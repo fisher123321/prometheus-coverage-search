@@ -1002,3 +1002,14 @@ Mapped change:
 - `cmake --build build/uav_control -j4` 编译成功，`uav_control_main` 已链接。
 - 两个新脚本通过 `bash -n`；自定义 launch、覆盖搜索 launch 和 `samplemaze.world`
   通过 XML 校验；`rospack` 能把 `prometheus_coverage_search` 定位到隔离后的目录。
+
+## 2026-07-15 专用启动脚本 MAVROS 环境修正
+
+- 现象：Gazebo、PX4 和 P450 模型正常启动，但控制终端报告
+  `Waiting for connect PX4`，随后解锁失败。
+- 根因：专用脚本重新加载 ROS 环境时遗漏了
+  `${HOME}/prometheus_mavros/devel/setup.bash`，日志中的直接错误是
+  `cannot launch node of type [mavros/mavros_node]`；这与 PX4 端口和模型无关。
+- 修正：脚本按 ROS、定制 MAVROS、Prometheus `--extend`、PX4 的顺序加载环境，并在
+  启动前检查 MAVROS setup 是否存在。NO_RC 场景同时通过 `joy_enable:=false` 关闭未使用
+  的手柄节点，避免 `/dev/input/js0` 警告。
