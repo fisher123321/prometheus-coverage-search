@@ -1,0 +1,122 @@
+<launch>
+    <!-- 探索矩形也是已知空间比率的固定分母；换世界时只覆盖这些 launch 参数。 -->
+    <arg name="map_origin_x" default="-9.6"/>
+    <arg name="map_origin_y" default="-9.6"/>
+    <arg name="map_origin_z" default="-0.5"/>
+    <arg name="map_size_x" default="19.2"/>
+    <arg name="map_size_y" default="19.2"/>
+    <arg name="map_size_z" default="3.0"/>
+    <arg name="completion_known_ratio" default="0.99"/>
+
+    <!-- 覆盖搜索节点 -->
+    <node pkg="prometheus_coverage_search" name="coverage_search_node" type="coverage_search_node" output="screen">
+        <!-- 无人机编号 -->
+        <param name="uav_id" value="1"/>
+        <!-- 仿真模式 -->
+        <param name="coverage_search/sim_mode" value="true"/>
+        <!-- 无人机飞行高度(必须与uav_control起飞高度一致) -->
+        <param name="coverage_search/fly_height" value="1.0"/>
+        <!-- 传感器感知范围(米) - D435i深度点云只信任0.3~3.0m -->
+        <param name="coverage_search/sensing_range" value="3.0"/>
+        <!-- 传感器水平FOV(弧度) - D435i深度相机约90度 -->
+        <param name="coverage_search/sensing_fov_h" value="1.571"/>
+        <!-- 传感器垂直FOV(弧度) -->
+        <param name="coverage_search/sensing_fov_v" value="1.287"/>
+        <!-- 最大速度 -->
+        <param name="coverage_search/max_vel" value="1.0"/>
+        <param name="coverage_search/max_acc" value="0.8"/>
+        <!-- 最大偏航角速率 -->
+        <param name="coverage_search/max_yaw_rate" value="1.8"/>
+        <!-- 重规划间隔(秒) -->
+        <param name="coverage_search/replan_time" value="3.0"/>
+        <!-- 目标到达判定距离(米) -->
+        <param name="coverage_search/goal_reach_dist" value="0.25"/>
+        <!-- 前方障碍物检测距离(米) -->
+        <param name="coverage_search/obstacle_check_dist" value="2.0"/>
+        <!-- 安全距离阈值(米) - 小于此距离触发紧急避让 -->
+        <param name="coverage_search/safe_distance" value="1.0"/>
+        <!-- 轨迹点间距(米) - 配合按位置推进，越小越平滑 -->
+        <param name="coverage_search/traj_step_size" value="0.35"/>
+        <!-- 推进到下一点所需距离阈值(米) - 无人机接近当前点至此值才前进 -->
+        <param name="coverage_search/traj_advance_dist" value="0.35"/>
+        <!-- 单点最长停留超时(秒) - 卡住超过此值停车并从实测位置重规划 -->
+        <param name="coverage_search/traj_point_dwell_timeout" value="3.0"/>
+        <param name="coverage_search/traj_cut_clearance" value="0.55"/>
+        <!-- 严格完成：已知率达标且持续无前沿；不达标时原地旋转恢复残余观测 -->
+        <param name="coverage_search/completion_known_ratio" value="$(arg completion_known_ratio)"/>
+        <param name="coverage_search/completion_no_frontier_dwell" value="8.0"/>
+        <param name="coverage_search/residual_scan_yaw_rate" value="0.6"/>
+        <!-- 滚动规划：60%起监听新前沿版本；交接点由85%~95%的De Boor状态选择 -->
+        <param name="coverage_search/rolling_preplan_progress" value="0.60"/>
+        <param name="coverage_search/rolling_handoff_goal_dist" value="0.60"/>
+        <!-- 自动开始 -->
+        <param name="coverage_search/auto_start" value="true"/>
+        <!-- 地图输入源: 0=全局点云, 1=局部点云, 2=激光雷达点云, 3=D435i深度点云 -->
+        <param name="coverage_search/map_input_source" value="3"/>
+        <!-- 点云话题 -->
+        <param name="coverage_search/global_pcl_topic" value="/map_generator/global_cloud"/>
+        <param name="coverage_search/local_pcl_topic" value="/map_generator/local_cloud"/>
+        <param name="coverage_search/depth_pcl_topic" value="/uav1/camera/depth/color/points_downsampled"/>
+        <param name="coverage_search/camera_offset_x" value="0.095"/>
+        <param name="coverage_search/camera_offset_y" value="0.0"/>
+        <param name="coverage_search/camera_offset_z" value="0.0"/>
+        <param name="coverage_search/camera_pitch" value="0.35"/>
+        <param name="coverage_search/fov_vis_range" value="1.5"/>
+
+        <param name="sensor/depth_min_range" value="0.3"/>
+        <param name="sensor/depth_max_range" value="3.0"/>
+        <param name="sensor/depth_height_tolerance" value="0.6"/>
+        <param name="sensor/depth_ground_ignore_height" value="0.15"/>
+
+        <!-- 地图参数 -->
+        <param name="map/resolution" value="0.2"/>
+        <param name="map/esdf_safe_distance" value="0.35"/>
+        <param name="map/esdf_max_distance" value="6.0"/>
+        <!-- 仅清除P450真实机体体积内的自反射/旧噪点，不清除0.35m安全区 -->
+        <param name="map/robot_clear_radius" value="0.22"/>
+        <param name="map/robot_clear_half_height" value="0.20"/>
+        <param name="map/tsdf_trunc_dist" value="1.0"/>
+        <param name="map/debug_unknown_boundary_vis" value="true"/>
+        <param name="map/queue_size" value="5"/>
+        <!-- 默认匹配 samplemaze.world；其他世界在 roslaunch 命令中覆盖顶部参数。 -->
+        <param name="map/origin_x" value="$(arg map_origin_x)"/>
+        <param name="map/origin_y" value="$(arg map_origin_y)"/>
+        <param name="map/origin_z" value="$(arg map_origin_z)"/>
+        <param name="map/map_size_x" value="$(arg map_size_x)"/>
+        <param name="map/map_size_y" value="$(arg map_size_y)"/>
+        <param name="map/map_size_z" value="$(arg map_size_z)"/>
+
+        <!-- 前沿查找器参数 -->
+        <param name="frontier_finder/cluster_min" value="5"/>
+        <param name="frontier_finder/cluster_size_xy" value="2.2"/>
+        <param name="frontier_finder/min_candidate_dist" value="1.0"/>
+        <param name="frontier_finder/candidate_rmin" value="1.2"/>
+        <param name="frontier_finder/candidate_rmax" value="1.6"/>
+        <param name="frontier_finder/candidate_rnum" value="4"/>
+        <param name="frontier_finder/candidate_dphi" value="0.262"/>
+        <param name="frontier_finder/down_sample" value="1"/>
+        <param name="frontier_finder/min_visib_num" value="3"/>
+        <param name="frontier_finder/min_candidate_clearance" value="0.12"/>
+        <param name="frontier_finder/min_candidate_occupied_clearance" value="0.55"/>
+        <param name="frontier_finder/min_viewpoint_frontier_dist" value="0.55"/>
+        <param name="frontier_finder/min_frontier_height" value="0.30"/>
+        <param name="frontier_finder/max_frontier_height" value="1.85"/>
+        <param name="frontier_finder/max_frontier_above_flight" value="0.35"/>
+        <param name="frontier_finder/frontier_z_half_layers" value="5"/>
+        <param name="frontier_finder/split_min_cells" value="80"/>
+        <param name="frontier_finder/split_min_aspect_ratio" value="1.25"/>
+        <param name="frontier_finder/split_max_aspect_ratio" value="6.0"/>
+        <param name="frontier_finder/min_frontier_z_layers" value="3"/>
+        <param name="frontier_finder/min_frontier_z_extent" value="0.35"/>
+        <param name="frontier_finder/min_frontier_xy_cells" value="8"/>
+        <param name="frontier_finder/min_frontier_neighbor_ratio" value="0.50"/>
+        <param name="frontier_finder/vis_down_sample" value="1"/>
+        <param name="frontier_finder/vis_max_points" value="800"/>
+        <param name="frontier_finder/vis_max_total_points" value="8000"/>
+
+        <!-- 分层网格参数 -->
+        <param name="hgrid/cell_size" value="5.0"/>
+        <param name="hgrid/min_unknown_num" value="10"/>
+        <param name="hgrid/unknown_penalty" value="2.0"/>
+    </node>
+</launch>

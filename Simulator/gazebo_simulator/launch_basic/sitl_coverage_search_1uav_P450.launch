@@ -1,0 +1,54 @@
+<launch>
+    <arg name="world" default="$(find prometheus_gazebo)/gazebo_worlds/planning_worlds/samplemaze.world"/>
+    <arg name="rviz_enable" default="true"/>
+    <arg name="rviz_config" default="$(find prometheus_gazebo)/launch_basic/maze_mapping.rviz"/>
+    <arg name="uav_id" default="1"/>
+
+    <!-- Keep the original Prometheus SITL launch unchanged and override only this scenario. -->
+    <include file="$(find prometheus_gazebo)/launch_basic/sitl_outdoor_1uav_P450.launch">
+        <arg name="gazebo_enable" value="true"/>
+        <arg name="use_sim_time" value="true"/>
+        <arg name="world" value="$(arg world)"/>
+        <arg name="vehicle" value="p450_D435i"/>
+        <arg name="d435i_enable" value="true"/>
+        <arg name="uav1_id" value="$(arg uav_id)"/>
+    </include>
+
+    <node pkg="prometheus_coverage_search" type="depth_cloud_downsample_node"
+          name="depth_cloud_downsample_$(arg uav_id)" output="screen">
+        <param name="input_topic" value="/uav$(arg uav_id)/camera/depth/color/points"/>
+        <param name="output_topic" value="/uav$(arg uav_id)/camera/depth/color/points_downsampled"/>
+        <param name="octomap_output_topic" value="/uav$(arg uav_id)/camera/depth/color/points_octomap"/>
+        <param name="leaf_size" value="0.10"/>
+        <param name="min_range" value="0.3"/>
+        <param name="max_range" value="3.0"/>
+        <param name="max_rate" value="10.0"/>
+        <param name="add_fov_clear_points" value="true"/>
+        <param name="fov_h" value="1.5708"/>
+        <param name="fov_v" value="1.287"/>
+        <param name="clear_point_range" value="3.15"/>
+    </node>
+
+    <node pkg="octomap_server" type="octomap_server_node"
+          name="octomap_server_$(arg uav_id)" output="screen">
+        <remap from="/octomap_point_cloud_centers" to="/uav$(arg uav_id)/octomap_point_cloud_centers"/>
+        <remap from="/octomap_full" to="/uav$(arg uav_id)/octomap_full"/>
+        <remap from="/octomap_binary" to="/uav$(arg uav_id)/octomap_binary"/>
+        <remap from="cloud_in" to="/uav$(arg uav_id)/camera/depth/color/points_octomap"/>
+        <param name="resolution" value="0.10"/>
+        <param name="frame_id" value="world"/>
+        <param name="base_frame_id" value="world"/>
+        <param name="sensor_model/max_range" value="3.0"/>
+        <param name="pointcloud_min_z" value="-0.05"/>
+        <param name="pointcloud_max_z" value="2.8"/>
+        <param name="filter_ground" value="true"/>
+        <param name="ground_filter/distance" value="0.10"/>
+        <param name="ground_filter/angle" value="0.7853"/>
+        <param name="ground_filter/plane_distance" value="0.12"/>
+    </node>
+
+    <group if="$(arg rviz_enable)">
+        <node pkg="rviz" type="rviz" name="coverage_search_rviz"
+              args="-d $(arg rviz_config)"/>
+    </group>
+</launch>

@@ -1,0 +1,91 @@
+# Coverage Search Configuration
+# Based on FALCON algorithm (IEEE T-RO 2024)
+
+# ===== 覆盖搜索参数 =====
+coverage_search:
+  sim_mode: true
+  fly_height: 1.0
+  sensing_range: 3.0
+  sensing_fov_h: 1.5708    # 90 degrees
+  sensing_fov_v: 1.287     # ~74 degrees
+  max_vel: 1.0
+  max_acc: 0.8
+  max_yaw_rate: 1.8
+  replan_time: 3.0
+  goal_reach_dist: 0.25
+  auto_start: true
+  map_input_source: 3      # 0=global pcl, 1=local pcl, 2=scan pcl, 3=D435i depth pcl
+  global_pcl_topic: "/map_generator/global_cloud"
+  local_pcl_topic: "/map_generator/local_cloud"
+  depth_pcl_topic: "/uav1/camera/depth/color/points_downsampled"
+  camera_offset_x: 0.095
+  camera_offset_y: 0.0
+  camera_offset_z: 0.0
+  camera_pitch: 0.35
+  fov_vis_range: 1.5
+  rolling_preplan_progress: 0.60
+  rolling_handoff_goal_dist: 0.60
+  traj_step_size: 0.35
+  traj_advance_dist: 0.35
+  traj_cut_clearance: 0.55
+  completion_known_ratio: 0.99
+  completion_no_frontier_dwell: 8.0
+  residual_scan_yaw_rate: 0.6
+
+sensor:
+  depth_min_range: 0.3
+  depth_max_range: 3.0
+  depth_height_tolerance: 0.6
+  depth_ground_ignore_height: 0.15
+
+# ===== 地图参数 =====
+map:
+  resolution: 0.2
+  esdf_safe_distance: 0.35
+  esdf_max_distance: 6.0
+  robot_clear_radius: 0.22       # P450机体自清除半径，不包含安全膨胀区
+  robot_clear_half_height: 0.20  # P450机体自清除半高度
+  tsdf_trunc_dist: 1.0
+  debug_unknown_boundary_vis: true
+  queue_size: 5
+  origin_x: -9.6
+  origin_y: -9.6
+  origin_z: -0.5
+  map_size_x: 19.2
+  map_size_y: 19.2
+  map_size_z: 3.0
+
+# ===== 前沿查找器参数 =====
+frontier_finder:
+  cluster_min: 5           # 最小前沿簇体素数
+  cluster_size_xy: 2.5     # 最大前沿簇尺寸
+  min_candidate_dist: 1.0
+  candidate_rmin: 1.2      # 视点采样最小半径
+  candidate_rmax: 1.6      # 视点采样最大半径
+  candidate_rnum: 4
+  candidate_dphi: 0.262    # 视点采样角度步长(~15度)
+  down_sample: 1
+  min_visib_num: 3         # 最小可见前沿数
+  min_candidate_clearance: 0.12
+  min_candidate_occupied_clearance: 0.55
+  min_viewpoint_frontier_dist: 0.55
+  min_frontier_height: 0.30
+  max_frontier_height: 1.85
+  max_frontier_above_flight: 0.35
+  frontier_z_half_layers: 5
+  split_min_cells: 80
+  split_min_aspect_ratio: 1.25
+  split_max_aspect_ratio: 6.0
+  min_frontier_z_layers: 3
+  min_frontier_z_extent: 0.35
+  min_frontier_xy_cells: 8
+  min_frontier_neighbor_ratio: 0.50
+  vis_down_sample: 1
+  vis_max_points: 800
+  vis_max_total_points: 8000
+
+# ===== 分层网格参数 =====
+hgrid:
+  cell_size: 5.0           # 网格单元大小(米)
+  min_unknown_num: 10      # 最小未知体素数(活跃条件)
+  unknown_penalty: 2.0     # 未知区域惩罚因子
