@@ -6,36 +6,17 @@
 - 双机功能分支：`two-uav-coverage`
 - 不使用 GitHub 的 `main` 分支；它已有独立提交，不能直接覆盖。
 
-## 推荐：在独立工作目录完整拉取分支
+## 工位电脑的目标路径
 
-适用于需要在工位电脑继续修改、编译和推送双机功能的情况。以下命令会得到与当前开发机一致的代码版本，不会影响工位电脑原有的 `Prometheus` 工作目录。
-
-```bash
-git clone --branch two-uav-coverage --single-branch \
-  git@github.com:fisher123321/prometheus-coverage-search.git \
-  /home/wjy/Prometheus_two_uav
-cd /home/wjy/Prometheus_two_uav
-git status
-```
-
-应看到当前分支为 `two-uav-coverage`，并且功能包位于：
+工位电脑已有一模一样的普罗米修斯工作空间，因此不克隆第二份仓库，也不切换其 `main` 分支。只把功能包恢复到下面这个**固定路径**：
 
 ```text
-Modules/two_uav_coverage_search
+/home/wjy/Prometheus/Modules/two_uav_coverage_search
 ```
 
-后续在工位电脑修改并推回同一分支：
+先确认该路径不存在，或已经备份其中未提交的修改；下面的恢复操作只会覆盖该路径。
 
-```bash
-cd /home/wjy/Prometheus_two_uav
-git add Modules/two_uav_coverage_search
-git commit -m "Update two UAV coverage search"
-git push
-```
-
-## 只取功能包到已有 Prometheus 工作区
-
-适用于工位电脑已经有可用的 `/home/wjy/Prometheus`，且只希望加入本功能包、不切换其余代码版本。先确认目标路径不存在，或已经备份其中未提交的修改。
+## 从 GitHub 只拉取该功能包
 
 ```bash
 cd /home/wjy/Prometheus
@@ -58,7 +39,7 @@ git status --short Modules/two_uav_coverage_search
 git log -1 --oneline coverage-source/two-uav-coverage
 ```
 
-此“只取包”方式会让该包显示为本地未提交修改；确认无误后，再按工位仓库自己的分支规范提交。不要把工位工作区的整个目录 `git add .`。
+这会把远端包恢复到 `/home/wjy/Prometheus/Modules/two_uav_coverage_search`，并让该路径显示为工位仓库中的未提交修改；确认无误后，再按工位仓库自己的分支规范提交。不要在工位工作区执行 `git add .`。
 
 ## 可直接交给工位 Codex 的指令
 
@@ -67,7 +48,8 @@ git log -1 --oneline coverage-source/two-uav-coverage
 请添加（或校正）GitHub remote：
 git@github.com:fisher123321/prometheus-coverage-search.git
 然后 fetch 分支 two-uav-coverage，并只恢复路径
-Modules/two_uav_coverage_search 到当前工作区。完成后输出 git status --short
+Modules/two_uav_coverage_search 到当前工作区的
+/home/wjy/Prometheus/Modules/two_uav_coverage_search。完成后输出 git status --short
 Modules/two_uav_coverage_search 和该远端分支最新提交；不要执行 git add .、commit、push 或 force 操作。
 ```
 
