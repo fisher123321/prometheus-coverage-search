@@ -1,0 +1,78 @@
+# 工位电脑获取双机协同覆盖功能包
+
+## 分支约定
+
+- GitHub 仓库：`git@github.com:fisher123321/prometheus-coverage-search.git`
+- 双机功能分支：`two-uav-coverage`
+- 不使用 GitHub 的 `main` 分支；它已有独立提交，不能直接覆盖。
+
+## 推荐：在独立工作目录完整拉取分支
+
+适用于需要在工位电脑继续修改、编译和推送双机功能的情况。以下命令会得到与当前开发机一致的代码版本，不会影响工位电脑原有的 `Prometheus` 工作目录。
+
+```bash
+git clone --branch two-uav-coverage --single-branch \
+  git@github.com:fisher123321/prometheus-coverage-search.git \
+  /home/wjy/Prometheus_two_uav
+cd /home/wjy/Prometheus_two_uav
+git status
+```
+
+应看到当前分支为 `two-uav-coverage`，并且功能包位于：
+
+```text
+Modules/two_uav_coverage_search
+```
+
+后续在工位电脑修改并推回同一分支：
+
+```bash
+cd /home/wjy/Prometheus_two_uav
+git add Modules/two_uav_coverage_search
+git commit -m "Update two UAV coverage search"
+git push
+```
+
+## 只取功能包到已有 Prometheus 工作区
+
+适用于工位电脑已经有可用的 `/home/wjy/Prometheus`，且只希望加入本功能包、不切换其余代码版本。先确认目标路径不存在，或已经备份其中未提交的修改。
+
+```bash
+cd /home/wjy/Prometheus
+git remote add coverage-source git@github.com:fisher123321/prometheus-coverage-search.git
+git fetch coverage-source two-uav-coverage
+git restore --source=coverage-source/two-uav-coverage --staged --worktree \
+  Modules/two_uav_coverage_search
+```
+
+若 `coverage-source` 已存在，不要重复 `git remote add`，改为：
+
+```bash
+git remote set-url coverage-source git@github.com:fisher123321/prometheus-coverage-search.git
+```
+
+导入后检查：
+
+```bash
+git status --short Modules/two_uav_coverage_search
+git log -1 --oneline coverage-source/two-uav-coverage
+```
+
+此“只取包”方式会让该包显示为本地未提交修改；确认无误后，再按工位仓库自己的分支规范提交。不要把工位工作区的整个目录 `git add .`。
+
+## 可直接交给工位 Codex 的指令
+
+```text
+在 /home/wjy/Prometheus 中，不修改或切换现有 main 分支，也不触碰其他文件。
+请添加（或校正）GitHub remote：
+git@github.com:fisher123321/prometheus-coverage-search.git
+然后 fetch 分支 two-uav-coverage，并只恢复路径
+Modules/two_uav_coverage_search 到当前工作区。完成后输出 git status --short
+Modules/two_uav_coverage_search 和该远端分支最新提交；不要执行 git add .、commit、push 或 force 操作。
+```
+
+## 常见问题
+
+- `Permission denied (publickey)`：工位电脑尚未配置能访问该 GitHub 账户的 SSH key；先执行 `ssh -T git@github.com` 检查并配置密钥。
+- 推送被拒绝：先执行 `git pull --ff-only`；若有本地提交和远端提交同时存在，停止并先检查差异，不能使用 `--force`。
+- 本文中的 `/home/wjy` 需替换为工位电脑实际用户名路径。
