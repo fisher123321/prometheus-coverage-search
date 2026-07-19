@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Usage: start_two_uav_coverage_sim.sh [uav1-id] [uav2-id] [fly-height-m]
+set -euo pipefail
+[[ $# -le 3 ]] || { echo "usage: $0 [uav1-id] [uav2-id] [fly-height-m]" >&2; exit 2; }
+
+workspace=${PROMETHEUS_WS:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"}
+source /opt/ros/noetic/setup.bash
+source "$workspace/devel/setup.bash"
+
+uav1_id=${1:-1}
+uav2_id=${2:-2}
+fly_height=${3:-1.5}
+[[ "$uav1_id" != "$uav2_id" ]] || { echo "UAV IDs must differ" >&2; exit 2; }
+
+# A planner can publish valid commands while the corresponding Prometheus
+# controller is absent.  In that case the aircraft will hover and it is easy
+# to mistake this for a coverage-planning failure.  Refuse to start until each
+# command topic is actually consumed by its controller.
+require_controller() {
+  local id=$1 info
+  info="$(timeout 5s rostopic info "/uav${id}/prometheus/command" 2>/dev/null || true)"
+  grep -Fq "/uav_control_main_${id}" <<<"$info" || {
+    echo "UAV${id} has no /uav_control_main_${id} subscriber on /uav${id}/prometheus/command." >&2
+    echo "Keep start_two_uav_sim.sh running, wait for MAVROS and uav_control, then retry." >&2
+    return 1
+  }
+}
+
+require_controller "$uav1_id" || exit 1
+require_controller "$uav2_id" || exit 1
+
+# The two state streams must already be expressed in one common world frame.
+# Do this before launching the bridge/coordinator so a per-vehicle PX4-local
+# frame cannot silently turn into an indefinite WAIT_TAKEOFF hover.
+read_position() {
+  local id=$1 state position
+  state="$(timeout 5s rostopic echo -n 1 "/uav${id}/prometheus/state" 2>/dev/null || true)"
+  position="$(sed -n 's/^position: \[\([^]]*\)\]$/\1/p' <<<"$state")"
+  [[ -n "$position" ]] || {
+    echo "UAV${id} has no usable prometheus/state; arm and wait for valid odometry first." >&2
+    return 1
+  }
+  awk -F',' '{gsub(/ /, "", $1); gsub(/ /, "", $2); if ($1 ~ /^-?[0-9.]+$/ && $2 ~ /^-?[0-9.]+$/) print $1, $2; else exit 1}' <<<"$position"
+}
+
+pos1="$(read_position "$uav1_id")" || exit 1
+pos2="$(read_position "$uav2_id")" || exit 1
+separation="$(awk -v x1="${pos1%% *}" -v y1="${pos1##* }" -v x2="${pos2%% *}" -v y2="${pos2##* }" 'BEGIN { printf "%.3f", sqrt((x1-x2)^2 + (y1-y2)^2) }')"
+awk -v d="$separation" 'BEGIN { exit !(d >= 1.0) }' || {
+  echo "UAV separation is ${separation} m (< 1.0 m); refusing cooperative start. Check shared world coordinates and spawn positions." >&2
+  exit 1
+}
+echo "Verified shared-frame UAV separation: ${separation} m"
+exec roslaunch prometheus_two_uav_coverage_search two_uav_coverage_sim_algorithm.launch \
+  uav1_id:="$uav1_id" uav2_id:="$uav2_id" fly_height:="$fly_height"

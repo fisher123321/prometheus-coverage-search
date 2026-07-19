@@ -1,0 +1,19 @@
+<launch>
+  <arg name="local_ip"/>
+  <arg name="peer_ip"/>
+  <arg name="tx_prefix" default="/two_uav/tx"/>
+  <arg name="rx_prefix" default="/two_uav/rx"/>
+  <arg name="port_base" default="31000"/>
+  <arg name="peer_port_base" default="$(arg port_base)"/>
+  <arg name="max_packet_kib" default="512"/>
+  <node pkg="prometheus_two_uav_coverage_search" type="two_uav_swarm_bridge"
+        name="two_uav_swarm_bridge_$(arg port_base)" output="screen">
+    <param name="local_ip" value="$(arg local_ip)"/>
+    <param name="peer_ip" value="$(arg peer_ip)"/>
+    <param name="tx_prefix" value="$(arg tx_prefix)"/>
+    <param name="rx_prefix" value="$(arg rx_prefix)"/>
+    <param name="port_base" value="$(arg port_base)"/>
+    <param name="peer_port_base" value="$(arg peer_port_base)"/>
+    <param name="max_packet_kib" value="$(arg max_packet_kib)"/>
+  </node>
+</launch>
