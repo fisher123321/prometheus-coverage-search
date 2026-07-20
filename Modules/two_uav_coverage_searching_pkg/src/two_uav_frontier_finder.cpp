@@ -112,11 +112,6 @@ void FrontierFinder::searchResidualFrontiers(const Eigen::Vector3d &cur_pos) {
              frontiers_.size());
 }
 
-void FrontierFinder::refreshFrontiersFull(const Eigen::Vector3d &cur_pos) {
-    ++update_generation_;
-    searchFrontiersFull(cur_pos);
-}
-
 void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
     Eigen::Vector3d update_min, update_max;
     bool has_update = map_->getUpdatedBox(update_min, update_max, true);

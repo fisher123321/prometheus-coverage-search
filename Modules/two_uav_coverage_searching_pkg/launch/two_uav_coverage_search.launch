@@ -54,7 +54,6 @@
         <param name="coverage_search/completion_known_ratio" value="$(arg completion_known_ratio)"/>
         <param name="coverage_search/completion_no_frontier_dwell" value="8.0"/>
         <param name="coverage_search/residual_scan_yaw_rate" value="0.6"/>
-        <param name="coverage_search/remote_full_frontier_period" value="3.0"/>
         <!-- Bids use A* path length.  Bound their rate/work so bid generation
              never competes with the real-time command loop. -->
         <param name="coverage_search/swarm_bid_period" value="2.0"/>

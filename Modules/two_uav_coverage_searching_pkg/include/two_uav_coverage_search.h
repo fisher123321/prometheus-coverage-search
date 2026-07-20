@@ -233,7 +233,6 @@ public:
 
     void init(ros::NodeHandle &nh, CoverageMap *map);
     void searchFrontiers(const Eigen::Vector3d &cur_pos);
-    void refreshFrontiersFull(const Eigen::Vector3d &cur_pos);
     void searchResidualFrontiers(const Eigen::Vector3d &cur_pos);
     void getFrontierAverages(std::vector<Eigen::Vector3d> &averages);
     void getFrontierClusters(std::vector<std::vector<Eigen::Vector3d>> &clusters);
@@ -383,7 +382,7 @@ private:
     ros::Subscriber uav_state_sub_, uav_control_state_sub_;
     ros::Subscriber global_pcl_sub_, local_pcl_sub_, scan_pcl_sub_, depth_pcl_sub_, goal_sub_;
     ros::Subscriber remote_chunk_sub_, map_request_sub_, remote_frontier_sub_;
-    ros::Publisher uav_cmd_pub_, path_vis_pub_, fov_vis_pub_, coverage_status_pub_;
+    ros::Publisher uav_cmd_pub_, path_vis_pub_, fov_vis_pub_, coverage_status_pub_, uav_label_pub_;
     ros::Publisher swarm_frontier_pub_, swarm_bid_pub_, swarm_traj_pub_, map_chunk_pub_, map_request_pub_;
     ros::Timer mainloop_timer_, frontier_timer_, swarm_data_timer_;
 
@@ -412,8 +411,6 @@ private:
     std::vector<uint32_t> swarm_peer_chunk_revision_;
     std::vector<uint8_t> swarm_chunk_snapshot_stage_;
     std::vector<bool> swarm_chunk_force_snapshot_;
-    bool remote_frontier_refresh_pending_ = false;
-    ros::Time last_remote_frontier_full_refresh_;
     ros::Time last_swarm_bid_time_;
     double swarm_bid_period_ = 2.0, swarm_information_gain_weight_ = 0.005;
     int swarm_bid_max_tasks_ = 16;
@@ -523,7 +520,6 @@ private:
     double completion_no_frontier_dwell_;
     double residual_scan_yaw_rate_;
     double residual_scan_yaw_;
-    double remote_full_frontier_period_;
     ros::Time last_residual_search_time_;
 
     // ★ 轨迹执行参数（按位置推进）
