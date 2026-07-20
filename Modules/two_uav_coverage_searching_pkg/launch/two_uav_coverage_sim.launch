@@ -1,0 +1,17 @@
+<launch>
+  <!-- Convenience all-in-one launch; the scripts use the two phases separately. -->
+  <arg name="world" default="$(find prometheus_gazebo)/gazebo_worlds/planning_worlds/samplemaze.world"/>
+  <arg name="uav1_id" default="1"/>
+  <arg name="uav2_id" default="2"/>
+  <arg name="fly_height" default="1.5"/>
+  <arg name="uav1_init_x" default="-8.0"/><arg name="uav1_init_y" default="-6.0"/><arg name="uav1_init_yaw" default="0.0"/>
+  <arg name="uav2_init_x" default="-8.0"/><arg name="uav2_init_y" default="6.0"/><arg name="uav2_init_yaw" default="0.0"/>
+  <arg name="rviz" default="true"/>
+  <arg name="rviz_config" default="$(find prometheus_two_uav_coverage_search)/rviz/two_uav_coverage_search.rviz"/>
+  <include file="$(find prometheus_two_uav_coverage_search)/launch/two_uav_sim_world.launch">
+    <arg name="world" value="$(arg world)"/><arg name="uav1_id" value="$(arg uav1_id)"/><arg name="uav2_id" value="$(arg uav2_id)"/><arg name="fly_height" value="$(arg fly_height)"/><arg name="uav1_init_x" value="$(arg uav1_init_x)"/><arg name="uav1_init_y" value="$(arg uav1_init_y)"/><arg name="uav1_init_yaw" value="$(arg uav1_init_yaw)"/><arg name="uav2_init_x" value="$(arg uav2_init_x)"/><arg name="uav2_init_y" value="$(arg uav2_init_y)"/><arg name="uav2_init_yaw" value="$(arg uav2_init_yaw)"/><arg name="rviz" value="$(arg rviz)"/><arg name="rviz_config" value="$(arg rviz_config)"/>
+  </include>
+  <include file="$(find prometheus_two_uav_coverage_search)/launch/two_uav_coverage_sim_algorithm.launch">
+    <arg name="uav1_id" value="$(arg uav1_id)"/><arg name="uav2_id" value="$(arg uav2_id)"/><arg name="fly_height" value="$(arg fly_height)"/>
+  </include>
+</launch>

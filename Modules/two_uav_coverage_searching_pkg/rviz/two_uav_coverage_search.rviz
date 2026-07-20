@@ -1,0 +1,358 @@
+Panels:
+  - Class: rviz/Displays
+    Help Height: 0
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+      Splitter Ratio: 0.6178659796714783
+    Tree Height: 472
+  - Class: rviz/Selection
+    Name: Selection
+  - Class: rviz/Tool Properties
+    Expanded: ~
+    Name: Tool Properties
+    Splitter Ratio: 0.5
+  - Class: rviz/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.5
+  - Class: rviz/Time
+    Name: Time
+    SyncMode: 0
+    SyncSource: ""
+Preferences:
+  PromptSaveOnExit: false
+Toolbars:
+  toolButtonStyle: 2
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.5
+      Cell Size: 1
+      Class: rviz/Grid
+      Color: 0; 0; 0
+      Enabled: true
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Billboards
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 30
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Class: rviz/Group
+      Displays:
+        - Angle Tolerance: 0.10000000149011612
+          Class: rviz/Odometry
+          Covariance:
+            Orientation:
+              Alpha: 0.5
+              Color: 255; 255; 127
+              Color Style: Unique
+              Frame: Local
+              Offset: 1
+              Scale: 1
+              Value: true
+            Position:
+              Alpha: 0.30000001192092896
+              Color: 204; 51; 204
+              Scale: 1
+              Value: true
+            Value: true
+          Enabled: true
+          Keep: 1
+          Name: 无人机位置 - odom
+          Position Tolerance: 0.10000000149011612
+          Queue Size: 10
+          Shape:
+            Alpha: 1
+            Axes Length: 0.30000001192092896
+            Axes Radius: 0.10000000149011612
+            Color: 255; 25; 0
+            Head Length: 0.30000001192092896
+            Head Radius: 0.10000000149011612
+            Shaft Length: 1
+            Shaft Radius: 0.05000000074505806
+            Value: Arrow
+          Topic: /uav1/prometheus/odom
+          Unreliable: false
+          Value: true
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /uav1/prometheus/uav_mesh
+          Name: 无人机位置 - 模型
+          Namespaces:
+            mesh: true
+          Queue Size: 100
+          Value: true
+        - Alpha: 1
+          Buffer Length: 30
+          Class: rviz/Path
+          Color: 255; 25; 0
+          Enabled: false
+          Head Diameter: 0.30000001192092896
+          Head Length: 0.20000000298023224
+          Length: 0.30000001192092896
+          Line Style: Billboards
+          Line Width: 0.20000000298023224
+          Name: 无人机轨迹
+          Offset:
+            X: 0
+            Y: 0
+            Z: 0
+          Pose Color: 255; 85; 255
+          Pose Style: None
+          Queue Size: 200
+          Radius: 0.029999999329447746
+          Shaft Diameter: 0.10000000149011612
+          Shaft Length: 0.10000000149011612
+          Topic: /uav1/prometheus/trajectory
+          Unreliable: false
+          Value: false
+      Enabled: true
+      Name: 无人机1
+    - Class: rviz/Group
+      Displays:
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /uav1/prometheus/coverage_search/path_vis
+          Name: 覆盖搜索-路径与目标
+          Namespaces:
+            bspline_traj: true
+            coverage_path: true
+            goal_point: true
+            goal_view_yaw: true
+            traj_points: true
+          Queue Size: 100
+          Value: true
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /uav1/prometheus/coverage_search/frontier_vis
+          Name: 统一前沿簇（UAV1 融合地图）
+          Namespaces:
+            frontier_best_view_yaw: true
+            frontier_best_viewpoint: true
+            frontier_cells: true
+          Queue Size: 100
+          Value: true
+      Enabled: true
+      Name: 覆盖搜索1
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav1/prometheus/coverage_search/fov_vis
+      Name: UAV1 FOV
+      Namespaces:
+        depth_camera_fov: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Group
+      Displays:
+        - Angle Tolerance: 0.10000000149011612
+          Class: rviz/Odometry
+          Covariance:
+            Orientation:
+              Alpha: 0.5
+              Color: 255; 255; 127
+              Color Style: Unique
+              Frame: Local
+              Offset: 1
+              Scale: 1
+              Value: true
+            Position:
+              Alpha: 0.30000001192092896
+              Color: 204; 51; 204
+              Scale: 1
+              Value: true
+            Value: true
+          Enabled: true
+          Keep: 1
+          Name: 无人机位置 - odom
+          Position Tolerance: 0.10000000149011612
+          Queue Size: 10
+          Shape:
+            Alpha: 1
+            Axes Length: 0.30000001192092896
+            Axes Radius: 0.10000000149011612
+            Color: 255; 25; 0
+            Head Length: 0.30000001192092896
+            Head Radius: 0.10000000149011612
+            Shaft Length: 1
+            Shaft Radius: 0.05000000074505806
+            Value: Arrow
+          Topic: /uav2/prometheus/odom
+          Unreliable: false
+          Value: true
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /uav2/prometheus/uav_mesh
+          Name: 无人机模型
+          Namespaces:
+            mesh: true
+          Queue Size: 100
+          Value: true
+        - Alpha: 1
+          Buffer Length: 30
+          Class: rviz/Path
+          Color: 0; 85; 255
+          Enabled: true
+          Head Diameter: 0.30000001192092896
+          Head Length: 0.20000000298023224
+          Length: 0.30000001192092896
+          Line Style: Billboards
+          Line Width: 0.05000000074505806
+          Name: 飞行轨迹
+          Offset:
+            X: 0
+            Y: 0
+            Z: 0
+          Pose Color: 255; 85; 255
+          Pose Style: None
+          Queue Size: 200
+          Radius: 0.029999999329447746
+          Shaft Diameter: 0.10000000149011612
+          Shaft Length: 0.10000000149011612
+          Topic: /uav2/prometheus/trajectory
+          Unreliable: false
+          Value: true
+      Enabled: true
+      Name: 无人机2
+    - Class: rviz/Group
+      Displays:
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /uav2/prometheus/coverage_search/path_vis
+          Name: 覆盖路径与目标
+          Namespaces:
+            bspline_traj: true
+            coverage_path: true
+            goal_point: true
+            goal_view_yaw: true
+            traj_points: true
+          Queue Size: 100
+          Value: true
+        - Class: rviz/MarkerArray
+          Enabled: false
+          Marker Topic: /uav2/prometheus/coverage_search/frontier_vis
+          Name: UAV2 前沿簇与候选视点（调试）
+          Namespaces:
+            {}
+          Queue Size: 100
+          Value: false
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /uav2/prometheus/coverage_search/fov_vis
+          Name: FOV
+          Namespaces:
+            depth_camera_fov: true
+          Queue Size: 100
+          Value: true
+      Enabled: true
+      Name: 覆盖搜索2
+    - Class: octomap_rviz_plugin/OccupancyGrid
+      Enabled: true
+      Max. Height Display: inf
+      Max. Octree Depth: 16
+      Min. Height Display: -inf
+      Name: OccupancyGrid
+      Octomap Topic: /uav1/octomap_full
+      Queue Size: 5
+      Value: true
+      Voxel Alpha: 1
+      Voxel Coloring: Z-Axis
+      Voxel Rendering: Occupied Voxels
+    - Class: octomap_rviz_plugin/OccupancyGrid
+      Enabled: true
+      Max. Height Display: inf
+      Max. Octree Depth: 16
+      Min. Height Display: -inf
+      Name: OccupancyGrid
+      Octomap Topic: /uav2/octomap_full
+      Queue Size: 5
+      Value: true
+      Voxel Alpha: 1
+      Voxel Coloring: Z-Axis
+      Voxel Rendering: Occupied Voxels
+    - Alpha: 0.699999988079071
+      Class: octomap_rviz_plugin/OccupancyMap
+      Color Scheme: map
+      Draw Behind: false
+      Enabled: true
+      Max. Octree Depth: 16
+      Name: OccupancyMap
+      Octomap Binary Topic: /uav1/octomap_full
+      Unreliable: false
+      Use Timestamp: false
+      Value: true
+    - Alpha: 0.699999988079071
+      Class: octomap_rviz_plugin/OccupancyMap
+      Color Scheme: map
+      Draw Behind: false
+      Enabled: true
+      Max. Octree Depth: 16
+      Name: OccupancyMap
+      Octomap Binary Topic: /uav2/octomap_full
+      Unreliable: false
+      Use Timestamp: false
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 186; 189; 182
+    Default Light: true
+    Fixed Frame: world
+    Frame Rate: 20
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+      Hide Inactive Objects: true
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+  Value: true
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 28.296428680419922
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.05999999865889549
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Field of View: 0.7853981852531433
+      Focal Point:
+        X: -4.76729679107666
+        Y: 2.9735331535339355
+        Z: -0.34047895669937134
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05000000074505806
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.009999999776482582
+      Pitch: 1.134796142578125
+      Target Frame: <Fixed Frame>
+      Yaw: 1.296832799911499
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 1016
+  Hide Left Dock: false
+  Hide Right Dock: false
+  QMainWindow State: 000000ff00000000fd0000000200000000000001e20000035ffc0200000004fb000000100044006900730070006c006100790073010000003d00000215000000c900fffffffb0000001200530065006c0065006300740069006f006e00000001cc000000700000005c00fffffffb0000001e0054006f006f006c002000500072006f00700065007200740069006500730000000209000000940000005c00fffffffb0000000a00560069006500770073010000025800000144000000a400ffffff000000030000073800000039fc0100000001fb0000000800540069006d0065010000000000000738000003bc00ffffff000005500000035f00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  Selection:
+    collapsed: false
+  Time:
+    collapsed: false
+  Tool Properties:
+    collapsed: false
+  Views:
+    collapsed: false
+  Width: 1848
+  X: 2632
+  Y: 212

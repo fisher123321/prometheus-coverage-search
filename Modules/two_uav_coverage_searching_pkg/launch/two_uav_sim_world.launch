@@ -1,0 +1,50 @@
+<launch>
+  <!-- Base simulation only: world, two PX4/MAVROS stacks, controls, and RViz. -->
+  <arg name="world" default="$(find prometheus_gazebo)/gazebo_worlds/planning_worlds/samplemaze.world"/>
+  <arg name="uav1_id" default="1"/>
+  <arg name="uav2_id" default="2"/>
+  <arg name="fly_height" default="1.5"/>
+  <!-- Shared Gazebo-world spawn coordinates.  Keep the same heading and separate
+       the aircraft laterally along y; every value can be overridden at launch. -->
+  <arg name="uav1_init_x" default="-8.0"/>
+  <arg name="uav1_init_y" default="-2.5"/>
+  <arg name="uav1_init_yaw" default="0.0"/>
+  <arg name="uav2_init_x" default="-8.0"/>
+  <!-- At x=-8 m Wall_9 begins at y=6.59 m.  Leave >1.5 m clearance
+       for initial hovering and the first depth-map update. -->
+  <arg name="uav2_init_y" default="4.0"/>
+  <arg name="uav2_init_yaw" default="0.0"/>
+  <arg name="rviz" default="true"/>
+  <arg name="rviz_config" default="$(find prometheus_two_uav_coverage_search)/rviz/two_uav_coverage_search.rviz"/>
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(arg world)"/>
+    <arg name="use_sim_time" value="true"/>
+  </include>
+  <!-- Indoor/Gazebo estimator publishes ground truth in one shared `world` frame.
+       The outdoor/GPS launch gives every PX4 its own local origin, which is safe
+       for one aircraft but invalid for inter-UAV separation and map fusion. -->
+  <include file="$(find prometheus_gazebo)/launch_basic/sitl_px4_indoor.launch">
+    <arg name="uav_id" value="$(arg uav1_id)"/><arg name="vehicle" value="p450_D435i"/>
+    <arg name="uav_init_x" value="$(arg uav1_init_x)"/><arg name="uav_init_y" value="$(arg uav1_init_y)"/><arg name="uav_init_z" value="0.15"/><arg name="uav_init_yaw" value="$(arg uav1_init_yaw)"/>
+  </include>
+  <include file="$(find prometheus_gazebo)/launch_basic/sitl_px4_indoor.launch">
+    <arg name="uav_id" value="$(arg uav2_id)"/><arg name="vehicle" value="p450_D435i"/>
+    <arg name="uav_init_x" value="$(arg uav2_init_x)"/><arg name="uav_init_y" value="$(arg uav2_init_y)"/><arg name="uav_init_z" value="0.15"/><arg name="uav_init_yaw" value="$(arg uav2_init_yaw)"/>
+  </include>
+  <include file="$(find prometheus_uav_control)/launch/uav_control_main_indoor.launch">
+    <arg name="uav_id" value="$(arg uav1_id)"/><arg name="joy_enable" value="false"/>
+  </include>
+  <param name="/uav_control_main_$(arg uav1_id)/control/Takeoff_height" value="$(arg fly_height)"/>
+  <include file="$(find prometheus_uav_control)/launch/uav_control_main_indoor.launch">
+    <arg name="uav_id" value="$(arg uav2_id)"/><arg name="joy_enable" value="false"/>
+  </include>
+  <param name="/uav_control_main_$(arg uav2_id)/control/Takeoff_height" value="$(arg fly_height)"/>
+  <!-- The D435i point cloud is published in d435i_link; each aircraft needs
+       exactly one static camera_link -> d435i_link transform for OctoMap. -->
+  <node pkg="tf" type="static_transform_publisher" name="two_uav_tf_camera_d435i_$(arg uav1_id)"
+        args="0 0 0 0 0 0 /uav$(arg uav1_id)/camera_link /uav$(arg uav1_id)/d435i_link 100"/>
+  <node pkg="tf" type="static_transform_publisher" name="two_uav_tf_camera_d435i_$(arg uav2_id)"
+        args="0 0 0 0 0 0 /uav$(arg uav2_id)/camera_link /uav$(arg uav2_id)/d435i_link 100"/>
+  <node if="$(arg rviz)" pkg="rviz" type="rviz" name="two_uav_rviz" output="screen"
+        args="-d $(arg rviz_config)"/>
+</launch>

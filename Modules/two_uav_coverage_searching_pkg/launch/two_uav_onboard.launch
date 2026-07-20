@@ -1,0 +1,49 @@
+<launch>
+  <!-- Run this once on each industrial computer. Values are all deploy-time args. -->
+  <arg name="uav_id"/>
+  <arg name="peer_uav_id"/>
+  <arg name="fly_height" default="1.5"/>
+  <arg name="global_coverage_source" default="0"/>
+  <arg name="tx_prefix" default="/two_uav/tx"/>
+  <arg name="rx_prefix" default="/two_uav/rx"/>
+  <arg name="map_origin_x" default="-9.6"/>
+  <arg name="map_origin_y" default="-9.6"/>
+  <arg name="map_origin_z" default="-0.5"/>
+  <arg name="map_size_x" default="19.2"/>
+  <arg name="map_size_y" default="19.2"/>
+  <arg name="map_size_z" default="3.0"/>
+
+  <include file="$(find prometheus_two_uav_coverage_search)/launch/two_uav_coverage_search.launch">
+    <arg name="uav_id" value="$(arg uav_id)"/>
+    <arg name="fly_height" value="$(arg fly_height)"/>
+    <arg name="auto_start" value="false"/>
+    <arg name="cooperative_mode" value="true"/>
+    <arg name="external_goal_only" value="true"/>
+    <arg name="global_coverage_source" value="$(arg global_coverage_source)"/>
+    <arg name="swarm_tx_prefix" value="$(arg tx_prefix)"/>
+    <arg name="swarm_rx_prefix" value="$(arg rx_prefix)"/>
+    <arg name="map_origin_x" value="$(arg map_origin_x)"/>
+    <arg name="map_origin_y" value="$(arg map_origin_y)"/>
+    <arg name="map_origin_z" value="$(arg map_origin_z)"/>
+    <arg name="map_size_x" value="$(arg map_size_x)"/>
+    <arg name="map_size_y" value="$(arg map_size_y)"/>
+    <arg name="map_size_z" value="$(arg map_size_z)"/>
+  </include>
+
+  <node pkg="prometheus_two_uav_coverage_search" type="two_uav_coordinator"
+        name="two_uav_coordinator_$(arg uav_id)" output="screen">
+    <param name="uav_id" value="$(arg uav_id)"/>
+    <param name="peer_uav_id" value="$(arg peer_uav_id)"/>
+    <param name="fly_height" value="$(arg fly_height)"/>
+    <param name="tx_prefix" value="$(arg tx_prefix)"/>
+    <param name="rx_prefix" value="$(arg rx_prefix)"/>
+    <param name="min_start_separation" value="1.0"/>
+    <param name="safe_separation" value="1.2"/>
+    <param name="task_bundle_size" value="3"/>
+    <param name="task_reach_dist" value="0.35"/>
+    <!-- A bad goal must not leave the aircraft waiting for the former 30 s. -->
+    <param name="task_commit_timeout" value="15.0"/>
+    <param name="task_retry_cooldown" value="12.0"/>
+    <param name="task_goal_separation" value="3.0"/>
+  </node>
+</launch>
