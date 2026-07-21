@@ -11,6 +11,7 @@
 #include <prometheus_msgs/UAVControlState.h>
 #include <prometheus_msgs/UAVState.h>
 #include <ros/ros.h>
+#include <visualization_msgs/Marker.h>
 
 #include <prometheus_two_uav_coverage_search/SwarmFrontierArray.h>
 #include <prometheus_two_uav_coverage_search/SwarmBidArray.h>
@@ -78,6 +79,8 @@ class TwoUavCoordinator {
     trajectory_pub_ = nh_.advertise<prometheus_two_uav_coverage_search::SwarmTrajectory>(tx_prefix_ + "/trajectory", 2);
     command_pub_ = nh_.advertise<prometheus_msgs::UAVCommand>(uav + "/prometheus/command", 10);
     goal_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(uav + "/prometheus/coverage_search/goal", 1);
+    task_label_pub_ = nh_.advertise<visualization_msgs::Marker>(
+        uav + "/prometheus/coverage_search/task_labels", 10);
     timer_ = nh_.createTimer(ros::Duration(0.05), &TwoUavCoordinator::timerCb, this);
     phase_ = WAIT_PEER;
     ROS_INFO("[two_uav_coordinator] UAV %d waits for UAV %d", uav_id_, peer_uav_id_);
@@ -411,6 +414,72 @@ class TwoUavCoordinator {
     raw_command_.header.stamp = ros::Time::now();
     raw_command_.Command_ID = ++command_id_;
     command_pub_.publish(raw_command_);
+    publishTaskLabels();
+  }
+
+  void publishTaskLabels() {
+    visualization_msgs::Marker label;
+    label.header.frame_id = "world";
+    label.header.stamp = ros::Time::now();
+    label.ns = "task_owner";
+    label.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+    label.action = visualization_msgs::Marker::ADD;
+    label.scale.z = 0.30;
+    label.lifetime = ros::Duration(2.5);
+
+    int id = 0;
+    // own tasks from local auction
+    if (!local_bids_.bids.empty() || !peer_bids_.bids.empty()) {
+      // Re-derive own tasks mirroring runAuction logic to avoid storing extra state
+      std::map<uint64_t, double> self_cost, peer_cost;
+      for (const auto& bid : local_bids_.bids) {
+        if (static_cast<int>(bid.bidder_uav_id) == uav_id_ && bid.reachable &&
+            std::isfinite(bid.cost)) self_cost[bid.task_id] = bid.cost;
+      }
+      for (const auto& bid : peer_bids_.bids) {
+        if (static_cast<int>(bid.bidder_uav_id) == peer_uav_id_ && bid.reachable &&
+            std::isfinite(bid.cost)) peer_cost[bid.task_id] = bid.cost;
+      }
+
+      std::map<uint64_t, prometheus_two_uav_coverage_search::SwarmFrontier> tasks;
+      auto merge = [&](const prometheus_two_uav_coverage_search::SwarmFrontierArray& src) {
+        for (const auto& f : src.frontiers) tasks[f.task_id] = f;
+      };
+      merge(local_frontiers_);
+      merge(peer_frontiers_);
+
+      for (const auto& entry : tasks) {
+        const auto& frontier = entry.second;
+        const auto s = self_cost.find(entry.first);
+        const auto p = peer_cost.find(entry.first);
+        double sc = s != self_cost.end() ? s->second : std::numeric_limits<double>::infinity();
+        double pc = p != peer_cost.end() ? p->second : std::numeric_limits<double>::infinity();
+        if (!std::isfinite(sc) && !std::isfinite(pc)) continue;
+
+        bool self_wins = sc < pc - 1e-3 ||
+            (std::fabs(sc - pc) <= 1e-3 && uav_id_ < peer_uav_id_);
+        int winner = self_wins ? uav_id_ : peer_uav_id_;
+
+        label.id = id++;
+        label.pose.position = frontier.viewpoint.position;
+        label.pose.position.z = fly_height_ + 0.55;
+        label.pose.orientation.w = 1.0;
+        label.text = "UAV" + std::to_string(winner);
+        label.color.r = (winner == uav_id_) ? 0.0f : 0.2f;
+        label.color.g = 1.0f;
+        label.color.b = (winner == uav_id_) ? 0.0f : 1.0f;
+        label.color.a = 0.9f;
+        task_label_pub_.publish(label);
+      }
+    }
+
+    // clear stale labels
+    for (int i = id; i < last_task_label_count_; ++i) {
+      label.id = i;
+      label.action = visualization_msgs::Marker::DELETE;
+      task_label_pub_.publish(label);
+    }
+    last_task_label_count_ = id;
   }
 
   ros::NodeHandle nh_;
@@ -439,7 +508,8 @@ class TwoUavCoordinator {
   geometry_msgs::Pose active_goal_;
   ros::Subscriber state_sub_, control_sub_, raw_command_sub_, local_frontier_sub_, local_bid_sub_, local_trajectory_sub_;
   ros::Subscriber peer_state_sub_, peer_frontier_sub_, peer_bid_sub_, peer_task_sub_, peer_trajectory_sub_;
-  ros::Publisher state_pub_, frontier_pub_, bid_pub_, task_pub_, trajectory_pub_, command_pub_, goal_pub_;
+  ros::Publisher state_pub_, frontier_pub_, bid_pub_, task_pub_, trajectory_pub_, command_pub_, goal_pub_, task_label_pub_;
+  int last_task_label_count_ = 0;
   ros::Timer timer_;
 };
 

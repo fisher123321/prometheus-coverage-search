@@ -130,9 +130,7 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
     std::vector<FrontierCluster> kept;
     kept.reserve(frontiers_.size());
     for (auto &ftr : frontiers_) {
-        if (haveOverlap(ftr.box_min_, ftr.box_max_, search_min, search_max) &&
-            isFrontierChanged(ftr)) {
-            // Re-search the entire changed cluster, not merely the newest ray AABB.
+        if (haveOverlap(ftr.box_min_, ftr.box_max_, search_min, search_max)) {
             search_min = search_min.cwiseMin(ftr.box_min_ - Eigen::Vector3d(margin, margin, margin));
             search_max = search_max.cwiseMax(ftr.box_max_ + Eigen::Vector3d(margin, margin, margin));
             resetFrontierFlag(ftr);
@@ -185,16 +183,6 @@ bool FrontierFinder::haveOverlap(const Eigen::Vector3d &min1, const Eigen::Vecto
         if (max1(k) < min2(k) || max2(k) < min1(k)) return false;
     }
     return true;
-}
-
-bool FrontierFinder::isFrontierChanged(const FrontierCluster &ftr) {
-    if (ftr.cells.empty()) return true;
-    for (const auto &cell : ftr.cells) {
-        Eigen::Vector3i idx;
-        map_->posToIndex(cell, idx);
-        if (!isFrontierCell(idx)) return true;
-    }
-    return false;
 }
 
 void FrontierFinder::resetFrontierFlag(const FrontierCluster &ftr) {

@@ -283,6 +283,14 @@ Visualization Manager:
             depth_camera_fov: true
           Queue Size: 100
           Value: true
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /uav1/prometheus/coverage_search/task_labels
+          Name: 任务归属标签
+          Namespaces:
+            task_owner: true
+          Queue Size: 20
+          Value: true
       Enabled: true
       Name: 覆盖搜索1
     - Class: rviz/Group
@@ -314,6 +322,14 @@ Visualization Manager:
           Namespaces:
             depth_camera_fov: true
           Queue Size: 100
+          Value: true
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /uav2/prometheus/coverage_search/task_labels
+          Name: 任务归属标签
+          Namespaces:
+            task_owner: true
+          Queue Size: 20
           Value: true
       Enabled: true
       Name: 覆盖搜索2

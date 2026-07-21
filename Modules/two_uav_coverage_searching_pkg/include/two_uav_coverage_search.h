@@ -294,7 +294,6 @@ private:
     void searchFrontiersFull(const Eigen::Vector3d &cur_pos, bool relaxed = false);
     bool haveOverlap(const Eigen::Vector3d &min1, const Eigen::Vector3d &max1,
                      const Eigen::Vector3d &min2, const Eigen::Vector3d &max2);
-    bool isFrontierChanged(const FrontierCluster &ftr);
     void resetFrontierFlag(const FrontierCluster &ftr);
     void splitLargeFrontiers();
     void computeFrontierInfo(FrontierCluster &ftr);
