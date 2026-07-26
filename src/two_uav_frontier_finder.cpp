@@ -282,6 +282,7 @@ bool FrontierFinder::isFrontierCell(const Eigen::Vector3i &idx) {
 
     Eigen::Vector3d pos;
     map_->indexToPos(idx, pos);
+    if (map_->isInDynamicPeerVolume(pos)) return false;
     if (pos(2) < min_frontier_height_ || pos(2) > max_frontier_height_) return false;
 
     // 只在无人机可飞行高度带附近找前沿，避免地面/顶部未观测层把整片已探索 free 区域染成前沿。

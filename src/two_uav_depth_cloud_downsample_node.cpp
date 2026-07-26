@@ -1,5 +1,8 @@
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <prometheus_msgs/UAVState.h>
+#include <prometheus_two_uav_coverage_search/SwarmState.h>
+#include <Eigen/Geometry>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -25,12 +28,27 @@ public:
         nh.param("clear_yaw_samples", clear_yaw_samples_, 25);
         nh.param("clear_pitch_samples", clear_pitch_samples_, 15);
         nh.param("clear_block_margin", clear_block_margin_, 1);
+        nh.param<std::string>("local_state_topic", local_state_topic_, "");
+        nh.param<std::string>("peer_state_topic", peer_state_topic_, "");
+        nh.param("peer_clear_radius", peer_clear_radius_, 0.40);
+        nh.param("peer_clear_half_height", peer_clear_half_height_, 0.30);
+        nh.param("peer_state_timeout", peer_state_timeout_, 0.60);
+        nh.param("camera_offset_x", camera_offset_(0), 0.095);
+        nh.param("camera_offset_y", camera_offset_(1), 0.0);
+        nh.param("camera_offset_z", camera_offset_(2), 0.0);
+        nh.param("camera_pitch", camera_pitch_, 0.35);
 
         pub_ = nh.advertise<sensor_msgs::PointCloud2>(output_topic_, 1);
         if (!octomap_output_topic_.empty()) {
             octomap_pub_ = nh.advertise<sensor_msgs::PointCloud2>(octomap_output_topic_, 1);
         }
         sub_ = nh.subscribe(input_topic_, 1, &DepthCloudDownsampleNode::cloudCb, this);
+        if (!local_state_topic_.empty() && !peer_state_topic_.empty()) {
+            local_state_sub_ = nh.subscribe(local_state_topic_, 1,
+                &DepthCloudDownsampleNode::localStateCb, this);
+            peer_state_sub_ = nh.subscribe(peer_state_topic_, 10,
+                &DepthCloudDownsampleNode::peerStateCb, this);
+        }
 
         ROS_INFO("[DepthCloudDownsample] %s -> %s leaf=%.2f range=[%.2f, %.2f] max_rate=%.1f",
                  input_topic_.c_str(), output_topic_.c_str(), leaf_size_,
@@ -80,8 +98,14 @@ private:
         pub_.publish(out);
 
         if (octomap_pub_) {
-            pcl::PointCloud<pcl::PointXYZ>::Ptr octomap_cloud(new pcl::PointCloud<pcl::PointXYZ>(*filtered));
-            if (add_fov_clear_points_) addFovClearPoints(*filtered, *octomap_cloud);
+            pcl::PointCloud<pcl::PointXYZ>::Ptr octomap_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+            const int suppressed = removePeerPoints(*filtered, *octomap_cloud);
+            if (add_fov_clear_points_) addFovClearPoints(*octomap_cloud, *octomap_cloud);
+            if (suppressed > 0) {
+                ROS_INFO_THROTTLE(1.0,
+                    "[DepthCloudDownsample] suppressed %d peer-body points from OctoMap input.",
+                    suppressed);
+            }
 
             sensor_msgs::PointCloud2 octomap_out;
             pcl::toROSMsg(*octomap_cloud, octomap_out);
@@ -89,6 +113,61 @@ private:
             octomap_pub_.publish(octomap_out);
         }
         last_pub_time_ = now;
+    }
+
+    void localStateCb(const prometheus_msgs::UAVState::ConstPtr &msg) {
+        local_state_ = *msg;
+        local_state_valid_ = msg->odom_valid;
+    }
+
+    void peerStateCb(const prometheus_two_uav_coverage_search::SwarmState::ConstPtr &msg) {
+        peer_pos_ = Eigen::Vector3d(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+        peer_state_valid_ = msg->odom_valid;
+        peer_state_received_ = ros::Time::now();
+    }
+
+    int removePeerPoints(const pcl::PointCloud<pcl::PointXYZ> &input,
+                         pcl::PointCloud<pcl::PointXYZ> &output) const {
+        output.clear();
+        output.reserve(input.size());
+        const bool peer_fresh = peer_state_valid_ && local_state_valid_ &&
+            (ros::Time::now() - peer_state_received_).toSec() <= peer_state_timeout_;
+        if (!peer_fresh) {
+            output = input;
+            return 0;
+        }
+
+        Eigen::Quaterniond q_wb(local_state_.attitude_q.w, local_state_.attitude_q.x,
+                                local_state_.attitude_q.y, local_state_.attitude_q.z);
+        if (q_wb.norm() <= 1e-3) {
+            output = input;
+            return 0;
+        }
+        q_wb.normalize();
+        const Eigen::Matrix3d R_wb = q_wb.toRotationMatrix();
+        Eigen::Matrix3d R_opt_to_body;
+        R_opt_to_body << 0, 0, 1, -1, 0, 0, 0, -1, 0;
+        const Eigen::Matrix3d R_wc = R_wb *
+            Eigen::AngleAxisd(camera_pitch_, Eigen::Vector3d::UnitY()).toRotationMatrix() *
+            R_opt_to_body;
+        const Eigen::Vector3d camera_pos(local_state_.position[0], local_state_.position[1],
+                                          local_state_.position[2]);
+        const Eigen::Vector3d origin = camera_pos + R_wb * camera_offset_;
+
+        int suppressed = 0;
+        for (const auto &pt : input.points) {
+            const Eigen::Vector3d world = origin + R_wc * Eigen::Vector3d(pt.x, pt.y, pt.z);
+            if ((world.head<2>() - peer_pos_.head<2>()).norm() <= peer_clear_radius_ &&
+                std::fabs(world(2) - peer_pos_(2)) <= peer_clear_half_height_) {
+                ++suppressed;
+                continue;
+            }
+            output.points.push_back(pt);
+        }
+        output.width = output.points.size();
+        output.height = 1;
+        output.is_dense = false;
+        return suppressed;
     }
 
     void addFovClearPoints(const pcl::PointCloud<pcl::PointXYZ> &real_points,
@@ -144,6 +223,8 @@ private:
     }
 
     ros::Subscriber sub_;
+    ros::Subscriber local_state_sub_;
+    ros::Subscriber peer_state_sub_;
     ros::Publisher pub_;
     ros::Publisher octomap_pub_;
     ros::Time last_pub_time_;
@@ -161,6 +242,18 @@ private:
     int clear_yaw_samples_;
     int clear_pitch_samples_;
     int clear_block_margin_;
+    std::string local_state_topic_;
+    std::string peer_state_topic_;
+    double peer_clear_radius_;
+    double peer_clear_half_height_;
+    double peer_state_timeout_;
+    Eigen::Vector3d camera_offset_;
+    double camera_pitch_;
+    prometheus_msgs::UAVState local_state_;
+    bool local_state_valid_ = false;
+    Eigen::Vector3d peer_pos_ = Eigen::Vector3d::Zero();
+    bool peer_state_valid_ = false;
+    ros::Time peer_state_received_;
 };
 
 int main(int argc, char **argv) {

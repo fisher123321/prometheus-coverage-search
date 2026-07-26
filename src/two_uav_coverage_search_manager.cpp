@@ -30,6 +30,7 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     nh.param("coverage_search/map_epoch", map_epoch_, 1);
     nh.param("coverage_search/swarm_chunk_size", swarm_chunk_size_, 2.0);
     nh.param("coverage_search/swarm_chunk_delta_period", swarm_chunk_delta_period_, 0.5);
+    nh.param("coverage_search/peer_state_timeout", peer_state_timeout_, 0.6);
     nh.param("coverage_search/swarm_tx_prefix", swarm_tx_prefix_, string("/two_uav/tx"));
     nh.param("coverage_search/swarm_rx_prefix", swarm_rx_prefix_, string("/two_uav/rx"));
     nh.param("coverage_search/map_input_source", map_input_source_, 3);
@@ -115,6 +116,8 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
             &CoverageSearchManager::remoteChunkCb, this);
         remote_frontier_sub_ = nh.subscribe(swarm_rx_prefix_ + "/frontier", 2,
             &CoverageSearchManager::remoteFrontierCb, this);
+        remote_state_sub_ = nh.subscribe(swarm_rx_prefix_ + "/state", 10,
+            &CoverageSearchManager::remoteStateCb, this);
         map_request_sub_ = nh.subscribe(swarm_rx_prefix_ + "/map_request", 2,
             &CoverageSearchManager::mapRequestCb, this);
         swarm_chunk_cells_x_ = std::max(1, static_cast<int>(std::round(
@@ -264,6 +267,20 @@ void CoverageSearchManager::goalCb(const geometry_msgs::PoseStampedConstPtr &msg
         start_time_ = ros::Time::now();
         cout << GREEN << "[CoverageSearch] Triggered! Start exploring." << TAIL << endl;
     }
+}
+
+void CoverageSearchManager::remoteStateCb(
+    const prometheus_two_uav_coverage_search::SwarmState::ConstPtr &msg) {
+    if (!cooperative_mode_ || static_cast<int>(msg->uav_id) == uav_id_) return;
+    if (!msg->odom_valid) {
+        peer_state_valid_ = false;
+        coverage_map_.setDynamicPeerVolume(Eigen::Vector3d::Zero(), false);
+        return;
+    }
+    peer_pos_ = Eigen::Vector3d(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+    peer_state_received_ = ros::Time::now();
+    peer_state_valid_ = true;
+    coverage_map_.setDynamicPeerVolume(peer_pos_, true);
 }
 
 void CoverageSearchManager::frontierCb(const ros::TimerEvent &e) {
@@ -569,6 +586,21 @@ void CoverageSearchManager::mapRequestCb(
 // ★ 主循环 - 简化FSM：INIT → EXPLORING → FINISH
 // ============================================================
 void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
+    const bool peer_fresh = cooperative_mode_ && peer_state_valid_ &&
+        (ros::Time::now() - peer_state_received_).toSec() <= peer_state_timeout_;
+    coverage_map_.setDynamicPeerVolume(peer_pos_, peer_fresh);
+    if (peer_fresh && coverage_map_.map_ready_) {
+        if (last_peer_clear_valid_ &&
+            (last_peer_clear_pos_ - peer_pos_).norm() > 0.05) {
+            coverage_map_.clearDynamicPeerVolume(last_peer_clear_pos_);
+        }
+        coverage_map_.clearDynamicPeerVolume(peer_pos_);
+        last_peer_clear_pos_ = peer_pos_;
+        last_peer_clear_valid_ = true;
+    } else if (!peer_fresh) {
+        last_peer_clear_valid_ = false;
+    }
+
     // UAV ID 标签 — 独立于 FSM 状态，只要节点运行就发布
     if (std::isfinite(uav_pos_(0)) && std::isfinite(uav_pos_(1)) && std::isfinite(uav_pos_(2))) {
         visualization_msgs::Marker label;

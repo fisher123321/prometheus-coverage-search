@@ -78,6 +78,8 @@ void CoverageMap::init(ros::NodeHandle &nh) {
     nh.param("map/tsdf_trunc_dist", tsdf_trunc_dist_, 1.0);
     nh.param("map/robot_clear_radius", robot_clear_radius_, 0.22);
     nh.param("map/robot_clear_half_height", robot_clear_half_height_, 0.20);
+    nh.param("map/peer_clear_radius", peer_clear_radius_, 0.40);
+    nh.param("map/peer_clear_half_height", peer_clear_half_height_, 0.30);
 
     inv_resolution_ = 1.0 / resolution_;
     for (int i = 0; i < 3; ++i) {
@@ -442,13 +444,14 @@ int CoverageMap::toAddress(const Eigen::Vector3i &idx) {
     return idx(0) * grid_size_(1) * grid_size_(2) + idx(1) * grid_size_(2) + idx(2);
 }
 
-void CoverageMap::setOccupancy(const Eigen::Vector3d &pos, uint8_t occ) {
-    if (!isInMap(pos)) return;
+bool CoverageMap::setOccupancy(const Eigen::Vector3d &pos, uint8_t occ,
+                               bool mark_local_update) {
+    if (!isInMap(pos)) return false;
     Eigen::Vector3i idx;
     posToIndex(pos, idx);
     int adr = toAddress(idx);
     occupancy_evidence_buffer_[adr] = occ == 2 ? 4 : -3;
-    updateOccupancyFromEvidence(idx);
+    return updateOccupancyFromEvidence(idx, mark_local_update);
 }
 
 bool CoverageMap::updateOccupancyFromEvidence(const Eigen::Vector3i &idx,
@@ -490,6 +493,7 @@ bool CoverageMap::setRemoteEvidence(int address, int8_t evidence) {
 
 void CoverageMap::integrateHit(const Eigen::Vector3d &pos) {
     if (!isInMap(pos)) return;
+    if (isInDynamicPeerVolume(pos)) return;
     Eigen::Vector3i idx;
     posToIndex(pos, idx);
     int adr = toAddress(idx);
@@ -522,15 +526,38 @@ void CoverageMap::beginOccupancyUpdate() {
     }
 }
 
+void CoverageMap::setDynamicPeerVolume(const Eigen::Vector3d &body_pos, bool active) {
+    dynamic_peer_valid_ = active && isInMap(body_pos);
+    if (dynamic_peer_valid_) dynamic_peer_pos_ = body_pos;
+}
+
+bool CoverageMap::isInDynamicPeerVolume(const Eigen::Vector3d &pos) const {
+    if (!dynamic_peer_valid_) return false;
+    return (pos.head<2>() - dynamic_peer_pos_.head<2>()).norm() <= peer_clear_radius_ &&
+           std::fabs(pos(2) - dynamic_peer_pos_(2)) <= peer_clear_half_height_;
+}
+
 void CoverageMap::clearRobotVolume(const Eigen::Vector3d &body_pos) {
+    clearVolume(body_pos, robot_clear_radius_, robot_clear_half_height_, true);
+}
+
+void CoverageMap::clearDynamicPeerVolume(const Eigen::Vector3d &body_pos) {
+    clearVolume(body_pos, peer_clear_radius_, peer_clear_half_height_, false);
+}
+
+void CoverageMap::clearVolume(const Eigen::Vector3d &body_pos,
+                              double radius, double half_height,
+                              bool mark_local_update) {
     if (!isInMap(body_pos)) return;
     Eigen::Vector3i center;
     posToIndex(body_pos, center);
     int rxy = std::max(1, (int)std::ceil(
-        (robot_clear_radius_ + 0.5 * resolution_) / resolution_));
+        (radius + 0.5 * resolution_) / resolution_));
     int rz = std::max(1, (int)std::ceil(
-        (robot_clear_half_height_ + 0.5 * resolution_) / resolution_));
+        (half_height + 0.5 * resolution_) / resolution_));
     int cleared_occupied = 0;
+    bool changed = false;
+    Eigen::Vector3i changed_min, changed_max;
     for (int dx = -rxy; dx <= rxy; ++dx) {
         for (int dy = -rxy; dy <= rxy; ++dy) {
             for (int dz = -rz; dz <= rz; ++dz) {
@@ -539,16 +566,25 @@ void CoverageMap::clearRobotVolume(const Eigen::Vector3d &body_pos) {
                 Eigen::Vector3d p;
                 indexToPos(idx, p);
                 if ((p.head<2>() - body_pos.head<2>()).norm() >
-                        robot_clear_radius_ + 0.5 * resolution_ ||
+                        radius + 0.5 * resolution_ ||
                     std::fabs(p(2) - body_pos(2)) >
-                        robot_clear_half_height_ + 0.5 * resolution_) {
+                        half_height + 0.5 * resolution_) {
                     continue;
                 }
                 if (occupancy_buffer_[toAddress(idx)] == 2) cleared_occupied++;
-                setOccupancy(p, 1);
+                if (!setOccupancy(p, 1, mark_local_update)) continue;
+                if (!changed) {
+                    changed_min = idx;
+                    changed_max = idx;
+                    changed = true;
+                } else {
+                    changed_min = changed_min.cwiseMin(idx);
+                    changed_max = changed_max.cwiseMax(idx);
+                }
             }
         }
     }
+    if (!mark_local_update && changed) markRemoteUpdatedBox(changed_min, changed_max);
     if (cleared_occupied > 0) {
         ROS_WARN_THROTTLE(1.0,
             "[CoverageMap] Cleared %d occupied voxels inside measured robot volume at "

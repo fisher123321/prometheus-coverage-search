@@ -9,6 +9,9 @@
     <param name="leaf_size" value="0.10"/><param name="min_range" value="0.3"/><param name="max_range" value="3.0"/><param name="max_rate" value="10.0"/>
     <!-- Endpoints beyond OctoMap's 3.0 m max range are inserted as free-only rays. -->
     <param name="add_fov_clear_points" value="true"/><param name="fov_h" value="1.5708"/><param name="fov_v" value="1.287"/><param name="clear_point_range" value="3.15"/>
+    <param name="local_state_topic" value="/uav$(arg uav1_id)/prometheus/state"/><param name="peer_state_topic" value="/uav$(arg uav1_id)/two_uav/rx/state"/>
+    <param name="peer_clear_radius" value="0.40"/><param name="peer_clear_half_height" value="0.30"/><param name="peer_state_timeout" value="0.60"/>
+    <param name="camera_offset_x" value="0.095"/><param name="camera_offset_y" value="0.0"/><param name="camera_offset_z" value="0.0"/><param name="camera_pitch" value="0.35"/>
   </node>
   <node pkg="prometheus_two_uav_coverage_search" type="two_uav_depth_cloud_downsample_node" name="depth_downsample_uav2" output="screen">
     <param name="input_topic" value="/uav$(arg uav2_id)/camera/depth/color/points"/><param name="output_topic" value="/uav$(arg uav2_id)/camera/depth/color/points_downsampled"/>
@@ -16,6 +19,9 @@
     <param name="leaf_size" value="0.10"/><param name="min_range" value="0.3"/><param name="max_range" value="3.0"/><param name="max_rate" value="10.0"/>
     <!-- Endpoints beyond OctoMap's 3.0 m max range are inserted as free-only rays. -->
     <param name="add_fov_clear_points" value="true"/><param name="fov_h" value="1.5708"/><param name="fov_v" value="1.287"/><param name="clear_point_range" value="3.15"/>
+    <param name="local_state_topic" value="/uav$(arg uav2_id)/prometheus/state"/><param name="peer_state_topic" value="/uav$(arg uav2_id)/two_uav/rx/state"/>
+    <param name="peer_clear_radius" value="0.40"/><param name="peer_clear_half_height" value="0.30"/><param name="peer_state_timeout" value="0.60"/>
+    <param name="camera_offset_x" value="0.095"/><param name="camera_offset_y" value="0.0"/><param name="camera_offset_z" value="0.0"/><param name="camera_pitch" value="0.35"/>
   </node>
   <node pkg="octomap_server" type="octomap_server_node" name="octomap_server_uav1" output="screen">
     <remap from="/octomap_point_cloud_centers" to="/uav$(arg uav1_id)/octomap_point_cloud_centers"/><remap from="/octomap_full" to="/uav$(arg uav1_id)/octomap_full"/><remap from="/octomap_binary" to="/uav$(arg uav1_id)/octomap_binary"/><remap from="/projected_map" to="/uav$(arg uav1_id)/projected_map"/>

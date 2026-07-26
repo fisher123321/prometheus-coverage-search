@@ -35,6 +35,7 @@
 #include <prometheus_two_uav_coverage_search/SwarmBidArray.h>
 #include <prometheus_two_uav_coverage_search/SwarmMapChunk.h>
 #include <prometheus_two_uav_coverage_search/SwarmMapRequest.h>
+#include <prometheus_two_uav_coverage_search/SwarmState.h>
 #include <prometheus_two_uav_coverage_search/SwarmTrajectory.h>
 
 #include <pcl/point_cloud.h>
@@ -66,6 +67,9 @@ public:
                             const Eigen::Vector3d &camera_pos,
                             const Eigen::Matrix3d &R_wc);
     void clearRobotVolume(const Eigen::Vector3d &body_pos);
+    void setDynamicPeerVolume(const Eigen::Vector3d &body_pos, bool active);
+    void clearDynamicPeerVolume(const Eigen::Vector3d &body_pos);
+    bool isInDynamicPeerVolume(const Eigen::Vector3d &pos) const;
 
     // 栅格状态查询
     bool isInMap(const Eigen::Vector3d &pos);
@@ -145,7 +149,8 @@ public:
     ros::Timer map_pub_timer_;
 
 private:
-    void setOccupancy(const Eigen::Vector3d &pos, uint8_t occ);
+    bool setOccupancy(const Eigen::Vector3d &pos, uint8_t occ,
+                      bool mark_local_update = true);
     void integrateHit(const Eigen::Vector3d &pos);
     void integrateMiss(const Eigen::Vector3i &idx);
     void beginOccupancyUpdate();
@@ -157,6 +162,9 @@ private:
     void appendRemoteBox(std::vector<IndexBox> &boxes,
                          const Eigen::Vector3i &min_idx,
                          const Eigen::Vector3i &max_idx);
+    void clearVolume(const Eigen::Vector3d &body_pos,
+                     double radius, double half_height,
+                     bool mark_local_update);
     void pubMapTimerCb(const ros::TimerEvent &e);
     void raycastFree(const Eigen::Vector3d &start, const Eigen::Vector3d &end,
                      bool include_end = false);
@@ -170,6 +178,9 @@ private:
     int queue_size_;
     int st_it_;
     double robot_clear_radius_, robot_clear_half_height_;
+    double peer_clear_radius_, peer_clear_half_height_;
+    Eigen::Vector3d dynamic_peer_pos_ = Eigen::Vector3d::Zero();
+    bool dynamic_peer_valid_ = false;
     unsigned int occupancy_update_epoch_ = 0;
     std::vector<unsigned int> occupancy_update_stamp_;
     std::vector<int8_t> remote_evidence_buffer_;
@@ -393,7 +404,7 @@ private:
 
     ros::Subscriber uav_state_sub_, uav_control_state_sub_;
     ros::Subscriber global_pcl_sub_, local_pcl_sub_, scan_pcl_sub_, depth_pcl_sub_, goal_sub_;
-    ros::Subscriber remote_chunk_sub_, map_request_sub_, remote_frontier_sub_;
+    ros::Subscriber remote_chunk_sub_, map_request_sub_, remote_frontier_sub_, remote_state_sub_;
     ros::Publisher uav_cmd_pub_, path_vis_pub_, fov_vis_pub_, coverage_status_pub_, uav_label_pub_;
     ros::Publisher swarm_frontier_pub_, swarm_bid_pub_, swarm_traj_pub_, map_chunk_pub_, map_request_pub_;
     ros::Timer mainloop_timer_, frontier_timer_, swarm_data_timer_;
@@ -404,6 +415,11 @@ private:
     Eigen::Vector3d uav_pos_, uav_vel_;
     double uav_yaw_;
     bool odom_ready_, drone_ready_, sensor_ready_;
+    Eigen::Vector3d peer_pos_ = Eigen::Vector3d::Zero();
+    Eigen::Vector3d last_peer_clear_pos_ = Eigen::Vector3d::Zero();
+    ros::Time peer_state_received_;
+    bool peer_state_valid_ = false;
+    bool last_peer_clear_valid_ = false;
     int uav_id_;
     string uav_name_;
 
@@ -414,6 +430,7 @@ private:
     int map_input_source_;
     int map_epoch_;
     double swarm_chunk_size_, swarm_chunk_delta_period_;
+    double peer_state_timeout_ = 0.6;
     string swarm_tx_prefix_, swarm_rx_prefix_;
     int swarm_chunk_cells_x_, swarm_chunk_cells_y_;
     uint32_t swarm_frontier_revision_ = 0;
@@ -559,6 +576,7 @@ private:
     void scanPclCb(const sensor_msgs::PointCloud2ConstPtr &msg);
     void depthPclCb(const sensor_msgs::PointCloud2ConstPtr &msg);
     void goalCb(const geometry_msgs::PoseStampedConstPtr &msg);
+    void remoteStateCb(const prometheus_two_uav_coverage_search::SwarmState::ConstPtr &msg);
     void remoteChunkCb(const prometheus_two_uav_coverage_search::SwarmMapChunkConstPtr &msg);
     void remoteFrontierCb(const prometheus_two_uav_coverage_search::SwarmFrontierArrayConstPtr &msg);
     void mapRequestCb(const prometheus_two_uav_coverage_search::SwarmMapRequestConstPtr &msg);

@@ -1417,3 +1417,49 @@ frontier timer（保持 1.2 s）
 
 因此没有该日志通常意味着：本轮更新低于 120 ms、处于 2 s 节流窗口内，或没有新的本机/远端
 地图脏区域而前沿搜索快速返回。该阈值与节流保持不变，用于避免正常快速更新刷屏。
+
+### 2026-07-26：双机互相观测产生的假占据体素（内部地图与 RViz OctoMap 同步消除）
+
+#### 问题
+
+两架无人机进入彼此 D435i 视场时，对机机身会成为真实的深度回波。若直接按静态环境处理，
+该回波不断累积为 occupied 体素；对机悬停或相互观察时，普通 miss 射线无法穿透机身，因而
+假占据与其遮挡边缘的假前沿簇不会自行稳定消失。
+
+此前已在覆盖规划内部的 `CoverageMap` 中加入动态对机排除：接收 `/uav<ID>/two_uav/rx/state`
+中的对机位置，以半径 `0.40 m`、半高 `0.30 m` 的圆柱体屏蔽新 hit，周期性清除当前及上一
+位置的历史占据，并让 `isFrontierCell()` 拒绝该体积内的前沿体素。这保证 A*、前沿和视点选择
+不会把对机当作静态障碍。
+
+但 RViz 的占据显示来自独立的 `octomap_server`，其输入是
+`/uav<ID>/camera/depth/color/points_octomap`，不读取 `CoverageMap`。因此内部规划已正确时，
+RViz 仍可能显示对机造成的假占据，形成两张地图不一致。
+
+#### 最小完整修复
+
+在 `two_uav_depth_cloud_downsample_node` 的 **OctoMap 输出支路**加入同一动态对机圆柱过滤：
+
+```text
+真实深度点云
+  -> 下采样
+  -> points_downsampled（不改，继续供 CoverageMap 使用）
+  -> 以本机 UAVState 外参将点变换到 world
+  -> 对方 SwarmState 新鲜且点落入对机圆柱：剔除
+  -> points_octomap + FOV free-only clear points
+  -> octomap_server -> RViz
+```
+
+- 本机位姿使用 `/uav<ID>/prometheus/state`；对机位姿使用 bridge 转发的
+  `/uav<ID>/two_uav/rx/state`。点坐标变换复用覆盖搜索的 D435i 外参：安装偏移
+  `(0.095, 0, 0) m`、俯仰 `0.35 rad` 与 optical-to-body 旋转，保证两处判定的空间范围一致。
+- 仅过滤 `points_octomap`，不改变 `points_downsampled`。规划内部仍由原有动态排除层统一处理，
+  从而避免在两个地图分支重复耦合。
+- 被剔除的对机回波不再占用其 FOV 角度桶；原有 `3.15 m` 的虚拟 clear-point 会向该方向发送
+  free-only 射线。OctoMap 后续帧因此会清除历史的对机假占据，而不会把虚拟端点写为 occupied。
+- 对方状态超过 `0.60 s` 未刷新，或本机里程计无效时，OctoMap 过滤自动停用；此时保留全部真实
+  回波，避免通信异常下误删静态障碍。
+
+相关参数在 `two_uav_coverage_sim_algorithm.launch` 的两个 `depth_downsample_uav*` 节点中设置：
+`peer_clear_radius=0.40`、`peer_clear_half_height=0.30`、`peer_state_timeout=0.60`。节点会节流输出
+`suppressed ... peer-body points from OctoMap input`，可作为运行时确认。`two_uav_depth_cloud_downsample_node`
+已编译通过，用户实测确认本修复有效。

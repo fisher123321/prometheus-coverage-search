@@ -73,6 +73,7 @@
         <param name="coverage_search/map_epoch" value="1"/>
         <param name="coverage_search/swarm_chunk_size" value="2.0"/>
         <param name="coverage_search/swarm_chunk_delta_period" value="0.5"/>
+        <param name="coverage_search/peer_state_timeout" value="0.6"/>
         <param name="coverage_search/swarm_tx_prefix" value="$(arg swarm_tx_prefix)"/>
         <param name="coverage_search/swarm_rx_prefix" value="$(arg swarm_rx_prefix)"/>
         <!-- 地图输入源: 0=全局点云, 1=局部点云, 2=激光雷达点云, 3=D435i深度点云 -->
@@ -99,6 +100,9 @@
         <!-- 仅清除P450真实机体体积内的自反射/旧噪点，不清除0.35m安全区 -->
         <param name="map/robot_clear_radius" value="0.22"/>
         <param name="map/robot_clear_half_height" value="0.20"/>
+        <!-- 对方机体是动态目标：不写入静态地图，也不在其周围生成前沿。 -->
+        <param name="map/peer_clear_radius" value="0.40"/>
+        <param name="map/peer_clear_half_height" value="0.30"/>
         <param name="map/tsdf_trunc_dist" value="1.0"/>
         <param name="map/queue_size" value="5"/>
         <!-- 默认匹配 samplemaze.world；其他世界在 roslaunch 命令中覆盖顶部参数。 -->
