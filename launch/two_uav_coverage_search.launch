@@ -115,7 +115,7 @@
         <!-- 前沿查找器参数 -->
         <param name="frontier_finder/cluster_min" value="5"/>
         <param name="frontier_finder/cluster_size_xy" value="2.2"/>
-        <param name="frontier_finder/min_candidate_dist" value="1.0"/>
+        <param name="frontier_finder/min_candidate_dist" value="0.0"/>
         <param name="frontier_finder/candidate_rmin" value="1.2"/>
         <param name="frontier_finder/candidate_rmax" value="1.6"/>
         <param name="frontier_finder/candidate_rnum" value="4"/>

@@ -36,6 +36,7 @@ class TwoUavCoordinator {
     nh_ = nh;
     nh_.param("uav_id", uav_id_, 1);
     nh_.param("peer_uav_id", peer_uav_id_, 2);
+    nh_.param("map_epoch", map_epoch_, 1);
     nh_.param("fly_height", fly_height_, 1.5);
     nh_.param("min_start_separation", min_start_separation_, 1.0);
     nh_.param("safe_separation", safe_separation_, 1.2);
@@ -47,6 +48,7 @@ class TwoUavCoordinator {
     nh_.param("task_commit_timeout", task_commit_timeout_, 15.0);
     nh_.param("task_retry_cooldown", task_retry_cooldown_, 12.0);
     nh_.param("task_goal_separation", task_goal_separation_, 3.0);
+    nh_.param("task_lease_duration", task_lease_duration_, 8.0);
     nh_.param("auction_period", auction_period_, 2.0);
     nh_.param<std::string>("tx_prefix", tx_prefix_, "/two_uav/tx");
     nh_.param<std::string>("rx_prefix", rx_prefix_, "/two_uav/rx");
@@ -78,7 +80,6 @@ class TwoUavCoordinator {
     task_pub_ = nh_.advertise<prometheus_two_uav_coverage_search::SwarmTaskArray>(tx_prefix_ + "/task", 2);
     trajectory_pub_ = nh_.advertise<prometheus_two_uav_coverage_search::SwarmTrajectory>(tx_prefix_ + "/trajectory", 2);
     command_pub_ = nh_.advertise<prometheus_msgs::UAVCommand>(uav + "/prometheus/command", 10);
-    goal_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(uav + "/prometheus/coverage_search/goal", 1);
     task_label_pub_ = nh_.advertise<visualization_msgs::Marker>(
         uav + "/prometheus/coverage_search/task_labels", 10);
     timer_ = nh_.createTimer(ros::Duration(0.05), &TwoUavCoordinator::timerCb, this);
@@ -139,6 +140,13 @@ class TwoUavCoordinator {
   void localTrajectoryCb(const prometheus_two_uav_coverage_search::SwarmTrajectory::ConstPtr& msg) {
     local_trajectory_ = *msg;
     local_trajectory_received_ = ros::Time::now();
+    if (msg->active_task_id == 0 || !std::isfinite(msg->active_task_distance)) return;
+    const auto previous = active_task_distance_.find(msg->active_task_id);
+    if (previous == active_task_distance_.end() ||
+        msg->active_task_distance + 0.05f < previous->second) {
+      lease_progress_time_[msg->active_task_id] = local_trajectory_received_;
+    }
+    active_task_distance_[msg->active_task_id] = msg->active_task_distance;
   }
   void peerStateCb(const prometheus_two_uav_coverage_search::SwarmState::ConstPtr& msg) {
     if (static_cast<int>(msg->uav_id) != peer_uav_id_) return;
@@ -188,25 +196,9 @@ class TwoUavCoordinator {
       if (reason) *reason = "peer state is stale";
       return false;
     }
-    geometry_msgs::Point target;
-    target.x = command.position_ref[0]; target.y = command.position_ref[1]; target.z = command.position_ref[2];
-    if (distance2d(target, peer_.pose.position) < safe_separation_) {
-      if (reason) *reason = "command target is inside peer safety radius";
-      return false;
-    }
-    // When the peer trajectory is stale, fall back to the peer position check
-    // (already performed above) instead of blocking the command.  A stale
-    // trajectory is not a safety hazard — the peer's current position is the
-    // conservative bound.
-    if ((ros::Time::now() - peer_trajectory_received_).toSec() > trajectory_timeout_) {
-      return true;
-    }
-    for (const auto& point : peer_trajectory_.points) {
-      if (distance2d(target, point) < safe_separation_) {
-        if (reason) *reason = "command target conflicts with peer predicted trajectory";
-        return false;
-      }
-    }
+    // Close-aircraft holds are disabled for this lease/selection experiment.
+    // Map-side dynamic peer filtering remains enabled, so this only removes
+    // the coordinator's command-forwarding stop.
     return true;
   }
 
@@ -231,21 +223,6 @@ class TwoUavCoordinator {
     const ros::Time now = ros::Time::now();
     if ((now - last_auction_).toSec() < auction_period_) return;
     last_auction_ = now;
-    // Keep an assigned view until it is reached.  Otherwise a small frontier
-    // update can reorder costs every auction period and send one aircraft
-    // back and forth between two valid viewpoints.
-    if (active_task_id_ != 0) {
-      if (distance2d(active_goal_.position, ownPoint()) < task_reach_dist_) {
-        active_task_id_ = 0;
-      } else if ((now - active_task_since_).toSec() < task_commit_timeout_) {
-        return;
-      } else {
-        rejected_until_[active_task_id_] = now + ros::Duration(task_retry_cooldown_);
-        ROS_WARN("[two_uav_coordinator] UAV %d task %llu timed out; choose another frontier.",
-                 uav_id_, static_cast<unsigned long long>(active_task_id_));
-        active_task_id_ = 0;
-      }
-    }
     std::map<uint64_t, prometheus_two_uav_coverage_search::SwarmFrontier> tasks;
     std::map<uint64_t, uint32_t> task_sources;
     auto merge_tasks = [&](const prometheus_two_uav_coverage_search::SwarmFrontierArray& source) {
@@ -289,12 +266,23 @@ class TwoUavCoordinator {
     std::vector<Candidate> candidates;
     for (const auto& entry : tasks) {
       const auto& frontier = entry.second;
-      const auto rejected = rejected_until_.find(frontier.task_id);
-      if (rejected != rejected_until_.end() && now < rejected->second) continue;
-      // The coverage node clears its external goal when it reaches it.  Do not
-      // auction that already-completed viewpoint again, or both nodes remain
-      // waiting for a different external goal while their coordinators keep
-      // selecting this zero-distance task.
+      const bool peer_lease_fresh = !peer_task_received_.isZero() &&
+          (now - peer_task_received_).toSec() <= 5.0;
+      bool peer_already_leases = false;
+      if (peer_lease_fresh) {
+        for (const auto& task : peer_tasks_.tasks) {
+          if (task.task_id == frontier.task_id &&
+              static_cast<int>(task.winner_uav_id) == peer_uav_id_ &&
+              task.lease_expire_time > now) {
+            peer_already_leases = true;
+            break;
+          }
+        }
+      }
+      // The peer's renewed task list is the second consensus round: do not
+      // claim an unexpired lease it has already announced.
+      if (peer_already_leases) continue;
+      // A reached region is not leased again until its next frontier update.
       if (distance2d(frontier.viewpoint.position, ownPoint()) < task_reach_dist_ ||
           distance2d(frontier.viewpoint.position, peer_.pose.position) < task_reach_dist_) continue;
       const auto self_bid = self_route_cost.find(frontier.task_id);
@@ -309,8 +297,13 @@ class TwoUavCoordinator {
       prometheus_two_uav_coverage_search::SwarmTask bid;
       bid.task_id = frontier.task_id;
       bid.task_version = std::max(local_bids_.frontier_revision, peer_bids_.frontier_revision);
+      bid.cluster_version = frontier.cluster_version;
+      bid.frontier_cell_count = frontier.frontier_cell_count;
       bid.winner_uav_id = uav_id_;
       bid.cost = self_cost;
+      bid.centroid = frontier.centroid;
+      bid.box_min = frontier.box_min;
+      bid.box_max = frontier.box_max;
       bid.goal = frontier.viewpoint;
       candidates.push_back({bid, peer_cost});
     }
@@ -343,7 +336,10 @@ class TwoUavCoordinator {
     if (own_seed < 0) {
       double best_self_cost = std::numeric_limits<double>::infinity();
       for (size_t i = 0; i < candidates.size(); ++i) {
-        if (candidates[i].task.cost < best_self_cost) {
+        const bool self_wins = candidates[i].task.cost < candidates[i].peer_cost - 1e-3 ||
+            (std::fabs(candidates[i].task.cost - candidates[i].peer_cost) <= 1e-3 &&
+             uav_id_ < peer_uav_id_);
+        if (self_wins && candidates[i].task.cost < best_self_cost) {
           best_self_cost = candidates[i].task.cost;
           own_seed = static_cast<int>(i);
         }
@@ -357,29 +353,49 @@ class TwoUavCoordinator {
            uav_id_ < peer_uav_id_);
       if (self_wins) own.push_back(candidates[i].task);
     }
+    const uint64_t active_task_id = local_trajectory_.active_task_id;
+    const auto progress = lease_progress_time_.find(active_task_id);
+    const bool active_progress = active_task_id != 0 && progress != lease_progress_time_.end() &&
+        (now - progress->second).toSec() <= 2.5;
+    if (active_progress) {
+      const auto lease = own_lease_expiry_.find(active_task_id);
+      if (lease != own_lease_expiry_.end() && lease->second > now) {
+        for (const auto& candidate : candidates) {
+          if (candidate.task.task_id != active_task_id) continue;
+          own.erase(std::remove_if(own.begin(), own.end(), [&](const prometheus_two_uav_coverage_search::SwarmTask& task) {
+            return task.task_id == active_task_id;
+          }), own.end());
+          own.insert(own.begin(), candidate.task);
+          if (static_cast<int>(own.size()) > task_bundle_size_) own.pop_back();
+          break;
+        }
+      }
+    }
+    std::set<uint64_t> leased_now;
+    for (auto& task : own) {
+      leased_now.insert(task.task_id);
+      auto found = own_lease_expiry_.find(task.task_id);
+      if (found == own_lease_expiry_.end() || found->second <= now) {
+        own_lease_expiry_[task.task_id] = now + ros::Duration(task_lease_duration_);
+      } else if (task.task_id == active_task_id && active_progress &&
+                 (found->second - now).toSec() <= auction_period_ + 0.25) {
+        own_lease_expiry_[task.task_id] = now + ros::Duration(task_lease_duration_);
+      }
+      task.lease_expire_time = own_lease_expiry_[task.task_id];
+    }
+    for (auto it = own_lease_expiry_.begin(); it != own_lease_expiry_.end();) {
+      if (leased_now.count(it->first) == 0) it = own_lease_expiry_.erase(it);
+      else ++it;
+    }
     prometheus_two_uav_coverage_search::SwarmTaskArray out;
     out.header.stamp = now;
     out.source_uav_id = uav_id_;
+    out.map_epoch = map_epoch_;
     out.revision = ++task_revision_;
     out.tasks = own;
     task_pub_.publish(out);
-    if (own.empty()) {
-      ROS_INFO_THROTTLE(2.0, "[two_uav_coordinator] UAV %d has no winning frontier task; hold until a new frontier is available.", uav_id_);
-      return;
-    }
-    const auto& selected = own.front();
-    if (selected.task_id == active_task_id_ &&
-        distance2d(selected.goal.position, active_goal_.position) < 0.2) return;
-    active_task_id_ = selected.task_id;
-    active_goal_ = selected.goal;
-    active_task_since_ = now;
-    geometry_msgs::PoseStamped goal;
-    goal.header.stamp = now;
-    goal.header.frame_id = "world";
-    goal.pose = active_goal_;
-    goal_pub_.publish(goal);
-    ROS_INFO("[two_uav_coordinator] UAV %d wins task %llu (cost %.2f)", uav_id_,
-             static_cast<unsigned long long>(active_task_id_), selected.cost);
+    ROS_INFO_THROTTLE(2.0, "[two_uav_coordinator] UAV %d renews %zu frontier leases.",
+                      uav_id_, own.size());
   }
 
   void timerCb(const ros::TimerEvent&) {
@@ -391,7 +407,7 @@ class TwoUavCoordinator {
       publishHold();
       return;
     }
-    if (!peer_.odom_valid || !peer_.command_ready || !startSeparationOk()) {
+    if (!peer_.odom_valid || !peer_.command_ready) {
       phase_ = WAIT_TAKEOFF;
       publishHold();
       return;
@@ -499,11 +515,12 @@ class TwoUavCoordinator {
   }
 
   ros::NodeHandle nh_;
-  int uav_id_ = 1, peer_uav_id_ = 2, task_bundle_size_ = 3;
+  int uav_id_ = 1, peer_uav_id_ = 2, map_epoch_ = 1, task_bundle_size_ = 3;
   double fly_height_ = 1.5, min_start_separation_ = 1.0, safe_separation_ = 1.2;
   double peer_timeout_ = 0.6, trajectory_timeout_ = 0.6, max_vel_ = 1.0;
   double auction_period_ = 2.0, task_reach_dist_ = 0.35;
   double task_commit_timeout_ = 15.0, task_retry_cooldown_ = 12.0, task_goal_separation_ = 3.0;
+  double task_lease_duration_ = 8.0;
   std::string tx_prefix_, rx_prefix_;
   Phase phase_ = WAIT_PEER;
   bool have_state_ = false, have_peer_ = false, have_raw_command_ = false;
@@ -515,16 +532,17 @@ class TwoUavCoordinator {
   prometheus_two_uav_coverage_search::SwarmBidArray local_bids_, peer_bids_;
   prometheus_two_uav_coverage_search::SwarmTaskArray peer_tasks_;
   prometheus_two_uav_coverage_search::SwarmTrajectory local_trajectory_, peer_trajectory_;
-  ros::Time peer_received_, local_frontier_received_, peer_frontier_received_, peer_task_received_, active_task_since_;
+  ros::Time peer_received_, local_frontier_received_, peer_frontier_received_, peer_task_received_;
   ros::Time local_bid_received_, peer_bid_received_;
   ros::Time local_trajectory_received_, peer_trajectory_received_, last_auction_;
-  uint64_t state_sequence_ = 0, active_task_id_ = 0;
+  uint64_t state_sequence_ = 0;
   uint32_t task_revision_ = 0, command_id_ = 0;
-  std::map<uint64_t, ros::Time> rejected_until_;
-  geometry_msgs::Pose active_goal_;
+  std::map<uint64_t, ros::Time> own_lease_expiry_;
+  std::map<uint64_t, double> active_task_distance_;
+  std::map<uint64_t, ros::Time> lease_progress_time_;
   ros::Subscriber state_sub_, control_sub_, raw_command_sub_, local_frontier_sub_, local_bid_sub_, local_trajectory_sub_;
   ros::Subscriber peer_state_sub_, peer_frontier_sub_, peer_bid_sub_, peer_task_sub_, peer_trajectory_sub_;
-  ros::Publisher state_pub_, frontier_pub_, bid_pub_, task_pub_, trajectory_pub_, command_pub_, goal_pub_, task_label_pub_;
+  ros::Publisher state_pub_, frontier_pub_, bid_pub_, task_pub_, trajectory_pub_, command_pub_, task_label_pub_;
   int last_task_label_count_ = 0;
   ros::Timer timer_;
 };

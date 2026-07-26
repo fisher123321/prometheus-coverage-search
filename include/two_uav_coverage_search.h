@@ -36,6 +36,7 @@
 #include <prometheus_two_uav_coverage_search/SwarmMapChunk.h>
 #include <prometheus_two_uav_coverage_search/SwarmMapRequest.h>
 #include <prometheus_two_uav_coverage_search/SwarmState.h>
+#include <prometheus_two_uav_coverage_search/SwarmTaskArray.h>
 #include <prometheus_two_uav_coverage_search/SwarmTrajectory.h>
 
 #include <pcl/point_cloud.h>
@@ -405,6 +406,7 @@ private:
     ros::Subscriber uav_state_sub_, uav_control_state_sub_;
     ros::Subscriber global_pcl_sub_, local_pcl_sub_, scan_pcl_sub_, depth_pcl_sub_, goal_sub_;
     ros::Subscriber remote_chunk_sub_, map_request_sub_, remote_frontier_sub_, remote_state_sub_;
+    ros::Subscriber local_task_sub_, remote_task_sub_;
     ros::Publisher uav_cmd_pub_, path_vis_pub_, fov_vis_pub_, coverage_status_pub_, uav_label_pub_;
     ros::Publisher swarm_frontier_pub_, swarm_bid_pub_, swarm_traj_pub_, map_chunk_pub_, map_request_pub_;
     ros::Timer mainloop_timer_, frontier_timer_, swarm_data_timer_;
@@ -446,6 +448,9 @@ private:
     int swarm_bid_max_astar_ = 6;
     prometheus_two_uav_coverage_search::SwarmFrontierArray local_swarm_frontiers_;
     prometheus_two_uav_coverage_search::SwarmFrontierArray remote_swarm_frontiers_;
+    prometheus_two_uav_coverage_search::SwarmTaskArray local_swarm_tasks_;
+    prometheus_two_uav_coverage_search::SwarmTaskArray remote_swarm_tasks_;
+    ros::Time local_swarm_task_received_, remote_swarm_task_received_;
     string global_pcl_topic_, local_pcl_topic_, scan_pcl_topic_, depth_pcl_topic_;
     Eigen::Vector3d camera_offset_;
     double camera_pitch_;
@@ -508,6 +513,7 @@ private:
         double handoff_time = -1.0;
         Eigen::Vector3d goal = Eigen::Vector3d::Zero();
         double goal_yaw = 0.0;
+        uint64_t task_id = 0;
         std::vector<Eigen::Vector3d> astar_path;
         std::vector<Eigen::Vector3d> points;
         std::vector<Eigen::Vector3d> vels;
@@ -535,7 +541,9 @@ private:
     // ★ 前沿簇队列
     std::vector<Eigen::Vector3d> frontier_targets_;
     std::vector<double> frontier_target_yaws_;
+    std::vector<uint64_t> frontier_target_task_ids_;
     int frontier_target_idx_;
+    uint64_t current_goal_task_id_ = 0;
 
     ros::Time start_time_, finish_time_;
     ros::Time traj_start_time_;  // 轨迹开始时间，用于超时检测
@@ -579,6 +587,7 @@ private:
     void remoteStateCb(const prometheus_two_uav_coverage_search::SwarmState::ConstPtr &msg);
     void remoteChunkCb(const prometheus_two_uav_coverage_search::SwarmMapChunkConstPtr &msg);
     void remoteFrontierCb(const prometheus_two_uav_coverage_search::SwarmFrontierArrayConstPtr &msg);
+    void swarmTaskCb(const prometheus_two_uav_coverage_search::SwarmTaskArrayConstPtr &msg);
     void mapRequestCb(const prometheus_two_uav_coverage_search::SwarmMapRequestConstPtr &msg);
 
     void mainloopCb(const ros::TimerEvent &e);
@@ -641,6 +650,12 @@ private:
     int chunkIdForAddress(int address) const;
     void appendChunk(int chunk_id, bool snapshot,
                      prometheus_two_uav_coverage_search::SwarmMapChunk &msg);
+    uint64_t frontierTaskId(const FrontierFinder::FrontierCluster &frontier);
+    bool isFrontierLeasedToSelf(const FrontierFinder::FrontierCluster &frontier);
+    uint64_t leasedTaskIdForFrontier(const FrontierFinder::FrontierCluster &frontier);
+    bool frontierMatchesTask(const FrontierFinder::FrontierCluster &frontier,
+                             const prometheus_two_uav_coverage_search::SwarmTask &task);
+    bool currentGoalLeaseValid() const;
 
 };
 

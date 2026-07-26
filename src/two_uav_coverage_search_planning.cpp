@@ -102,8 +102,14 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
         planner->max_yaw_rate_ = max_yaw_rate_;
         planner->goal_reach_dist_ = goal_reach_dist_;
         planner->sim_mode_ = sim_mode_;
+        planner->cooperative_mode_ = cooperative_mode_;
+        planner->local_swarm_tasks_ = local_swarm_tasks_;
+        planner->remote_swarm_tasks_ = remote_swarm_tasks_;
+        planner->local_swarm_task_received_ = local_swarm_task_received_;
+        planner->remote_swarm_task_received_ = remote_swarm_task_received_;
         planner->current_goal_ = current_goal_;
         planner->current_goal_yaw_ = current_goal_yaw_;
+        planner->current_goal_task_id_ = current_goal_task_id_;
         planner->has_goal_ = has_goal_;
         planner->has_traj_ = has_traj_;
         planner->committed_heading_ = committed_heading_;
@@ -126,6 +132,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
         planner->cmd_yaw_inited_ = cmd_yaw_inited_;
         planner->frontier_targets_ = frontier_targets_;
         planner->frontier_target_yaws_ = frontier_target_yaws_;
+        planner->frontier_target_task_ids_ = frontier_target_task_ids_;
         planner->frontier_target_idx_ = frontier_target_idx_;
         planner->start_time_ = start_time_;
         planner->goal_commit_time_ = goal_commit_time_;
@@ -239,7 +246,9 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
     const bool old_cmd_yaw_inited = cmd_yaw_inited_;
     const std::vector<Eigen::Vector3d> old_frontier_targets = frontier_targets_;
     const std::vector<double> old_frontier_yaws = frontier_target_yaws_;
+    const std::vector<uint64_t> old_frontier_task_ids = frontier_target_task_ids_;
     const int old_frontier_idx = frontier_target_idx_;
+    const uint64_t old_goal_task_id = current_goal_task_id_;
     const int old_same_goal_replans = same_goal_replan_count_;
     const ros::Time old_goal_commit = goal_commit_time_;
     const bool old_has_failed_goal = has_failed_goal_;
@@ -277,6 +286,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
         current_goal_ = frontier_targets_[next_idx];
         current_goal_(2) = fly_height_;
         current_goal_yaw_ = frontier_target_yaws_[next_idx];
+        current_goal_task_id_ = frontier_target_task_ids_[next_idx];
         has_goal_ = true;
         if (planPathToGoal()) {
             generateBsplineTraj();
@@ -286,6 +296,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
                 prepared.handoff_time = handoff_time;
                 prepared.goal = current_goal_;
                 prepared.goal_yaw = current_goal_yaw_;
+                prepared.task_id = current_goal_task_id_;
                 prepared.astar_path = astar_path_;
                 prepared.points = traj_points_;
                 prepared.vels = traj_vels_;
@@ -319,7 +330,9 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
     cmd_yaw_inited_ = old_cmd_yaw_inited;
     frontier_targets_ = old_frontier_targets;
     frontier_target_yaws_ = old_frontier_yaws;
+    frontier_target_task_ids_ = old_frontier_task_ids;
     frontier_target_idx_ = old_frontier_idx;
+    current_goal_task_id_ = old_goal_task_id;
     same_goal_replan_count_ = old_same_goal_replans;
     goal_commit_time_ = old_goal_commit;
     has_failed_goal_ = old_has_failed_goal;
@@ -427,18 +440,18 @@ bool CoverageSearchManager::selectNextFrontier() {
     if (ftr_count > 0) {
         frontier_targets_.clear();
         frontier_target_yaws_.clear();
+        frontier_target_task_ids_.clear();
 
         struct TargetCandidate {
             Eigen::Vector3d pos;
             double yaw;
             double euclid_dist;
-            bool recent;
+            uint64_t task_id;
         };
 
         std::vector<TargetCandidate> candidates;
         int clusters_without_view = 0;
         int skipped_not_free = 0;
-        int skipped_too_close = 0;
         int reach_direct_failed = 0;
         int reach_astar_tried = 0;
         int reach_astar_failed = 0;
@@ -448,42 +461,36 @@ bool CoverageSearchManager::selectNextFrontier() {
         int reach_astar_unknown_rejected = 0;
         int reach_astar_skipped = 0;
         int reach_budget_break = 0;
-        const uint64_t current_frontier_generation = frontier_finder_.update_generation_;
-
         for (auto &ftr : frontier_finder_.frontiers_) {
             if (ftr.viewpoints.empty()) {
                 clusters_without_view++;
                 continue;
             }
+            const uint64_t lease_task_id = leasedTaskIdForFrontier(ftr);
+            if (lease_task_id == 0) continue;
 
-            // 不再只取按可见收益排序的前6个；全量汇总后由全局最近候选池限流。
-            for (int i = 0; i < (int)ftr.viewpoints.size(); ++i) {
-                const Eigen::Vector3d &vp = ftr.viewpoints[i];
-                double dist = (uav_pos_.head<2>() - vp.head<2>()).norm();
+            // Each frontier cluster contributes exactly its best observation
+            // viewpoint.  The final target is selected locally from those
+            // leased cluster representatives using the current UAV state.
+            const Eigen::Vector3d &vp = ftr.viewpoints.front();
+            const double dist = (uav_pos_.head<2>() - vp.head<2>()).norm();
 
-                // 仅防止重复选择完全相同的旧视点，不排除其附近的新前沿视点。
-                if (rolling_prepare_in_progress_ &&
-                    (vp.head<2>() - current_goal_.head<2>()).norm() < 0.10) {
-                    continue;
-                }
-
-                Eigen::Vector3i idx;
-                coverage_map_.posToIndex(vp, idx);
-                if (!coverage_map_.isInMap2D(idx(0), idx(1)) ||
-                    !coverage_map_.isFree2D(idx(0), idx(1))) {
-                    skipped_not_free++;
-                    continue;
-                }
-
-                if (dist < 0.55) {
-                    skipped_too_close++;
-                    continue;
-                }
-
-                const bool recent = current_frontier_generation > 0 &&
-                    ftr.changed_generation + 1 >= current_frontier_generation;
-                candidates.push_back({vp, ftr.viewpoint_yaws[i], dist, recent});
+            // 仅防止重复选择完全相同的旧视点，不排除其附近的新前沿视点。
+            if (rolling_prepare_in_progress_ &&
+                (vp.head<2>() - current_goal_.head<2>()).norm() < 0.10) {
+                continue;
             }
+
+            Eigen::Vector3i idx;
+            coverage_map_.posToIndex(vp, idx);
+            if (!coverage_map_.isInMap2D(idx(0), idx(1)) ||
+                !coverage_map_.isFree2D(idx(0), idx(1))) {
+                skipped_not_free++;
+                continue;
+            }
+
+            const double yaw = ftr.viewpoint_yaws.empty() ? uav_yaw_ : ftr.viewpoint_yaws.front();
+            candidates.push_back({vp, yaw, dist, lease_task_id});
 
         }
 
@@ -492,15 +499,11 @@ bool CoverageSearchManager::selectNextFrontier() {
                 return a.euclid_dist < b.euclid_dist;
             };
             std::sort(candidates.begin(), candidates.end(), by_euclid);
-            std::vector<TargetCandidate> recent_candidates;
-            std::vector<TargetCandidate> older_candidates;
-            for (const auto &candidate : candidates) {
-                (candidate.recent ? recent_candidates : older_candidates).push_back(candidate);
-            }
 
             struct ReachableCandidate {
                 Eigen::Vector3d pos;
                 double yaw;
+                uint64_t task_id;
                 double path_len;
                 double final_cost;
                 double path_time;
@@ -596,6 +599,7 @@ bool CoverageSearchManager::selectNextFrontier() {
                     reachable.push_back({
                         cand.pos,
                         cand.yaw,
+                        cand.task_id,
                         path_len,
                         final_cost,
                         path_time,
@@ -629,18 +633,7 @@ bool CoverageSearchManager::selectNextFrontier() {
                 }
             };
 
-            // 先只在本次与上一次增量更新产生/改变的前沿中选择；确实没有
-            // 可达解时才回退到更老的全局前沿，避免近处新前沿被远处旧簇抢走。
-            evaluateCandidateSet(recent_candidates);
-            const bool used_recent_pool = !reachable.empty();
-            if (reachable.empty()) evaluateCandidateSet(older_candidates);
-
-            ROS_INFO_THROTTLE(1.0,
-                "[CoverageSearch] Frontier generation priority: current=%llu, "
-                "recent_viewpoints=%zu, older_viewpoints=%zu, selected_pool=%s.",
-                (unsigned long long)current_frontier_generation,
-                recent_candidates.size(), older_candidates.size(),
-                used_recent_pool ? "recent-two" : "global-fallback");
+            evaluateCandidateSet(candidates);
 
             if (!reachable.empty()) {
                 std::sort(reachable.begin(), reachable.end(),
@@ -661,6 +654,7 @@ bool CoverageSearchManager::selectNextFrontier() {
                 for (int i = 0; i < target_num; ++i) {
                     frontier_targets_.push_back(reachable[i].pos);
                     frontier_target_yaws_.push_back(reachable[i].yaw);
+                    frontier_target_task_ids_.push_back(reachable[i].task_id);
                 }
             }
         }
@@ -669,7 +663,6 @@ bool CoverageSearchManager::selectNextFrontier() {
             cout << YELLOW << "[CoverageSearch] Frontiers exist but no usable viewpoint. clusters="
                  << ftr_count << ", no_view=" << clusters_without_view
                  << ", not_free=" << skipped_not_free
-                 << ", too_close=" << skipped_too_close
                  << ", reach_direct_failed=" << reach_direct_failed
                  << ", astar_tried=" << reach_astar_tried
                  << ", astar_failed=" << reach_astar_failed
@@ -896,7 +889,9 @@ void CoverageSearchManager::abortCurrentGoalForSafety(const std::string &reason)
     has_goal_ = false;
     frontier_targets_.clear();
     frontier_target_yaws_.clear();
+    frontier_target_task_ids_.clear();
     frontier_target_idx_ = 0;
+    current_goal_task_id_ = 0;
     same_goal_replan_count_ = 0;
     replan_count_++;
 }
@@ -906,12 +901,14 @@ void CoverageSearchManager::filterFailedGoal() {
     if (!has_failed_goal_) return;
     double elapsed = (ros::Time::now() - failed_goal_time_).toSec();
     if (elapsed > 3.0) { has_failed_goal_ = false; return; }
-    std::vector<Eigen::Vector3d> pos; std::vector<double> yw;
+    std::vector<Eigen::Vector3d> pos; std::vector<double> yw; std::vector<uint64_t> task_ids;
     for (int i = 0; i < (int)frontier_targets_.size(); i++) {
         if ((frontier_targets_[i] - failed_goal_).head<2>().norm() < 1.0) continue;
         pos.push_back(frontier_targets_[i]);
         yw.push_back(frontier_target_yaws_[i]);
+        task_ids.push_back(frontier_target_task_ids_[i]);
     }
     frontier_targets_ = pos;
     frontier_target_yaws_ = yw;
+    frontier_target_task_ids_ = task_ids;
 }

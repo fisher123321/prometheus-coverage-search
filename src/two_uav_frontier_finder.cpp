@@ -12,7 +12,7 @@ void FrontierFinder::init(ros::NodeHandle &nh, CoverageMap *map) {
     nh.param("frontier_finder/candidate_dphi", candidate_dphi_, 0.524);
     nh.param("frontier_finder/candidate_rnum", candidate_rnum_, 4);
     nh.param("frontier_finder/down_sample", down_sample_, 1);
-    nh.param("frontier_finder/min_candidate_dist", min_candidate_dist_, 1.0);
+    nh.param("frontier_finder/min_candidate_dist", min_candidate_dist_, 0.0);
     nh.param("frontier_finder/min_visib_num", min_visib_num_, 3);
     nh.param("frontier_finder/min_candidate_clearance", min_candidate_clearance_, 0.2);
     nh.param("frontier_finder/min_candidate_occupied_clearance", min_candidate_occupied_clearance_, 0.55);
@@ -640,13 +640,12 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
     std::sort(order.begin(), order.end(), [&](int a, int b) {
         return visib_nums[a] > visib_nums[b];
     });
-    for (int idx : order) {
-        ROS_ASSERT_MSG(visib_nums[idx] >= min_visib_num_,
-                       "Stored viewpoint must directly see its frontier cluster");
-        ftr.viewpoints.push_back(viewpoints[idx]);
-        ftr.viewpoint_yaws.push_back(yaws[idx]);
-        ftr.viewpoint_visib_nums.push_back(visib_nums[idx]);
-    }
+    const int best = order.front();
+    ROS_ASSERT_MSG(visib_nums[best] >= min_visib_num_,
+                   "Stored viewpoint must directly see its frontier cluster");
+    ftr.viewpoints.push_back(viewpoints[best]);
+    ftr.viewpoint_yaws.push_back(yaws[best]);
+    ftr.viewpoint_visib_nums.push_back(visib_nums[best]);
 
     if (ftr.viewpoints.empty()) {
         ROS_DEBUG_THROTTLE(5.0,

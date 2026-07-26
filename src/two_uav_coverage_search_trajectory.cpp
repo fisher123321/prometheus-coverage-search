@@ -1349,6 +1349,7 @@ bool CoverageSearchManager::activatePendingTrajectory() {
 
     current_goal_ = pending_traj_.goal;
     current_goal_yaw_ = pending_traj_.goal_yaw;
+    current_goal_task_id_ = pending_traj_.task_id;
     astar_path_.swap(pending_traj_.astar_path);
     traj_points_.swap(pending_traj_.points);
     traj_vels_.swap(pending_traj_.vels);
@@ -1396,6 +1397,10 @@ void CoverageSearchManager::executeTrajectory() {
     }
 
     const ros::Time execution_now = ros::Time::now();
+    if (!currentGoalLeaseValid()) {
+        abortCurrentGoalForSafety("task lease expired or reassigned");
+        return;
+    }
     const double execution_elapsed = (execution_now - traj_start_time_).toSec();
     const bool handoff_due = pending_traj_.ready &&
         (active_time_spline_.valid && pending_traj_.handoff_time >= 0.0
