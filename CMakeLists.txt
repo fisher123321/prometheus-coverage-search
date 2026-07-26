@@ -73,6 +73,10 @@ add_executable(two_uav_depth_cloud_downsample_node src/two_uav_depth_cloud_downs
 add_dependencies(two_uav_depth_cloud_downsample_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(two_uav_depth_cloud_downsample_node ${catkin_LIBRARIES} ${PCL_LIBRARIES})
 
+add_executable(two_uav_fov_visualizer src/two_uav_fov_visualizer.cpp)
+add_dependencies(two_uav_fov_visualizer ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(two_uav_fov_visualizer ${catkin_LIBRARIES})
+
 add_executable(two_uav_swarm_bridge src/two_uav_swarm_bridge.cpp)
 add_dependencies(two_uav_swarm_bridge ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(two_uav_swarm_bridge ${catkin_LIBRARIES} zmq zmqpp)
@@ -84,7 +88,7 @@ target_link_libraries(two_uav_coordinator ${catkin_LIBRARIES})
 install(TARGETS two_uav_coverage_lib
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION})
-install(TARGETS two_uav_coverage_search_node two_uav_depth_cloud_downsample_node
+install(TARGETS two_uav_coverage_search_node two_uav_depth_cloud_downsample_node two_uav_fov_visualizer
   two_uav_swarm_bridge two_uav_coordinator
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 install(DIRECTORY include/ launch config docs rviz

@@ -130,19 +130,14 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
     std::vector<FrontierCluster> kept;
     kept.reserve(frontiers_.size());
     for (auto &ftr : frontiers_) {
-        if (haveOverlap(ftr.box_min_, ftr.box_max_, search_min, search_max)) {
-            search_min = search_min.cwiseMin(ftr.box_min_ - Eigen::Vector3d(margin, margin, margin));
-            search_max = search_max.cwiseMax(ftr.box_max_ + Eigen::Vector3d(margin, margin, margin));
+        if (haveOverlap(ftr.box_min_, ftr.box_max_, update_min, update_max) &&
+            isFrontierChanged(ftr)) {
             resetFrontierFlag(ftr);
         } else {
             kept.push_back(ftr);
         }
     }
     frontiers_.swap(kept);
-    for (int k = 0; k < 3; ++k) {
-        search_min(k) = std::max(search_min(k), map_->min_range_(k));
-        search_max(k) = std::min(search_max(k), map_->max_range_(k));
-    }
 
     Eigen::Vector3i min_id, max_id;
     map_->posToIndex(search_min, min_id);
@@ -183,6 +178,22 @@ bool FrontierFinder::haveOverlap(const Eigen::Vector3d &min1, const Eigen::Vecto
         if (max1(k) < min2(k) || max2(k) < min1(k)) return false;
     }
     return true;
+}
+
+bool FrontierFinder::isFrontierChanged(const FrontierCluster &ftr) {
+    if (ftr.cells.empty()) return true;
+    int changed = 0;
+    const int threshold = std::max(1, (int)ceil(0.15 * (double)ftr.cells.size()));
+    const int stride = std::max(1, (int)ftr.cells.size() / 180);
+    for (int i = 0; i < (int)ftr.cells.size(); i += stride) {
+        Eigen::Vector3i idx;
+        map_->posToIndex(ftr.cells[i], idx);
+        if (!isFrontierCell(idx)) {
+            changed += stride;
+            if (changed >= threshold) return true;
+        }
+    }
+    return false;
 }
 
 void FrontierFinder::resetFrontierFlag(const FrontierCluster &ftr) {

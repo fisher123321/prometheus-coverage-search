@@ -281,7 +281,7 @@ Visualization Manager:
           Name: FOV
           Namespaces:
             depth_camera_fov: true
-          Queue Size: 100
+          Queue Size: 1
           Value: true
         - Class: rviz/Marker
           Enabled: true
@@ -321,7 +321,7 @@ Visualization Manager:
           Name: FOV
           Namespaces:
             depth_camera_fov: true
-          Queue Size: 100
+          Queue Size: 1
           Value: true
         - Class: rviz/Marker
           Enabled: true
@@ -338,7 +338,7 @@ Visualization Manager:
     Background Color: 186; 189; 182
     Default Light: true
     Fixed Frame: world
-    Frame Rate: 20
+    Frame Rate: 60
   Name: root
   Tools:
     - Class: rviz/Interact

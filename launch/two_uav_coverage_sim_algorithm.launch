@@ -46,6 +46,12 @@
     <arg name="global_coverage_source" value="$(arg uav1_id)"/>
     <arg name="tx_prefix" value="/uav$(arg uav2_id)/two_uav/tx"/><arg name="rx_prefix" value="/uav$(arg uav2_id)/two_uav/rx"/>
   </include>
+  <node pkg="prometheus_two_uav_coverage_search" type="two_uav_fov_visualizer" name="fov_visualizer_uav1" output="screen">
+    <param name="uav_id" value="$(arg uav1_id)"/>
+  </node>
+  <node pkg="prometheus_two_uav_coverage_search" type="two_uav_fov_visualizer" name="fov_visualizer_uav2" output="screen">
+    <param name="uav_id" value="$(arg uav2_id)"/>
+  </node>
   <include file="$(find prometheus_two_uav_coverage_search)/launch/two_uav_bridge.launch">
     <arg name="local_ip" value="127.0.0.1"/><arg name="peer_ip" value="127.0.0.1"/>
     <arg name="tx_prefix" value="/uav$(arg uav1_id)/two_uav/tx"/><arg name="rx_prefix" value="/uav$(arg uav1_id)/two_uav/rx"/><arg name="port_base" value="31000"/><arg name="peer_port_base" value="32000"/>

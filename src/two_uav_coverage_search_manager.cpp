@@ -94,7 +94,7 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     path_vis_pub_ = nh.advertise<visualization_msgs::Marker>(
         uav_name_ + "/prometheus/coverage_search/path_vis", 20);
     fov_vis_pub_ = nh.advertise<visualization_msgs::Marker>(
-        uav_name_ + "/prometheus/coverage_search/fov_vis", 1, false);
+        uav_name_ + "/prometheus/coverage_search/fov_vis", 1, true);
     coverage_status_pub_ = nh.advertise<visualization_msgs::Marker>(
         uav_name_ + "/prometheus/coverage_search/status", 1);
     uav_label_pub_ = nh.advertise<visualization_msgs::Marker>(
@@ -169,7 +169,6 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     last_frontier_found_valid_ = false;
     residual_scan_yaw_ = 0.0;
     last_residual_search_time_ = ros::Time(0);
-
     cout << GREEN << "[CoverageSearch] init. UAV: " << uav_name_
          << ", Fly height: " << fly_height_
          << ", Sensing range: " << sensing_range_ << TAIL << endl;
@@ -184,13 +183,6 @@ void CoverageSearchManager::uavStateCb(const prometheus_msgs::UAVState::ConstPtr
     uav_pos_ = Eigen::Vector3d(msg->position[0], msg->position[1], fly_height_);
     uav_vel_ = Eigen::Vector3d(msg->velocity[0], msg->velocity[1], msg->velocity[2]);
     uav_yaw_ = msg->attitude[2];
-
-    static ros::Time last_fov_pub(0);
-    ros::Time now = ros::Time::now();
-    if (!now.isZero() && (last_fov_pub.isZero() || (now - last_fov_pub).toSec() > 0.02)) {
-        publishCameraFov();
-        last_fov_pub = now;
-    }
 }
 
 void CoverageSearchManager::uavControlStateCb(const prometheus_msgs::UAVControlState::ConstPtr &msg) {
@@ -1066,7 +1058,6 @@ void CoverageSearchManager::publishVisualization() {
         path_vis_pub_.publish(tp_marker);
     }
 
-    publishCameraFov();
 }
 
 void CoverageSearchManager::publishCameraFov() {
@@ -1094,7 +1085,8 @@ void CoverageSearchManager::publishCameraFov() {
         q_wb.normalize();
         R_wb = q_wb.toRotationMatrix();
     } else {
-        double cy = cos(uav_yaw_), sy = sin(uav_yaw_);
+        const double yaw = uav_state_.attitude[2];
+        const double cy = cos(yaw), sy = sin(yaw);
         R_wb << cy, -sy, 0,
                 sy,  cy, 0,
                  0,   0, 1;

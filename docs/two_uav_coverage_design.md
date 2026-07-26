@@ -1278,3 +1278,22 @@ bridge 的证据。接收端没收到该 chunk 的任何后续 revision 时也�
 用户在重新部署并运行后确认：本修复**直接消除了问题**。UAV1 融合图中的 B 区域前沿不再
 呈 chunk 对齐的直线/直角块状，说明根因确为 `SwarmMapChunk` 在 bridge 的全通道 5 Hz
 节流下被静默丢弃，而非 AABB 聚类或前沿可视化。
+
+### 2026-07-26：RViz FOV 实时跟随无人机朝向
+
+- 症状：`/uav<ID>/prometheus/state` 实测稳定为 50 Hz，但原先由
+  `coverage_search_node` 发布的 `/uav<ID>/prometheus/coverage_search/fov_vis`
+  约为 1 Hz。深度建图和规划与状态回调共用该节点的单线程 `ros::spin()`；重计算阻塞
+  状态回调，导致 RViz 中的 world-FOV 明显落后于无人机姿态。
+- 最终方案：新增独立的 `two_uav_fov_visualizer` 进程。每架机各启动一个实例，直接订阅
+  `/uav<ID>/prometheus/state`，以每条状态消息重建并发布原有的
+  `/uav<ID>/prometheus/coverage_search/fov_vis` Marker。FOV 保持 `frame_id=world`，
+  不采用会被当前 RViz/TF 链路丢弃的 frame-locked Marker，因此原有 RViz 的两个 FOV
+  Display 和话题均不变。
+- FOV 几何、D435i 安装偏移、俯仰和水平/垂直视场角均与覆盖搜索原实现相同；仅将发布者
+  从会被阻塞的覆盖节点移出。`two_uav_coverage_search_manager` 不再向该话题发布，避免
+  低频旧 Marker 覆盖实时 Marker。
+- `two_uav_coverage_sim_algorithm.launch` 在两套 onboard 覆盖节点后自动启动
+  `fov_visualizer_uav1` 和 `fov_visualizer_uav2`。RViz 的两个 FOV Display 订阅队列为 1，
+  根配置帧率为 60，旧消息不会积压。编译已验证
+  `two_uav_fov_visualizer` 与 `two_uav_coverage_search_node`。
