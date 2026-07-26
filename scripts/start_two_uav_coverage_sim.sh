@@ -4,8 +4,11 @@ set -euo pipefail
 [[ $# -le 3 ]] || { echo "usage: $0 [uav1-id] [uav2-id] [fly-height-m]" >&2; exit 2; }
 
 workspace=${PROMETHEUS_WS:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"}
+mavros_ws=${PROMETHEUS_MAVROS:-"${HOME}/prometheus_mavros"}
+[[ -f "$mavros_ws/devel/setup.bash" ]] || { echo "missing MAVROS setup: $mavros_ws/devel/setup.bash" >&2; exit 1; }
 source /opt/ros/noetic/setup.bash
-source "$workspace/devel/setup.bash"
+source "$mavros_ws/devel/setup.bash"
+source "$workspace/devel/setup.bash" --extend
 
 uav1_id=${1:-1}
 uav2_id=${2:-2}
@@ -26,8 +29,20 @@ require_controller() {
   }
 }
 
+require_yaw_rate() {
+  local id=$1 response yaw_rate
+  response="$(timeout 5s rosservice call "/uav${id}/mavros/param/get" "param_id: 'MC_YAWRATE_MAX'" 2>/dev/null || true)"
+  yaw_rate="$(awk '/real:/ { print $2; exit }' <<<"$response")"
+  awk -v value="$yaw_rate" 'BEGIN { exit !(value > 0) }' || {
+    echo "UAV${id} has MC_YAWRATE_MAX=${yaw_rate:-unreadable}; yaw control is disabled. Restart the simulator so uav_control_indoor.yaml restores it." >&2
+    return 1
+  }
+}
+
 require_controller "$uav1_id" || exit 1
 require_controller "$uav2_id" || exit 1
+require_yaw_rate "$uav1_id" || exit 1
+require_yaw_rate "$uav2_id" || exit 1
 
 # The two state streams must already be expressed in one common world frame.
 # Do this before launching the bridge/coordinator so a per-vehicle PX4-local

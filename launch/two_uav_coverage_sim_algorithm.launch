@@ -7,19 +7,20 @@
     <param name="input_topic" value="/uav$(arg uav1_id)/camera/depth/color/points"/><param name="output_topic" value="/uav$(arg uav1_id)/camera/depth/color/points_downsampled"/>
     <param name="octomap_output_topic" value="/uav$(arg uav1_id)/camera/depth/color/points_octomap"/>
     <param name="leaf_size" value="0.10"/><param name="min_range" value="0.3"/><param name="max_range" value="3.0"/><param name="max_rate" value="10.0"/>
-    <!-- Virtual clear endpoints are interpreted as occupied hits by OctoMap. -->
-    <param name="add_fov_clear_points" value="false"/><param name="fov_h" value="1.5708"/><param name="fov_v" value="1.287"/><param name="clear_point_range" value="3.15"/>
+    <!-- Endpoints beyond OctoMap's 3.0 m max range are inserted as free-only rays. -->
+    <param name="add_fov_clear_points" value="true"/><param name="fov_h" value="1.5708"/><param name="fov_v" value="1.287"/><param name="clear_point_range" value="3.15"/>
   </node>
   <node pkg="prometheus_two_uav_coverage_search" type="two_uav_depth_cloud_downsample_node" name="depth_downsample_uav2" output="screen">
     <param name="input_topic" value="/uav$(arg uav2_id)/camera/depth/color/points"/><param name="output_topic" value="/uav$(arg uav2_id)/camera/depth/color/points_downsampled"/>
     <param name="octomap_output_topic" value="/uav$(arg uav2_id)/camera/depth/color/points_octomap"/>
     <param name="leaf_size" value="0.10"/><param name="min_range" value="0.3"/><param name="max_range" value="3.0"/><param name="max_rate" value="10.0"/>
-    <param name="add_fov_clear_points" value="false"/><param name="fov_h" value="1.5708"/><param name="fov_v" value="1.287"/><param name="clear_point_range" value="3.15"/>
+    <!-- Endpoints beyond OctoMap's 3.0 m max range are inserted as free-only rays. -->
+    <param name="add_fov_clear_points" value="true"/><param name="fov_h" value="1.5708"/><param name="fov_v" value="1.287"/><param name="clear_point_range" value="3.15"/>
   </node>
   <node pkg="octomap_server" type="octomap_server_node" name="octomap_server_uav1" output="screen">
     <remap from="/octomap_point_cloud_centers" to="/uav$(arg uav1_id)/octomap_point_cloud_centers"/><remap from="/octomap_full" to="/uav$(arg uav1_id)/octomap_full"/><remap from="/octomap_binary" to="/uav$(arg uav1_id)/octomap_binary"/><remap from="/projected_map" to="/uav$(arg uav1_id)/projected_map"/>
     <remap from="cloud_in" to="/uav$(arg uav1_id)/camera/depth/color/points_octomap"/>
-    <param name="resolution" value="0.10"/><param name="frame_id" value="world"/><param name="base_frame_id" value="world"/><param name="sensor_model/max_range" value="3.0"/>
+    <param name="resolution" value="0.1"/><param name="frame_id" value="world"/><param name="base_frame_id" value="world"/><param name="sensor_model/max_range" value="3.0"/>
     <!-- D435i scans often contain no floor plane.  Do not run OctoMap's RANSAC
          ground detector; it only emits warnings and is not used for planning. -->
     <!-- Filter in world frame before insertion.  This is what keeps the floor
@@ -31,7 +32,7 @@
   <node pkg="octomap_server" type="octomap_server_node" name="octomap_server_uav2" output="screen">
     <remap from="/octomap_point_cloud_centers" to="/uav$(arg uav2_id)/octomap_point_cloud_centers"/><remap from="/octomap_full" to="/uav$(arg uav2_id)/octomap_full"/><remap from="/octomap_binary" to="/uav$(arg uav2_id)/octomap_binary"/><remap from="/projected_map" to="/uav$(arg uav2_id)/projected_map"/>
     <remap from="cloud_in" to="/uav$(arg uav2_id)/camera/depth/color/points_octomap"/>
-    <param name="resolution" value="0.10"/><param name="frame_id" value="world"/><param name="base_frame_id" value="world"/><param name="sensor_model/max_range" value="3.0"/>
+    <param name="resolution" value="0.1"/><param name="frame_id" value="world"/><param name="base_frame_id" value="world"/><param name="sensor_model/max_range" value="3.0"/>
     <param name="pointcloud_min_z" value="0.20"/><param name="pointcloud_max_z" value="2.8"/>
     <param name="occupancy_min_z" value="0.20"/><param name="filter_ground" value="false"/>
   </node>

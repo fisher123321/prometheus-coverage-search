@@ -47,6 +47,52 @@ Visualization Manager:
       Plane Cell Count: 30
       Reference Frame: <Fixed Frame>
       Value: true
+    - Class: octomap_rviz_plugin/OccupancyGrid
+      Enabled: true
+      Max. Height Display: 3.4028234663852886e+38
+      Max. Octree Depth: 15
+      Min. Height Display: 0.5
+      Name: OccupancyGrid
+      Octomap Topic: /uav1/octomap_binary
+      Queue Size: 5
+      Value: true
+      Voxel Alpha: 1
+      Voxel Coloring: Z-Axis
+      Voxel Rendering: Occupied Voxels
+    - Class: octomap_rviz_plugin/OccupancyGrid
+      Enabled: true
+      Max. Height Display: 3.4028234663852886e+38
+      Max. Octree Depth: 15
+      Min. Height Display: 0.5
+      Name: OccupancyGrid
+      Octomap Topic: /uav2/octomap_binary
+      Queue Size: 5
+      Value: true
+      Voxel Alpha: 1
+      Voxel Coloring: Z-Axis
+      Voxel Rendering: Occupied Voxels
+    - Alpha: 0.699999988079071
+      Class: octomap_rviz_plugin/OccupancyMap
+      Color Scheme: map
+      Draw Behind: false
+      Enabled: false
+      Max. Octree Depth: 15
+      Name: OccupancyMap
+      Octomap Binary Topic: /uav1/octomap_binary
+      Unreliable: false
+      Use Timestamp: false
+      Value: false
+    - Alpha: 0.699999988079071
+      Class: octomap_rviz_plugin/OccupancyMap
+      Color Scheme: map
+      Draw Behind: false
+      Enabled: false
+      Max. Octree Depth: 15
+      Name: OccupancyMap
+      Octomap Binary Topic: /uav2/octomap_binary
+      Unreliable: false
+      Use Timestamp: false
+      Value: false
     - Class: rviz/Group
       Displays:
         - Angle Tolerance: 0.10000000149011612
@@ -120,40 +166,6 @@ Visualization Manager:
       Name: 无人机1
     - Class: rviz/Group
       Displays:
-        - Class: rviz/Marker
-          Enabled: true
-          Marker Topic: /uav1/prometheus/coverage_search/path_vis
-          Name: 覆盖搜索-路径与目标
-          Namespaces:
-            bspline_traj: true
-            coverage_path: true
-            goal_point: true
-            goal_view_yaw: true
-            traj_points: true
-          Queue Size: 100
-          Value: true
-        - Class: rviz/MarkerArray
-          Enabled: true
-          Marker Topic: /uav1/prometheus/coverage_search/frontier_vis
-          Name: 统一前沿簇（UAV1 融合地图）
-          Namespaces:
-            frontier_best_view_yaw: true
-            frontier_best_viewpoint: true
-            frontier_cells: true
-          Queue Size: 100
-          Value: true
-      Enabled: true
-      Name: 覆盖搜索1
-    - Class: rviz/Marker
-      Enabled: true
-      Marker Topic: /uav1/prometheus/coverage_search/fov_vis
-      Name: UAV1 FOV
-      Namespaces:
-        depth_camera_fov: true
-      Queue Size: 100
-      Value: true
-    - Class: rviz/Group
-      Displays:
         - Angle Tolerance: 0.10000000149011612
           Class: rviz/Odometry
           Covariance:
@@ -192,7 +204,7 @@ Visualization Manager:
         - Class: rviz/Marker
           Enabled: true
           Marker Topic: /uav2/prometheus/uav_mesh
-          Name: 无人机模型
+          Name: 无人机位置 - 模型
           Namespaces:
             mesh: true
           Queue Size: 100
@@ -207,7 +219,7 @@ Visualization Manager:
           Length: 0.30000001192092896
           Line Style: Billboards
           Line Width: 0.05000000074505806
-          Name: 飞行轨迹
+          Name: 无人机轨迹
           Offset:
             X: 0
             Y: 0
@@ -223,12 +235,70 @@ Visualization Manager:
           Value: true
       Enabled: true
       Name: 无人机2
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav1/prometheus/coverage_search/uav_label
+      Name: UAV1 标签
+      Namespaces:
+        uav_label: true
+      Queue Size: 10
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav2/prometheus/coverage_search/uav_label
+      Name: UAV2 标签
+      Namespaces:
+        uav_label: true
+      Queue Size: 10
+      Value: true
+    - Class: rviz/Group
+      Displays:
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /uav1/prometheus/coverage_search/path_vis
+          Name: 覆盖搜索-路径与目标
+          Namespaces:
+            bspline_traj: true
+            coverage_path: true
+            goal_point: true
+            goal_view_yaw: true
+            traj_points: true
+          Queue Size: 100
+          Value: true
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /uav1/prometheus/coverage_search/frontier_vis
+          Name: 统一前沿簇（UAV1 融合地图）
+          Namespaces:
+            frontier_best_view_yaw: true
+            frontier_best_viewpoint: true
+            frontier_cells: true
+          Queue Size: 100
+          Value: true
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /uav1/prometheus/coverage_search/fov_vis
+          Name: FOV
+          Namespaces:
+            depth_camera_fov: true
+          Queue Size: 100
+          Value: true
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /uav1/prometheus/coverage_search/task_labels
+          Name: 任务归属标签
+          Namespaces:
+            task_owner: true
+          Queue Size: 20
+          Value: true
+      Enabled: true
+      Name: 覆盖搜索1
     - Class: rviz/Group
       Displays:
         - Class: rviz/Marker
           Enabled: true
           Marker Topic: /uav2/prometheus/coverage_search/path_vis
-          Name: 覆盖路径与目标
+          Name: 覆盖搜索-路径与目标
           Namespaces:
             bspline_traj: true
             coverage_path: true
@@ -240,7 +310,7 @@ Visualization Manager:
         - Class: rviz/MarkerArray
           Enabled: false
           Marker Topic: /uav2/prometheus/coverage_search/frontier_vis
-          Name: UAV2 前沿簇与候选视点（调试）
+          Name: 统一前沿簇（UAV2 融合地图）
           Namespaces:
             {}
           Queue Size: 100
@@ -253,54 +323,16 @@ Visualization Manager:
             depth_camera_fov: true
           Queue Size: 100
           Value: true
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /uav2/prometheus/coverage_search/task_labels
+          Name: 任务归属标签
+          Namespaces:
+            task_owner: true
+          Queue Size: 20
+          Value: true
       Enabled: true
       Name: 覆盖搜索2
-    - Class: octomap_rviz_plugin/OccupancyGrid
-      Enabled: true
-      Max. Height Display: inf
-      Max. Octree Depth: 16
-      Min. Height Display: -inf
-      Name: OccupancyGrid
-      Octomap Topic: /uav1/octomap_full
-      Queue Size: 5
-      Value: true
-      Voxel Alpha: 1
-      Voxel Coloring: Z-Axis
-      Voxel Rendering: Occupied Voxels
-    - Class: octomap_rviz_plugin/OccupancyGrid
-      Enabled: true
-      Max. Height Display: inf
-      Max. Octree Depth: 16
-      Min. Height Display: -inf
-      Name: OccupancyGrid
-      Octomap Topic: /uav2/octomap_full
-      Queue Size: 5
-      Value: true
-      Voxel Alpha: 1
-      Voxel Coloring: Z-Axis
-      Voxel Rendering: Occupied Voxels
-    - Alpha: 0.699999988079071
-      Class: octomap_rviz_plugin/OccupancyMap
-      Color Scheme: map
-      Draw Behind: false
-      Enabled: true
-      Max. Octree Depth: 16
-      Name: OccupancyMap
-      Octomap Binary Topic: /uav1/octomap_full
-      Unreliable: false
-      Use Timestamp: false
-      Value: true
-    - Alpha: 0.699999988079071
-      Class: octomap_rviz_plugin/OccupancyMap
-      Color Scheme: map
-      Draw Behind: false
-      Enabled: true
-      Max. Octree Depth: 16
-      Name: OccupancyMap
-      Octomap Binary Topic: /uav2/octomap_full
-      Unreliable: false
-      Use Timestamp: false
-      Value: true
   Enabled: true
   Global Options:
     Background Color: 186; 189; 182
@@ -318,7 +350,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 28.296428680419922
+      Distance: 17.421459197998047
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -326,17 +358,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -4.76729679107666
-        Y: 2.9735331535339355
-        Z: -0.34047895669937134
+        X: -3.6334614753723145
+        Y: -2.4032211303710938
+        Z: 1.0705828666687012
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.134796142578125
+      Pitch: 1.1997967958450317
       Target Frame: <Fixed Frame>
-      Yaw: 1.296832799911499
+      Yaw: 3.1568331718444824
     Saved: ~
 Window Geometry:
   Displays:

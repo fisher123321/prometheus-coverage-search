@@ -20,6 +20,7 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     nh.param("coverage_search/max_vel", max_vel_, 1.0);
     nh.param("coverage_search/max_acc", max_acc_, 0.8);
     nh.param("coverage_search/max_yaw_rate", max_yaw_rate_, 0.5);
+    nh.param("coverage_search/max_yaw_acc", max_yaw_acc_, 1.8);
     nh.param("coverage_search/replan_time", replan_time_, 3.0);
     nh.param("coverage_search/goal_reach_dist", goal_reach_dist_, 0.25);
     nh.param("coverage_search/auto_start", auto_start_, true);
@@ -53,7 +54,6 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     nh.param("coverage_search/completion_known_ratio", completion_known_ratio_, 0.99);
     nh.param("coverage_search/completion_no_frontier_dwell", completion_no_frontier_dwell_, 8.0);
     nh.param("coverage_search/residual_scan_yaw_rate", residual_scan_yaw_rate_, 0.6);
-    nh.param("coverage_search/remote_full_frontier_period", remote_full_frontier_period_, 3.0);
     nh.param("coverage_search/swarm_bid_period", swarm_bid_period_, 2.0);
     nh.param("coverage_search/swarm_information_gain_weight", swarm_information_gain_weight_, 0.005);
     nh.param("coverage_search/swarm_bid_max_tasks", swarm_bid_max_tasks_, 16);
@@ -97,6 +97,8 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
         uav_name_ + "/prometheus/coverage_search/fov_vis", 1, false);
     coverage_status_pub_ = nh.advertise<visualization_msgs::Marker>(
         uav_name_ + "/prometheus/coverage_search/status", 1);
+    uav_label_pub_ = nh.advertise<visualization_msgs::Marker>(
+        uav_name_ + "/prometheus/coverage_search/uav_label", 1);
 
     if (cooperative_mode_) {
         swarm_frontier_pub_ = nh.advertise<prometheus_two_uav_coverage_search::SwarmFrontierArray>(
@@ -281,17 +283,7 @@ void CoverageSearchManager::updateFrontiers() {
 
     auto t0 = std::chrono::high_resolution_clock::now();
     coverage_map_.updateDistanceFields();
-    const ros::Time now = ros::Time::now();
-    const bool do_remote_full_refresh = remote_frontier_refresh_pending_ &&
-        (last_remote_frontier_full_refresh_.isZero() ||
-         (now - last_remote_frontier_full_refresh_).toSec() >= remote_full_frontier_period_);
-    if (do_remote_full_refresh) {
-        frontier_finder_.refreshFrontiersFull(uav_pos_);
-        remote_frontier_refresh_pending_ = false;
-        last_remote_frontier_full_refresh_ = now;
-    } else {
-        frontier_finder_.searchFrontiers(uav_pos_);
-    }
+    frontier_finder_.searchFrontiers(uav_pos_);
     int ftr_count = frontier_finder_.getFrontierCount();
     frontier_finder_.publishFrontiers();
     std::vector<Eigen::Vector3d> frontier_avgs;
@@ -303,8 +295,7 @@ void CoverageSearchManager::updateFrontiers() {
     auto t1 = std::chrono::high_resolution_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     if (ms > 120.0) {
-        ROS_WARN_THROTTLE(2.0, "[CoverageSearch] frontier %s update took %.1f ms, frontiers=%d",
-                          do_remote_full_refresh ? "remote-full" : "local-AABB",
+        ROS_WARN_THROTTLE(2.0, "[CoverageSearch] frontier AABB update took %.1f ms, frontiers=%d",
                           ms, frontier_finder_.getFrontierCount());
     }
 }
@@ -551,7 +542,6 @@ void CoverageSearchManager::remoteChunkCb(
         changed = coverage_map_.setRemoteEvidence(msg->addresses[i], msg->evidence[i]) || changed;
     }
     swarm_peer_chunk_revision_[msg->chunk_id] = msg->revision;
-    remote_frontier_refresh_pending_ = remote_frontier_refresh_pending_ || changed;
 }
 
 void CoverageSearchManager::remoteFrontierCb(
@@ -572,6 +562,29 @@ void CoverageSearchManager::mapRequestCb(
 // ★ 主循环 - 简化FSM：INIT → EXPLORING → FINISH
 // ============================================================
 void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
+    // UAV ID 标签 — 独立于 FSM 状态，只要节点运行就发布
+    if (std::isfinite(uav_pos_(0)) && std::isfinite(uav_pos_(1)) && std::isfinite(uav_pos_(2))) {
+        visualization_msgs::Marker label;
+        label.header.frame_id = "world";
+        label.header.stamp = ros::Time::now();
+        label.ns = "uav_label";
+        label.id = 0;
+        label.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        label.action = visualization_msgs::Marker::ADD;
+        label.pose.position.x = uav_pos_(0);
+        label.pose.position.y = uav_pos_(1);
+        label.pose.position.z = uav_pos_(2) + 0.6;
+        label.pose.orientation.w = 1.0;
+        label.scale.z = 0.45;
+        label.color.r = 0.0;
+        label.color.g = 1.0;
+        label.color.b = 0.0;
+        label.color.a = 1.0;
+        label.lifetime = ros::Duration(0.5);
+        label.text = "UAV" + std::to_string(uav_id_);
+        uav_label_pub_.publish(label);
+    }
+
     bool command_ready = (uav_control_state_.control_state ==
                           prometheus_msgs::UAVControlState::COMMAND_CONTROL);
     if (!odom_ready_ || !drone_ready_ || !sensor_ready_ || !command_ready) {

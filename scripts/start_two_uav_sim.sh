@@ -14,6 +14,11 @@ mavros_ws=${PROMETHEUS_MAVROS:-"${HOME}/prometheus_mavros"}
 source /opt/ros/noetic/setup.bash
 source "$mavros_ws/devel/setup.bash"
 source "$workspace/devel/setup.bash" --extend
+# PX4's setup script expands these variables directly.  Seed them because this
+# launcher intentionally runs with `set -u` and a fresh shell may not define them.
+export GAZEBO_PLUGIN_PATH="${GAZEBO_PLUGIN_PATH:-}"
+export GAZEBO_MODEL_PATH="${GAZEBO_MODEL_PATH:-}"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
 source "$px4_root/Tools/setup_gazebo.bash" "$px4_root" "$px4_root/build/amovlab_sitl_default"
 export ROS_PACKAGE_PATH="${ROS_PACKAGE_PATH}:$px4_root:$px4_root/Tools/sitl_gazebo"
 

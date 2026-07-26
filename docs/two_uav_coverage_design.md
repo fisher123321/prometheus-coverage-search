@@ -210,6 +210,47 @@
 
 ## 决策记录
 
+### 2026-07-24：RViz 地面体素显示过滤
+
+- 地面体素的当前处理仅在 RViz：两个 `octomap_rviz_plugin/OccupancyGrid`
+  （`/uav1/octomap_full`、`/uav2/octomap_full`）均设置
+  `Min. Height Display=0.5`。`samplemaze.world` 地面为 `z=0`，该余量同时
+  裁掉深度 15 合并后仍可能露出的低层块。
+- 此设置只影响显示，不修改 `octomap_full`、`octomap_binary` 或覆盖规划地图；
+  不启用 `octomap_server` 的 RANSAC `filter_ground`。修改后仅需重新加载 RViz
+  配置，无需重启 Gazebo 或算法节点。
+
+### 2026-07-24：协同飞行中周期性颠簸修正
+
+- 症状是两架飞机均会在前进中反复“抖一下、回正、再抖”，并非仅在两机接近时发生。
+  根因位于 `two_uav_coordinator`：原 `stableAtHeight()` 同时要求目标高度误差不超过
+  0.30 m 和水平速度不超过 0.35 m/s；20 Hz 主循环在已经进入 `ACTIVE` 的飞行阶段仍调用
+  它。覆盖轨迹允许 `max_vel=1.0 m/s`，所以飞机每次加速越过 0.35 m/s 都会被改发
+  当前位姿的 `XYZ_POS` 悬停命令；减速后又恢复 `TRAJECTORY`，形成周期性刹车与再加速。
+- 修复将两个语义分开：`stableAtHeight()` 保留为起飞门禁，仅在 `WAIT_PEER` 或
+  `WAIT_TAKEOFF` 阶段要求低速稳定；新增 `altitudeAtHeight()` 只检查高度，在 `ACTIVE`
+  飞行阶段继续检查两机高度，但不把正常飞行速度当作悬停条件。
+- 此修改不改变 `max_vel=1.0`、`max_acc=0.8`、最小起飞间距、状态/通信有效性或真实的
+  双机安全距离判断。编译目标 `two_uav_coordinator` 和 `git diff --check` 已通过。验收时，
+  起飞稳定后应连续输出轨迹；若仍发生悬停，协调器终端的 `UAV ... holds:` 原因可用于区分
+  双机安全判断与地图安全重规划，而不再是 0.35 m/s 的误触发。
+
+### 2026-07-24：位置与视点偏航同步轨迹
+
+- 需求是无人机抵达视点位置时同时抵达该视点的指定偏航角；偏航不能在轨迹末段才集中
+  完成。原时间 B 样条把偏航控制点按 `fraction / 0.80` 提前压缩到前 80%，而执行端又对
+  已规划偏航施加第二个逐帧限速器，可能造成参考滞后并把剩余转向留给终点悬停。
+- 时间 B 样条现在使用与位置相同的完整时间域线性控制点，并保留起止处的零速/零角加速度
+  边界；有效轨迹的偏航连续、单调地从当前朝向变化到视点朝向。执行端直接下发经 De Boor
+  验证的 `desired_yaw`，不再二次限速。
+- 新增 `coverage_search/max_yaw_acc=1.8 rad/s²`（`max_yaw_rate=1.8 rad/s` 不变）。轨迹
+  时长同时受路径长度、偏航速率和偏航角加速度约束；短距离而初末朝向差大时会拉长整段
+  轨迹，不以末段急转补偿。
+- 候选轨迹采样校验峰值偏航速率、峰值偏航角加速度及单调性；另外要求偏航进度在 25% 时
+  已开始、50% 位于 35%--65%、75% 至少完成 65%，否则拒绝该候选。`two_uav_coverage_search_node`
+  已重新编译通过，`git diff --check` 无格式错误；运行日志会输出 `peak_yaw_rate` 与
+  `peak_yaw_acc` 供验收。
+
 ### 2026-07-19：地面显示、前沿实时性与路径代价竞价修正
 
 - 对比单机 `coverage_searching_pkg` 后确认：内部覆盖地图的 D435i 地面处理逻辑
@@ -498,9 +539,14 @@
   `octomap_binary`/`octomap_full` 的原始序列化树；两个 `octomap_server` 因此改用原生
   `pointcloud_min_z=0.20`。该筛选发生在点云转换至 `world` 后、插入 OctoMap 前，地板点
   不会进入两种地图消息；墙体从 0.20 m 以上仍按 Z 轴渐变显示。
-- `points_octomap` 不再加入虚拟 FOV clear-point 端点。OctoMap 的 `PointCloud2` 输入无法
-  区分“清空射线终点”和真实深度命中，前者会被错误积分为 occupied，形成大块紫色伪体素；
-  覆盖搜索仍使用独立的真实 `points_downsampled` 输入，故该改动只影响 OctoMap 可视化。
+- `points_octomap` 的虚拟 FOV clear-point 端点仅在其距离**严格大于**
+  `sensor_model/max_range=3.0 m` 时启用，当前为 `3.15 m`。Noetic `octomap_server` 会将
+  超量程点截断到 3.0 m 并只写入沿途和截断端点的 free/miss 证据，不把虚拟端点写为
+  occupied；这为无有效回波的视线提供清空证据，能消除移动对机离开后残留的 OctoMap
+  幽灵障碍物。
+- 真实深度回波及其相邻角度桶会阻挡虚拟射线，避免穿透墙体。虚拟点只进入
+  `points_octomap`；覆盖搜索继续只接收真实 `points_downsampled`，因此不会把虚拟端点
+  误作为规划地图的障碍物。
 
 ### 2026-07-19：地图同步审计（待实现可靠补齐）
 
@@ -527,3 +573,708 @@ source devel/setup.bash
 使用 `configure_chrony_peer.sh master`，高 ID 机使用
 `configure_chrony_peer.sh client <低ID机IP>`；两端均须用 `check_clock_offset.sh 20`
 通过后才进入任务前检查。
+
+### 2026-07-22：拍卖 V2 方案 — Top-3 视点、纯成本竞价、增量分配
+
+用户（wjy）与 Codex 经过对现有代码的逐行审查，确定以下改进方案。原有 V1
+行为通过 `auction_mode` 参数保留，默认仍为 `"v1"` 以保持向后兼容。
+
+#### 需求来源
+
+1. 任务应是前沿簇，拍卖时应考虑该簇的多个候选视点而非仅最优一个。
+2. 纯路径执行代价拍卖：不考虑信息增益收益项，谁飞得近（A* 测地距离短）谁拿任务。
+3. 增量分配：已分配且未超时的任务不再重复进入拍卖，只有新出现的前沿才参与。
+4. 确定性共识：两台机对同一 task 计算出相同 task_id，交换代价后按确定规则判定
+   赢家，不依赖 frame_id 重命名。
+
+#### 消息改动（向后兼容）
+
+**SwarmFrontier.msg** — 增加 top-3 视点字段（追加在末尾，ROS 消息向后兼容）：
+
+```
+uint64 task_id
+uint32 chunk_id
+geometry_msgs/Pose viewpoint        # 最佳视点（V1 兼容）
+float32 information_gain
+# === V2 新增 ===
+geometry_msgs/Pose viewpoint_2      # 第 2 视点
+geometry_msgs/Pose viewpoint_3      # 第 3 视点
+float32 yaw_2
+float32 yaw_3
+uint8 num_viewpoints                # 实际视点数 (1-3)
+```
+
+V1 订阅者忽略新字段，V2 订阅者读取 `num_viewpoints` 确定有效视点数。
+
+**SwarmBid.msg** — 不变。`cost` 字段在 V2 下含义变为
+   `min(path_len_i) / max_vel`（三个视点中 A* 路径最短的时间代价），
+   不含信息增益项。
+
+**SwarmTask.msg** — 增加增量分配状态：
+
+```
+uint64 task_id
+uint32 task_version
+uint32 winner_uav_id
+float32 cost
+geometry_msgs/Pose goal
+# === V2 新增 ===
+bool   incremental_assigned        # 已被分配过
+time   assigned_at                 # 分配时刻
+```
+
+#### 新增参数
+
+全部通过 launch/YAML 可配，默认保持 V1 行为：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `coverage_search/auction_mode` | `"v1"` | `"v1"` 原始 / `"v2"` 新拍卖 |
+| `coverage_search/top_viewpoints_count` | `3` | 每个前沿簇共享的视点数 |
+| `coverage_search/incremental_task_timeout` | `30.0` | 已分配任务超时后复位为未分配（s） |
+
+#### 改动点 1：publishSwarmFrontiers() — 发布 top-N 视点
+
+文件：[src/two_uav_coverage_search_manager.cpp](src/two_uav_coverage_search_manager.cpp)
+
+- V2 模式：对 `frontier_finder_.frontiers_[i]` 的 `viewpoints` / `viewpoint_yaws`
+  取 min(N, viewpoints.size()) 个，填充到 SwarmFrontier 的新增字段
+- V1 模式：仅填充 `viewpoint`（保持原行为）
+
+`FrontierCluster::viewpoints` 已在 `sampleViewpoints()` 中按可见性分数降序排列，
+无需额外排序。
+
+#### 改动点 2：publishSwarmBids() — 纯成本，取 min of N 个 A* 代价
+
+文件：[src/two_uav_coverage_search_manager.cpp](src/two_uav_coverage_search_manager.cpp)
+
+V2 模式：
+```cpp
+double best_cost = INFINITY;
+for (int v = 0; v < frontier.num_viewpoints; ++v) {
+    Vector3d vp = getViewpoint(frontier, v);
+    double path_len = (vp - uav_pos).norm();
+    bool reachable = astar.isPathTraversable(uav_pos, vp, &path_len);
+    if (!reachable) { /* try full A* up to swarm_bid_max_astar_ times */ }
+    if (reachable) best_cost = min(best_cost, path_len / max_vel);
+}
+bid.cost = best_cost;        // 纯路径时间，不含 info_gain
+bid.reachable = isfinite(best_cost);
+```
+
+V1 模式：保持原 `path_len/max_vel - 0.005*info_gain` 计算。
+
+#### 改动点 3：runAuction() — 增量分配 + 超时复位
+
+文件：[src/two_uav_coordinator.cpp](src/two_uav_coordinator.cpp)
+
+新增成员：
+```cpp
+struct TaskAlloc {
+    uint64_t task_id;
+    ros::Time assigned_at;
+    uint32_t winner;
+};
+std::map<uint64_t, TaskAlloc> task_allocations_;  // 全局已分配任务表
+```
+
+V2 模式竞价流程：
+```
+1. 超时清理：遍历 task_allocations_，超过 incremental_task_timeout 且
+   winner 已失联/状态过期 → 移除（该 task 重新进入候选池）
+
+2. 候选过滤：
+   - 已在 task_allocations_ 中且未超时 → 跳过（增量分配）
+   - 已被任一方到达（< task_reach_dist_） → 跳过
+   - 双方都不可达 → 跳过
+
+3. 赢家判定（同 V1）：
+   - 对每个候选 task，比较 self_cost vs peer_cost
+   - self_cost < peer_cost - 1e-3 → self wins
+   - 相等 → 低 UAV ID 赢
+
+4. 新分配的任务写入 task_allocations_[task_id] = {now, winner_id}
+
+5. 发布 SwarmTaskArray（显式共识，防止数据不对齐时的脑裂）
+```
+
+V1 模式：保持原 `rejected_until_` + `task_commit_timeout` + `task_retry_cooldown` 机制。
+
+#### 改动点 4：FrontierFinder 接口不变
+
+`FrontierCluster::viewpoints` 和 `viewpoint_yaws` 已是按 `visib_nums` 降序排列的
+数组。V2 仅改变消费端（publishSwarmFrontiers 取前 N 个），生产端无需修改。
+
+#### 不变的部分
+
+- `task_id` 编码公式不变：`(chunk_id << 40) | (x << 20) | y`，确定性，跨机一致
+- `SwarmTaskArray` 显式交换保留，作为共识安全冗余
+- deploy/launch/scripts 不变
+- OctoMap / 地图同步 / bridge 不变
+- 低 UAV ID 打破平局规则不变
+
+#### 实施顺序
+
+1. 修改 `SwarmFrontier.msg`、`SwarmTask.msg`，重新编译消息
+2. 在 `two_uav_coverage_search.h` 中声明 V2 相关参数和辅助方法
+3. 修改 `publishSwarmFrontiers()` → V2 填充 top-N 视点
+4. 修改 `publishSwarmBids()` → V2 纯成本 + min-of-N
+5. 修改 `runAuction()` → V2 增量分配 + 超时复位
+6. 更新 `two_uav_coverage_search.yaml` 和 launch 文件参数
+7. 编译验证
+
+### 2026-07-20：前沿簇发布者、融合地图前沿与 AABB 增量更新机制分析
+
+用户（wjy）询问 RViz 中显示的融合地图前沿簇由哪个无人机、哪个话题、什么频率发布，
+以及前沿簇的本地更新是否为 AABB 轴对称包围盒下的增量更新。
+
+#### 前沿簇可视化发布者
+
+- **发布者**：仅 UAV1。默认 RViz 配置中 UAV1 的 `frontier_vis` 启用，UAV2 的同类
+  显示标记为“调试”且 `Enabled: false`。
+- **话题**：`/uav1/prometheus/coverage_search/frontier_vis`
+- **消息类型**：`visualization_msgs::MarkerArray`，包含三个命名空间：
+  - `frontier_cells` — 前沿体素（按簇着色，HSV 色相）
+  - `frontier_best_viewpoint` — 每簇最佳视点（球体标记）
+  - `frontier_best_view_yaw` — 最佳视点推荐偏航角（箭头标记）
+- **频率**：约 **0.83 Hz**（周期 1.2 s），由 `frontier_timer_` 驱动
+  （[two_uav_coverage_search_manager.cpp:138](src/two_uav_coverage_search_manager.cpp#L138)）。
+- 两架无人机各自独立运行 `FrontierFinder`，分别在自己的融合地图上搜索前沿。
+  UAV2 的前沿可视化话题 `/uav2/prometheus/coverage_search/frontier_vis` 同样存在并
+  发布数据，但 RViz 默认不显示。
+
+#### 协同模式下的 swarm 前沿交换频率
+
+| 话题 | 周期 | 频率 |
+|------|------|------|
+| `frontier_vis`（RViz MarkerArray） | 1.2 s | ~0.83 Hz |
+| `swarm_frontiers`（本机，供协调器出价） | `swarm_chunk_delta_period_`（默认 0.5 s） | 2 Hz |
+| bridge 转发 relay | `data_hz`（默认 5 Hz） | 5 Hz |
+| 协调器竞价 | 0.05 s | 20 Hz |
+
+#### UAV1 显示的融合地图前沿是否包含 UAV2 的数据
+
+**是的，包含。** 在协同模式下，UAV1 的前沿簇基于本地融合地图搜索，该地图已融合了
+UAV2 的观测数据。流程：
+
+1. UAV2 通过 ZMQ bridge 发送地图 chunk 到 `/two_uav/rx/map_chunk`
+2. UAV1 的 `remoteChunkCb`（[two_uav_coverage_search_manager.cpp:527](src/two_uav_coverage_search_manager.cpp#L527)）
+   调用 `coverage_map_.setRemoteEvidence()` 将 UAV2 的 Log-Odds 证据写入 UAV1 本地
+   地图的远端证据层
+3. 远端证据导致占据状态变化时，触发 `markUpdatedIndex` 并置位
+   `remote_frontier_refresh_pending_ = true`
+4. 下一次 `updateFrontiers()` 调用触发 `refreshFrontiersFull()`（全量重扫描），在
+   **已融合的地图**上重新搜索前沿
+5. 全量刷新受 `remote_full_frontier_period_`（默认 3.0 s）限频，避免每收到一个
+   chunk 就重扫
+
+因此 `/uav1/prometheus/coverage_search/frontier_vis` 上显示的前沿簇，是在融合了两架
+无人机观测数据的同一张地图上搜索出来的，自然包含了 UAV2 发现的前沿。两机独立维护
+各自的融合地图，不是删除 UAV2 的数据。
+
+#### AABB 增量更新机制
+
+**是的，前沿簇本地更新是严格的 AABB 轴对称包围盒增量更新。** 机制分两阶段：
+
+**累积阶段** — 每次体素占据状态变化时，`markUpdatedIndex(idx, margin=1)`
+（[two_uav_coverage_map.cpp:557](src/two_uav_coverage_map.cpp#L557)）不断扩张累积 AABB：
+
+```cpp
+// 首次标记：直接用当前体素初始化
+updated_min_idx_ = min_idx;
+updated_max_idx_ = max_idx;
+
+// 后续标记：做 union 扩张
+updated_min_idx_(k) = std::min(updated_min_idx_(k), min_idx(k));
+updated_max_idx_(k) = std::max(updated_max_idx_(k), max_idx(k));
+```
+
+只有占据状态**实际改变**时（`occupancy_buffer_[adr]` 值从 unknown→free/occupied 或
+反之）才调用 `markUpdatedIndex`；证据数值变化但不改变状态分类时不触发。
+
+**消费阶段** — `FrontierFinder::searchFrontiers()` 调用
+`map_->getUpdatedBox(update_min, update_max, true)`（`reset=true` 立即清零）：
+
+1. 取出累积 AABB 并加 margin（`2*resolution` 与 `esdf_safe_distance_+resolution` 的
+   较大值），得到搜索范围
+2. **保留**不与搜索范围重叠的旧前沿簇（直接放入 `kept` 列表，不做任何重算）
+3. **移除**与搜索范围重叠的旧前沿簇，并将其 AABB 也并入搜索范围（确保整个受影响
+   簇都被重新评估）
+4. **仅**在搜索范围内做 BFS 膨胀聚类找新前沿
+5. 新前沿做 PCA 分裂（`splitLargeFrontiers`）和视点采样（`computeViewpoints`）
+
+日志输出直接印证（[two_uav_coverage_search_manager.cpp:306](src/two_uav_coverage_search_manager.cpp#L306)）：
+```cpp
+ROS_WARN_THROTTLE(2.0, "[CoverageSearch] frontier %s update took %.1f ms, frontiers=%d",
+                  do_remote_full_refresh ? "remote-full" : "local-AABB", ...);
+```
+- `"local-AABB"` = 增量路径（本机深度更新，仅扫描 AABB）
+- `"remote-full"` = 全量路径（收到远端 chunk 后触发，受 3.0 s 限频）
+
+#### 关键代码路径
+
+- `markUpdatedIndex`：[two_uav_coverage_map.cpp:557-576](src/two_uav_coverage_map.cpp#L557)
+- `getUpdatedBox`：[two_uav_coverage_map.cpp:601-616](src/two_uav_coverage_map.cpp#L601)
+- `searchFrontiers`（增量）：[two_uav_frontier_finder.cpp:120-185](src/two_uav_frontier_finder.cpp#L120)
+- `searchFrontiersFull`（全量）：[two_uav_frontier_finder.cpp:74-106](src/two_uav_frontier_finder.cpp#L74)
+- `refreshFrontiersFull`：[two_uav_frontier_finder.cpp:115-118](src/two_uav_frontier_finder.cpp#L115)
+- `updateFrontiers`（调度逻辑）：[two_uav_coverage_search_manager.cpp:279-310](src/two_uav_coverage_search_manager.cpp#L279)
+- `remoteChunkCb`（远端地图融合）：[two_uav_coverage_search_manager.cpp:527-555](src/two_uav_coverage_search_manager.cpp#L527)
+
+### 2026-07-20：RViz 无人机 ID 标签实现
+
+用户（wjy）要求在 RViz 中显示跟随无人机移动的 ID 标签，以便时刻区分两架飞机。
+
+#### 实现方案
+
+在 `CoverageSearchManager` 中新增 `TEXT_VIEW_FACING` 类型的 Marker 发布：
+
+- **话题**：`<uav_name>/prometheus/coverage_search/uav_label`
+  （即 `/uav1/prometheus/coverage_search/uav_label` 和
+  `/uav2/prometheus/coverage_search/uav_label`）
+- **消息类型**：`visualization_msgs::Marker`（`TEXT_VIEW_FACING`）
+- **更新频率**：10 Hz（在 `publishVisualization()` 中随 `mainloopCb` 发布）
+- **显示效果**：绿色文字（`#00FF00`），位于无人机实际位置上方 0.6 m，字号 0.45 m，
+  文字始终面向观察者
+- **标签内容**：`uav_name_`（即 `/uav1` 或 `/uav2`）
+- **生命周期**：0.5 s（持续刷新，确保断连后自动消失）
+
+#### 修改的文件
+
+1. [include/two_uav_coverage_search.h](include/two_uav_coverage_search.h#L386) —
+   新增 `uav_label_pub_` 发布器成员
+2. [src/two_uav_coverage_search_manager.cpp](src/two_uav_coverage_search_manager.cpp) —
+   `init()` 初始化发布器；`publishVisualization()` 发布文字 Marker
+3. [rviz/two_uav_coverage_search.rviz](rviz/two_uav_coverage_search.rviz) —
+   新增 `UAV1 标签` 和 `UAV2 标签` 两个 Marker Display，均默认启用
+
+### 2026-07-20：移除冗余的 remote-full 全量前沿扫描路径
+
+用户（wjy）质疑 `remote-full` 全量扫描的必要性，经代码审查确认该路径是冗余的，
+已删除。
+
+#### 冗余分析
+
+远端 chunk 到达时的调用链：
+
+```
+remoteChunkCb
+  → setRemoteEvidence(address, evidence)
+    → remote_evidence_buffer_[address] = evidence
+    → updateOccupancyFromEvidence(idx)
+      → fused_evidence = local + remote
+      → if (next != occupancy_buffer_[adr])
+          markUpdatedIndex(idx, margin=1)   // ← 远端变化已加入 AABB
+```
+
+关键发现：远端证据导致的占据状态变化，**已经通过 `markUpdatedIndex` 把对应体素指
+标加入了累积 AABB**。下一次 `searchFrontiers()` 调用 `getUpdatedBox(reset=true)` 时，
+自然会包含这些远端变化区域。
+
+`searchFrontiers()` 的 BFS 膨胀（`expandFrontier`）不受 AABB 边界限制 — 只要种子
+在 AABB 范围内，BFS 会沿 26 邻域一直膨胀到整个前沿簇的边界。配合 `markUpdatedIndex`
+的 margin=1 和搜索侧的额外 margin（`max(2*resolution, esdf_safe_distance+resolution)`），
+远端变化不可能漏掉。
+
+因此 `refreshFrontiersFull()` 触发的全地图扫描对该场景没有任何额外效果 — 它只是把
+已经由 AABB 增量覆盖的区域重新扫描了一遍。
+
+#### 已删除的代码
+
+1. **头文件** (`two_uav_coverage_search.h`)：
+   - 删除 `refreshFrontiersFull()` 声明
+   - 删除 `remote_frontier_refresh_pending_`、`last_remote_frontier_full_refresh_` 成员
+   - 删除 `remote_full_frontier_period_` 参数成员
+
+2. **覆盖管理器** (`two_uav_coverage_search_manager.cpp`)：
+   - `updateFrontiers()` 简化为始终调用 `searchFrontiers()`（AABB 增量），
+     移除 `do_remote_full_refresh` 条件分支和限频逻辑
+   - 删除 `nh.param("coverage_search/remote_full_frontier_period", ...)` 参数读取
+   - `remoteChunkCb` 中删除 `remote_frontier_refresh_pending_ = ...` 赋值
+
+3. **前沿查找器** (`two_uav_frontier_finder.cpp`)：
+   - 删除 `refreshFrontiersFull()` 实现（仅 3 行包装函数）
+   - `searchFrontiersFull()` 保留，供 `searchResidualFrontiers()` 使用
+
+4. **launch 文件** (`two_uav_coverage_search.launch`)：
+   - 删除 `<param name="coverage_search/remote_full_frontier_period" value="3.0"/>`
+
+#### 不变的部分
+
+- `searchResidualFrontiers()` 继续使用 `searchFrontiersFull(cur_pos, true)` —
+  这是长时间无前沿时的宽松兜底重扫，与 remote-full 无关
+- AABB 增量机制的累积/消费逻辑完全不变
+- `remoteChunkCb` → `setRemoteEvidence` → `markUpdatedIndex` 的调用链完全不变
+
+### 2026-07-20：三个待解决问题分析（仅分析，不做代码修改）
+
+用户（wjy）报告了三个仿真中观察到的问题，以下逐项分析。
+
+#### 问题 1：UAV2 前沿簇显示未及时更新 — UAV1 已探索区域的前沿在 UAV2 上仍然可见
+
+**现象**：UAV1 通过拍卖竞价拿到了原本属于 UAV2 的前沿簇任务并完成探索，但
+UAV2 的 RViz 前沿簇显示中，该区域的前沿簇仍然存在。
+
+**分析**：
+
+远端地图同步的完整链路是：
+
+```
+UAV1 探索 → 本机体素状态变化 → publishSwarmMapDelta() 发送 chunk 增量
+  → bridge 转发 → UAV2 remoteChunkCb → setRemoteEvidence
+  → updateOccupancyFromEvidence → 若 fused 状态改变 → markUpdatedIndex
+  → 下一次 frontierCb (1.2s) → searchFrontiers() → 移除/更新受影响前沿簇
+```
+
+链路本身逻辑是正确的，但存在以下可能导致延迟或遗漏的因素：
+
+1. **chunk 同步延迟**：delta 周期为 `swarm_chunk_delta_period_` = 0.5 s，加上
+   bridge ZMQ 转发延迟和 TCP 传输，实际端到端延迟可能达到 1-2 秒。
+
+2. **AABB 增量可能遗漏**：`searchFrontiers()` 通过 `getUpdatedBox` 获取变化体素
+   的 AABB。如果远端证据导致前沿簇内部的 free 体素附近出现了新的 free 体素
+   （原本 unknown），变化体素在 AABB 内，但现有前沿簇的 `isFrontierChanged()`
+   检查的是"旧前沿簇的 cells 是否仍是前沿体素"——如果旧前沿簇的每个 cell 恰好
+   仍是前沿（因为新 free 体素旁边还有其他 unknown 体素），则该簇会被直接保留
+   （`kept.push_back(ftr)`），不会重新 BFS 聚类。这意味着旧前沿簇的边界可能
+   不会收缩，即使其中部分区域已被探索。
+
+3. **关键场景**：远端证据标记了旧前沿簇附近的一些 unknown 体素为 free。这些
+   新 free 体素本身变成了前沿（free + 有其他 unknown 邻居），但旧前沿簇的
+   原有 cells 仍然是前沿（仍然有各自的其他 unknown 邻居）。此时：
+   - `isFrontierChanged` 对旧簇返回 `false`（所有旧 cells 仍是前沿）
+   - 旧簇被保留
+   - AABB 内的新前沿体素被 BFS 找到，形成新簇
+   - 结果：同一区域出现两个重叠的前沿簇 —— 旧簇和新簇各占一部分
+   - 表现：UAV2 上该区域的前沿"似乎没有消失"
+
+4. **根本原因**：增量更新逻辑的设计假设是"前沿簇要么整体消失，要么保持不变"。
+   但实际上远端地图更新可能导致前沿簇**部分收缩**——部分区域不再是前沿但
+   其他部分仍然是。增量路径无法检测这种"部分收缩"。
+
+5. **为什么之前 remote-full 存在**：原 `refreshFrontiersFull()` 全量扫描正好
+   弥补了这个问题——定期全图重搜会清除这种残留。但全量扫描又太重。正确的修复
+   方向可能是：对与 AABB 重叠的旧簇，不仅检查 `isFrontierChanged`，而是
+   **无条件移除并重搜**（即只要重叠就重搜，不管是否 changed）。这比当前条件
+   更激进但能避免残留，且远轻于全量扫描。
+
+**结论**：旧前沿簇的保留条件过于宽松（要求同时满足重叠且 changed 才移除）。
+改为"只要与 AABB 重叠就重搜"可以解决此问题，开销可控（通常只有少数簇与
+AABB 重叠）。
+
+#### 问题 2：前沿簇缺少任务归属标签
+
+**需求**：在 RViz 中每个前沿簇旁边显示它是分配给 UAV1 还是 UAV2 的任务。
+
+**分析**：
+
+当前 RViz 只显示 UAV1 融合地图的前沿簇（`/uav1/prometheus/coverage_search/frontier_vis`），
+不显示任务归属信息。任务分配由协调器的拍卖逻辑完成，分配结果通过外部目标模式
+(`external_goal_only`) 下发给覆盖节点。
+
+要实现此需求，可能的方案：
+
+1. **在协调器中新增发布**：协调器维护任务分配表，为每个已分配任务发布一个
+   `TEXT_VIEW_FACING` Marker，文字为 `UAV1` 或 `UAV2`，位置为任务视点上方。
+   话题：`/two_uav/task_labels`（或类似）。
+
+2. **在覆盖节点中扩展前沿发布**：`publishFrontiers()` 知道本机前沿，但不知道
+   远端 UAV 的任务归属。需要协调器下发任务归属信息。
+
+3. **方案 1 最简单**：协调器已经有任务分配信息（`task_allocations_` 或等价
+   结构），直接从协调器发布归属标签。RViz 新增一个 Marker Display 订阅即可。
+
+**注意**：此问题不做代码修改，仅记录分析供后续实施参考。
+
+#### 问题 3：虚假占据体素 — 无人机相互观测导致对机被写入静态障碍地图
+
+**现象**：
+- RViz 中出现了 Gazebo 世界不存在的"障碍物体素"
+- 无人机在这些虚假障碍周围徘徊
+- 前沿簇被嵌入到虚假障碍中
+- 持续观测未能清除这些占据体素
+
+**分析**：
+
+**3a. 根因确认：D435i 深度相机观测到了对机**
+
+P450 是物理 3D 模型，在 Gazebo 中 D435i 深度相机发射的红外光线打到对机机身
+上会反射，产生真实的深度点。这些点进入 `updateFromDepthPcl`：
+
+```cpp
+// 命中点 → integrateHit → occupancy_evidence_buffer += 1~2
+// 射线路径 → integrateMiss → occupancy_evidence_buffer -= 1
+```
+
+对机机身上的点被当作"命中"（hit），证据 +1~+2。如果对机悬停在某位置，每帧
+深度点云都会产生新的命中，证据迅速累积到上限 +4，体素变为 occupied。
+
+**3b. 为什么持续观测不能清除**
+
+`clearRobotVolume` 只清除**本机**机体体积内的体素（[two_uav_coverage_search_manager.cpp:577](src/two_uav_coverage_search_manager.cpp#L577)）：
+
+```cpp
+coverage_map_.clearRobotVolume(Eigen::Vector3d(
+    uav_state_.position[0], uav_state_.position[1], uav_state_.position[2]));
+```
+
+它**不清除对机**的体积。因此对机占据的体素只能通过正常的射线投射（miss/free
+射线穿过对机原来位置）来逐渐衰减证据。但问题是：
+
+1. 对机本身是不透明的，深度相机**看不到对机背后的体素**。对机背后的区域被
+   遮挡，永远不会收到 free 射线。
+2. 当对机移动后，原来位置的体素可以被后续的深度射线穿过了，此时 `integrateMiss`
+   会逐步减少证据。但这个衰减需要多次观测（每次 -1，从 +4 降到 <= -1 需要至少
+   5 帧）。
+3. 如果对机在附近徘徊，不断产生新的命中，新旧占据交替出现，地图中始终有
+   对机体积的占据体素。
+
+**3c. 为什么前沿簇嵌入虚假障碍**
+
+前沿检测依赖 `isFrontierCell`，它要求体素是 free 且有 unknown 邻居。如果对机
+产生了一片 occupied 体素，那么：
+- 障碍后面的区域变为 unknown（被遮挡）
+- 障碍边缘的 free 体素紧邻 unknown → 形成前沿
+- 前沿簇就在虚假障碍周围形成
+
+A* 规划器避开这些 occupied 体素，导致无人机路径绕行、徘徊。
+
+**3d. 解决方案方向**（仅分析，不做修改）
+
+1. **对机点云过滤**：在深度点云进入 `updateFromDepthPcl` 之前，根据对机位姿
+   （bridge 交换得到），过滤掉对机机体包围盒内的点。这是最直接的修复。
+2. **扩展 `clearRobotVolume`**：同时清除本机和对机机体体积内的体素。这只能
+   清除当前对机位置的体素，不能清除历史积累。
+3. **对机占用动态层**：将对机作为一个独立的动态障碍层，不写入静态 Log-Odds
+   地图。MID360/D435i 看到的对机点永远不计入 `occupancy_evidence_buffer_`。
+4. **联合方案**：方案 1（点云过滤）+ 方案 3（动态障碍层）是最完整的解法。
+   方案 1 防止新假点进入，方案 3 清理历史假点。
+
+**结论**：这是多机器人系统中经典的自/对机感知干扰问题。短期的仿真 workaround
+包括增大两机初始距离、让两机在不同区域探索以减少相互观测。真正的修复需要
+点云过滤或动态障碍层。
+
+#### 同步修正：2026-07-20 前沿 AABB 更新日志措辞
+
+上一条记录中 `updateFrontiers()` 改为始终调用 `searchFrontiers()` 后，日志文本
+由 `"remote-full"/"local-AABB"` 改为 `"AABB update"`。此修改在
+[src/two_uav_coverage_search_manager.cpp](src/two_uav_coverage_search_manager.cpp)
+中已生效。
+
+### 2026-07-20：前沿簇跨机不一致问题深度分析（根因分析与最小修复）
+
+用户（wjy）报告了一个更精确的问题场景：
+- A 区域 = UAV1 探索区域，B 区域 = UAV2 探索区域
+- UAV1 显示 A 区域的前沿簇：正确
+- UAV2 显示 B 区域的前沿簇：正确
+- UAV1 显示 B 区域的前沿簇（通过 chunk 同步融合）：**与 UAV2 本地显示不一致**
+
+#### 根因分析
+
+这个问题的根因与 [问题 1](#问题-1uav2-前沿簇显示未及时更新) 完全相同，是 AABB 增量
+更新的保留条件过于保守。
+
+**具体过程：**
+
+1. UAV2 在 B 区域探索，产生前沿簇 F_B（包含一组 frontier cells）
+2. UAV2 通过 chunk 同步将 B 区域的 Log-Odds 证据发送给 UAV1
+3. UAV1 接收并融合：`remote_evidence_buffer_` 更新 → `updateOccupancyFromEvidence`
+   → 若 fused 状态变化 → `markUpdatedIndex` → 累积 AABB
+4. UAV1 的下一次 `searchFrontiers()` 取出 AABB，检查 UAV1 上 B 区域已有的旧前沿簇
+5. **关键判断**：旧前沿簇的 AABB 是否与更新 AABB 重叠？重叠的前沿 cell 是否不再是
+   前沿（`isFrontierChanged`）？
+6. 如果旧前沿簇的每个 cell 碰巧仍然是前沿（因为旁边还有 unknown 体素），
+   `isFrontierChanged` 返回 false → 旧簇被**直接保留**
+7. AABB 内的新前沿体素被 BFS 找到，形成新簇
+8. 结果：UAV1 上 B 区域的旧前沿簇和新前沿簇并存，边界重叠、形状不一致
+
+这不是远端 chunk 特有的算法分支：本地与远端体素最终都经
+`updateOccupancyFromEvidence()` → `markUpdatedIndex()` → `searchFrontiers()`。UAV2 本地
+未复现，只是它的连续相机更新更常让旧簇中至少一个 cell 直接失去 frontier 属性，
+从而偶然通过旧的 `isFrontierChanged()` 门槛；远端批量更新更容易触发“簇拓扑变了、
+但旧 cell 仍全部是 frontier”的反例。换言之，根因是**缓存簇的拓扑失效判断错误**，
+不是 chunk 没有发送某类边界 free cell，也不是 UAV1/UAV2 使用了不同的前沿算法。
+
+#### 为什么"前沿簇标志位"方案不合理
+
+用户提出：给每个栅格加一个 `is_frontier` 标志位，传输时携带。
+
+**架构上不合理的原因：**
+
+1. **前沿是导出量，不是原始数据**。前沿由"free cell + 相邻 unknown cell"这个
+   拓扑关系决定。如果占据状态正确同步，前沿一定可以通过本地重算得到。直接传输
+   前沿标志相当于在"传输正确占据"之外引入了第二条可能不一致的数据通道。
+
+2. **标志位会过期**。UAV2 标记某 cell 为前沿的时刻，到 UAV1 收到这个标志的
+   时刻之间，UAV2 可能已经探索了该 cell 旁边区域，该 cell 不再是前沿。标志位
+   需要"撤销"机制 → 复杂度远超当前方案。
+
+3. **标志位不能替代前沿检测**。即使收到了标志位，UAV1 仍然需要在自己的融合
+   地图上做前沿检测（因为 UAV1 也需要知道本机区域的前沿）。两条路径两次计算
+   → 不如把一条路径修好。
+
+4. **真正的修复只需一行条件改动**（见下方"修复方向"）。
+
+#### chunk 同步协议回顾
+
+用户问到当前的地图传输机制。当前协议如下：
+
+**发送端（每 0.5 s，`publishSwarmMapDelta`）：**
+
+```
+for each chunk:
+    for each voxel in chunk:
+        evidence = getLocalEvidence(address)  // 本机 Log-Odds 证据 [-3, 4]
+        if snapshot OR evidence != last_sent[address]:
+            加入 delta 消息
+            last_sent[address] = evidence
+    if chunk.known% 达到 25/50/75/100%:
+        发送完整快照（snapshot=true）
+```
+
+- 只发送**与本机上次发送相比有变化**的体素
+- 每达到 25% 阈值发一次完整快照，用于断链恢复
+- 本机证据值**直接覆写**对端的远端证据层（不是增量加减）
+
+**接收端（`remoteChunkCb`）：**
+
+```
+收到 chunk 消息:
+    if revision 跳号 → 发送 SwarmMapRequest 请求完整快照
+    对消息中的每个 (address, evidence):
+        setRemoteEvidence(address, evidence)
+          → remote_evidence_buffer_[address] = evidence  // 直接覆写
+          → updateOccupancyFromEvidence(idx)
+            → fused = local_evidence + remote_evidence  // 融合
+            → 阈值判定 → 若状态真的改变 → markUpdatedIndex
+```
+
+- 远端证据直接覆写，不是加/减操作（避免重传/乱序导致重复计数）
+- 每个来源独立维护自己的证据层
+- 融合后再阈值化，不依赖单个来源
+
+**这个协议本身是正确的。** 问题不在传输，而在 UAV1 收到正确证据后，前沿增量
+更新没有完全反映新的融合地图状态。
+
+#### 修复方向
+
+将 `searchFrontiers()` 中对旧前沿簇的处理从：
+
+```cpp
+// 当前：同时要求重叠 AND changed 才移除重搜
+if (haveOverlap(ftr.box_min_, ftr.box_max_, search_min, search_max) &&
+    isFrontierChanged(ftr)) {
+    // remove and re-search
+} else {
+    kept.push_back(ftr);  // keep unchanged
+}
+```
+
+改为：
+
+```cpp
+// 修复后：只要与 AABB 重叠就无条件移除重搜
+if (haveOverlap(ftr.box_min_, ftr.box_max_, search_min, search_max)) {
+    // always remove and re-search, regardless of isFrontierChanged
+    search_min = search_min.cwiseMin(ftr.box_min_ - margin);
+    search_max = search_max.cwiseMax(ftr.box_max_ + margin);
+    resetFrontierFlag(ftr);
+} else {
+    kept.push_back(ftr);
+}
+```
+
+这样做的好处：
+- 任何与更新区域有重叠的前沿簇都会被完整重搜
+- BFS 会从 AABB 内的种子出发，膨胀到正确的簇边界
+- 不重叠的簇完全跳过，不影响性能
+- 开销：通常只有少数簇与 AABB 重叠（更新区域有限），额外开销可忽略
+- 不需要增加任何消息字段、标志位或传输带宽
+
+此修复同时解决了"问题 1（前沿残留）"和"前沿跨机不一致"两个问题。
+
+#### 复核结论与验收边界（2026-07-20）
+
+已逐段复核发送、bridge、接收、地图融合、AABB 消费和 RViz 发布路径，结论如下：
+
+```
+UAV2 local evidence
+  -> publishSwarmMapDelta()                 # 每 0.5 s
+  -> two_uav_swarm_bridge /map_chunk        # 每个 chunk 均转发；源端每 0.5 s 批处理
+  -> UAV1 remoteChunkCb()
+  -> setRemoteEvidence()                    # 直接覆写远端证据层
+  -> updateOccupancyFromEvidence()
+  -> markUpdatedIndex()
+  -> FrontierFinder::searchFrontiers()      # 每 1.2 s
+  -> /uav1/.../frontier_vis
+```
+
+- chunk 带的是 UAV2 的本机证据值，不是前沿簇；接收端没有“远端前沿显示”专用缓存或
+  第二套聚类逻辑。因此不应增加 `is_frontier` 网络字段。
+- 原始 `isFrontierChanged()` 只问“旧簇中是否有 cell 不再是 frontier”，不能检测
+  “新 free frontier 与旧簇连通/旧簇需要重分裂”的拓扑改变。旧 `frontier_flag_` 保持为
+  true 后，BFS 会跳过旧 cell，产生过期簇或分裂簇。
+- 当前工作区的 `two_uav_frontier_finder.cpp` 已采用正确的最小修复：只要旧簇 AABB 与
+  更新搜索区相交，就移除该簇、清除其 `frontier_flag_` 并在扩展后的范围重新 BFS；
+  `isFrontierChanged()` 的声明和定义已删除。该路径同时覆盖本地和远端更新。
+- 不存在静态地图更新时，两机显示的正常传播上界约为 `0.5 + 1.2 = 1.7 s`（另加少量
+  bridge/ROS 调度时间）。在这个窗口内的暂时不一致是设计上的最终一致性，不是本缺陷。
+  若最后一次 B 区域变化超过约 2 s 后仍不一致，再检查 bridge 的
+  `drop ... message`、revision 跳号和两个 `frontier_vis` 话题是否都已启用。
+
+构建复核：已在现有 package build 目录成功构建 `two_uav_coverage_lib` 与
+`two_uav_coordinator`。未添加消息字段、同步线程、全图重扫或新依赖。
+
+### 2026-07-21：块状直线前沿的真正根因——bridge 丢弃同批 map chunk（已修复）
+
+用户提供的 RViz 截图显示：UAV1 的融合地图中，代表 B 区域的前沿呈绿色/红色的直线、
+直角和块状边界；UAV2 本机在同一区域显示的紫色/橙色前沿则随真实观测边界弯曲。
+这说明问题位于**前沿计算之前的地图证据传输**，而不是前沿簇 AABB 重搜。
+
+> RViz 的颜色仅按本机 `frontiers_` 容器下标生成，并不编码“来自哪架无人机”。这里的
+> 绿色/红色应理解为 UAV1 融合图 B 区域中的簇，而非网络传输了绿色/红色前沿簇。
+
+#### 精确故障链
+
+`publishSwarmMapDelta()` 每 0.5 s 依次发布本轮所有发生变化的 2 m × 2 m chunk；地图
+分辨率为 0.2 m，因此一个 chunk 是 10 × 10 × 15 个体素。旧 bridge 对整个
+`SwarmMapChunk` 通道共用一个 `last_send_`，并套用 `data_hz=5` 的节流：
+
+```cpp
+if ((now - last_send_).toSec() < 1.0 / 5.0) return;
+```
+
+同一个 0.5 s 定时回调中产生的第一条 chunk 消息通过，后续所有 chunk 都在 0.2 s
+窗口内被该 `return` **静默丢弃**。与此同时，发送端在构造 ROS 消息时已经更新了
+`swarm_last_sent_evidence_`，以后认为这些体素“已发送”，因而不会重发未真正穿过
+bridge 的证据。接收端没收到该 chunk 的任何后续 revision 时也无法发出补快照请求。
+
+这正好解释了图像特征：融合图只拥有部分 2 m 网格块的观测，已知/未知边界被 chunk
+边界切断，前沿自然退化成直线、直角和矩形，而不是传感器几何产生的弯曲边界。
+
+#### 已实施的最小修复
+
+在 [src/two_uav_swarm_bridge.cpp](../src/two_uav_swarm_bridge.cpp) 中允许 `max_hz=0` 表示
+不节流，并只给 `SwarmMapChunk` 传入 0。状态、轨迹、前沿、出价和请求通道仍保持原来的
+`data_hz` / `state_hz` 限速；地图发送仍由 `swarm_chunk_delta_period=0.5 s` 的增量批处理
+控制，单包仍受 `max_packet_kib` 限制。没有添加前沿字段、全图重扫或新依赖。
+
+`two_uav_swarm_bridge` 已重新编译通过，且 `git diff --check` 无格式错误。
+
+#### 部署与验收
+
+1. 将新 bridge 二进制部署到**两台**机载计算机，并重启两端 bridge。
+2. 为消除旧 bridge 已静默丢失的历史 evidence，首次验证应重启两侧 coverage-search
+   节点/重新开始任务；否则要等待每个旧 chunk 再发生一次变化并由 revision 快照恢复。
+3. 启用两台飞机的 `frontier_vis` 后，等待超过一次 0.5 s 同步和一次 1.2 s 前沿刷新；
+   UAV1 的 B 区域应不再出现按 2 m 规则切割的直线/直角前沿，形状应与 UAV2 的融合图
+   在正常时延内一致。
+
+当前协议仍没有逐包 ACK；断链后完全静止的历史 chunk 不能立即自愈。若真实链路中需要
+支持这种场景，下一步才增加低频轮询快照/连接后同步请求；这不是本次块状前沿的必要修复。
+
+#### 现场验证（2026-07-21）
+
+用户在重新部署并运行后确认：本修复**直接消除了问题**。UAV1 融合图中的 B 区域前沿不再
+呈 chunk 对齐的直线/直角块状，说明根因确为 `SwarmMapChunk` 在 bridge 的全通道 5 Hz
+节流下被静默丢弃，而非 AABB 聚类或前沿可视化。
