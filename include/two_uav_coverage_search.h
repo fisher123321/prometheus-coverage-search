@@ -441,7 +441,7 @@ private:
     std::vector<uint8_t> swarm_chunk_snapshot_stage_;
     std::vector<bool> swarm_chunk_force_snapshot_;
     ros::Time last_swarm_bid_time_;
-    double swarm_bid_period_ = 2.0, swarm_information_gain_weight_ = 0.005;
+    double swarm_bid_period_ = 2.0;
     int swarm_bid_max_tasks_ = 16;
     int swarm_bid_max_astar_ = 6;
     prometheus_two_uav_coverage_search::SwarmFrontierArray local_swarm_frontiers_;

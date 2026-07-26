@@ -56,7 +56,6 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     nh.param("coverage_search/completion_no_frontier_dwell", completion_no_frontier_dwell_, 8.0);
     nh.param("coverage_search/residual_scan_yaw_rate", residual_scan_yaw_rate_, 0.6);
     nh.param("coverage_search/swarm_bid_period", swarm_bid_period_, 2.0);
-    nh.param("coverage_search/swarm_information_gain_weight", swarm_information_gain_weight_, 0.005);
     nh.param("coverage_search/swarm_bid_max_tasks", swarm_bid_max_tasks_, 16);
     nh.param("coverage_search/swarm_bid_max_astar", swarm_bid_max_astar_, 6);
     uav_name_ = "/uav" + std::to_string(uav_id_);
@@ -463,8 +462,7 @@ void CoverageSearchManager::publishSwarmBids() {
         const double dy = frontier.viewpoint.position.y - uav_pos_(1);
         // Rank only decides which bounded set receives an expensive A* query;
         // it does not become the bid cost.
-        ranked.push_back({frontier, std::hypot(dx, dy) -
-                          swarm_information_gain_weight_ * frontier.information_gain});
+        ranked.push_back({frontier, std::hypot(dx, dy)});
     }
     std::sort(ranked.begin(), ranked.end(), [](const RankedTask &a, const RankedTask &b) {
         return a.rank < b.rank;
@@ -488,8 +486,7 @@ void CoverageSearchManager::publishSwarmBids() {
         bid.task_version = out.frontier_revision;
         bid.bidder_uav_id = uav_id_;
         bid.reachable = reachable;
-        bid.cost = reachable ? std::max(0.0, path_len) / std::max(0.1, max_vel_) -
-                               swarm_information_gain_weight_ * frontier.information_gain
+        bid.cost = reachable ? std::max(0.0, path_len) / std::max(0.1, max_vel_)
                              : std::numeric_limits<float>::infinity();
         out.bids.push_back(bid);
     }

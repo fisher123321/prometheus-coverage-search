@@ -59,7 +59,6 @@
         <!-- Bids use A* path length.  Bound their rate/work so bid generation
              never competes with the real-time command loop. -->
         <param name="coverage_search/swarm_bid_period" value="2.0"/>
-        <param name="coverage_search/swarm_information_gain_weight" value="0.005"/>
         <param name="coverage_search/swarm_bid_max_tasks" value="16"/>
         <param name="coverage_search/swarm_bid_max_astar" value="6"/>
         <!-- 滚动规划：60%起监听新前沿版本；交接点由85%~95%的De Boor状态选择 -->
