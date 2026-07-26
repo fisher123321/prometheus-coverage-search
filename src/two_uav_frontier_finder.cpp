@@ -114,24 +114,51 @@ void FrontierFinder::searchResidualFrontiers(const Eigen::Vector3d &cur_pos) {
 
 void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
     Eigen::Vector3d update_min, update_max;
-    bool has_update = map_->getUpdatedBox(update_min, update_max, true);
-    if (!has_update) return;
-    ++update_generation_;
+    std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> update_boxes;
+    if (map_->getUpdatedBox(update_min, update_max, true)) {
+        update_boxes.emplace_back(update_min, update_max);
+    }
+    std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> remote_boxes;
+    map_->getRemoteUpdatedBoxes(remote_boxes, true);
+    update_boxes.insert(update_boxes.end(), remote_boxes.begin(), remote_boxes.end());
+    if (update_boxes.empty()) return;
 
     const double margin = std::max(2.0 * map_->resolution_,
                                    map_->esdf_safe_distance_ + map_->resolution_);
-    Eigen::Vector3d search_min = update_min - Eigen::Vector3d(margin, margin, margin);
-    Eigen::Vector3d search_max = update_max + Eigen::Vector3d(margin, margin, margin);
-    for (int k = 0; k < 3; ++k) {
-        search_min(k) = std::max(search_min(k), map_->min_range_(k));
-        search_max(k) = std::min(search_max(k), map_->max_range_(k));
+    std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> merged_boxes;
+    for (const auto &box : update_boxes) {
+        Eigen::Vector3d merged_min = box.first;
+        Eigen::Vector3d merged_max = box.second;
+        bool merged = true;
+        while (merged) {
+            merged = false;
+            for (auto it = merged_boxes.begin(); it != merged_boxes.end(); ++it) {
+                if (!haveOverlap(merged_min - Eigen::Vector3d::Constant(margin),
+                                 merged_max + Eigen::Vector3d::Constant(margin),
+                                 it->first, it->second)) continue;
+                merged_min = merged_min.cwiseMin(it->first);
+                merged_max = merged_max.cwiseMax(it->second);
+                merged_boxes.erase(it);
+                merged = true;
+                break;
+            }
+        }
+        merged_boxes.emplace_back(merged_min, merged_max);
     }
+
+    ++update_generation_;
 
     std::vector<FrontierCluster> kept;
     kept.reserve(frontiers_.size());
     for (auto &ftr : frontiers_) {
-        if (haveOverlap(ftr.box_min_, ftr.box_max_, update_min, update_max) &&
-            isFrontierChanged(ftr)) {
+        bool affected = false;
+        for (const auto &box : merged_boxes) {
+            if (haveOverlap(ftr.box_min_, ftr.box_max_, box.first, box.second)) {
+                affected = true;
+                break;
+            }
+        }
+        if (affected && isFrontierChanged(ftr)) {
             resetFrontierFlag(ftr);
         } else {
             kept.push_back(ftr);
@@ -139,31 +166,40 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
     }
     frontiers_.swap(kept);
 
-    Eigen::Vector3i min_id, max_id;
-    map_->posToIndex(search_min, min_id);
-    map_->posToIndex(search_max, max_id);
-    for (int k = 0; k < 3; ++k) {
-        min_id(k) = std::max(0, min_id(k));
-        max_id(k) = std::min(map_->grid_size_(k) - 1, max_id(k));
-    }
-    const int z_min = std::max(min_id(2), map_->fly_z_idx_ - std::max(1, frontier_z_half_layers_));
-    const int z_max = std::min(max_id(2), map_->fly_z_idx_ + std::max(1, frontier_z_half_layers_));
     int new_count = 0;
-    for (int x = min_id(0); x <= max_id(0); ++x) {
-        for (int y = min_id(1); y <= max_id(1); ++y) {
-            for (int z = z_min; z <= z_max; ++z) {
-                Eigen::Vector3i seed(x, y, z);
-                if (frontier_flag_[map_->toAddress(seed)] || !isFrontierCell(seed)) continue;
-                std::vector<Eigen::Vector3d> cluster_cells;
-                expandFrontier(seed, cluster_cells);
-                if (static_cast<int>(cluster_cells.size()) >= cluster_min_ &&
-                    isValidFrontierCluster(cluster_cells, false)) {
-                    FrontierCluster ftr;
-                    ftr.cells = cluster_cells;
-                    ftr.changed_generation = update_generation_;
-                    computeFrontierInfo(ftr);
-                    frontiers_.push_back(ftr);
-                    ++new_count;
+    for (const auto &box : merged_boxes) {
+        Eigen::Vector3d search_min = box.first - Eigen::Vector3d::Constant(margin);
+        Eigen::Vector3d search_max = box.second + Eigen::Vector3d::Constant(margin);
+        for (int k = 0; k < 3; ++k) {
+            search_min(k) = std::max(search_min(k), map_->min_range_(k));
+            search_max(k) = std::min(search_max(k), map_->max_range_(k));
+        }
+
+        Eigen::Vector3i min_id, max_id;
+        map_->posToIndex(search_min, min_id);
+        map_->posToIndex(search_max, max_id);
+        for (int k = 0; k < 3; ++k) {
+            min_id(k) = std::max(0, min_id(k));
+            max_id(k) = std::min(map_->grid_size_(k) - 1, max_id(k));
+        }
+        const int z_min = std::max(min_id(2), map_->fly_z_idx_ - std::max(1, frontier_z_half_layers_));
+        const int z_max = std::min(max_id(2), map_->fly_z_idx_ + std::max(1, frontier_z_half_layers_));
+        for (int x = min_id(0); x <= max_id(0); ++x) {
+            for (int y = min_id(1); y <= max_id(1); ++y) {
+                for (int z = z_min; z <= z_max; ++z) {
+                    Eigen::Vector3i seed(x, y, z);
+                    if (frontier_flag_[map_->toAddress(seed)] || !isFrontierCell(seed)) continue;
+                    std::vector<Eigen::Vector3d> cluster_cells;
+                    expandFrontier(seed, cluster_cells);
+                    if (static_cast<int>(cluster_cells.size()) >= cluster_min_ &&
+                        isValidFrontierCluster(cluster_cells, false)) {
+                        FrontierCluster ftr;
+                        ftr.cells = cluster_cells;
+                        ftr.changed_generation = update_generation_;
+                        computeFrontierInfo(ftr);
+                        frontiers_.push_back(ftr);
+                        ++new_count;
+                    }
                 }
             }
         }

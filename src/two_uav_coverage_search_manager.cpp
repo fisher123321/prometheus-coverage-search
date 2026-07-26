@@ -528,11 +528,26 @@ void CoverageSearchManager::remoteChunkCb(
     const int voxel_count = coverage_map_.grid_size_(0) * coverage_map_.grid_size_(1) *
                             coverage_map_.grid_size_(2);
     bool changed = false;
+    Eigen::Vector3i changed_min, changed_max;
     for (size_t i = 0; i < msg->addresses.size(); ++i) {
         if (msg->addresses[i] >= voxel_count ||
             chunkIdForAddress(msg->addresses[i]) != static_cast<int>(msg->chunk_id)) continue;
-        changed = coverage_map_.setRemoteEvidence(msg->addresses[i], msg->evidence[i]) || changed;
+        if (!coverage_map_.setRemoteEvidence(msg->addresses[i], msg->evidence[i])) continue;
+        const int yz = coverage_map_.grid_size_(1) * coverage_map_.grid_size_(2);
+        const int x = msg->addresses[i] / yz;
+        const int remain = msg->addresses[i] % yz;
+        const Eigen::Vector3i idx(x, remain / coverage_map_.grid_size_(2),
+                                  remain % coverage_map_.grid_size_(2));
+        if (!changed) {
+            changed_min = idx;
+            changed_max = idx;
+            changed = true;
+        } else {
+            changed_min = changed_min.cwiseMin(idx);
+            changed_max = changed_max.cwiseMax(idx);
+        }
     }
+    if (changed) coverage_map_.markRemoteUpdatedBox(changed_min, changed_max);
     swarm_peer_chunk_revision_[msg->chunk_id] = msg->revision;
 }
 

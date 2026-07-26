@@ -108,8 +108,13 @@ public:
     bool getUpdatedBox(Eigen::Vector3d &update_min,
                        Eigen::Vector3d &update_max,
                        bool reset = true);
+    void getRemoteUpdatedBoxes(
+        std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> &boxes,
+        bool reset = true);
+    void markRemoteUpdatedBox(const Eigen::Vector3i &min_idx,
+                              const Eigen::Vector3i &max_idx);
     int8_t getLocalEvidence(int address) const;
-    // Returns true only when the remote evidence actually changed.
+    // Returns true only when remote evidence changes the fused occupancy state.
     bool setRemoteEvidence(int address, int8_t evidence);
 
     // 参数（public以便Astar2D访问）
@@ -144,9 +149,14 @@ private:
     void integrateHit(const Eigen::Vector3d &pos);
     void integrateMiss(const Eigen::Vector3i &idx);
     void beginOccupancyUpdate();
-    void updateOccupancyFromEvidence(const Eigen::Vector3i &idx);
+    bool updateOccupancyFromEvidence(const Eigen::Vector3i &idx,
+                                     bool mark_local_update = true);
     void markUpdatedIndex(const Eigen::Vector3i &idx, int margin = 0);
     void markDistanceFieldDirtyIndex(const Eigen::Vector3i &idx, int margin = 0);
+    using IndexBox = std::pair<Eigen::Vector3i, Eigen::Vector3i>;
+    void appendRemoteBox(std::vector<IndexBox> &boxes,
+                         const Eigen::Vector3i &min_idx,
+                         const Eigen::Vector3i &max_idx);
     void pubMapTimerCb(const ros::TimerEvent &e);
     void raycastFree(const Eigen::Vector3d &start, const Eigen::Vector3d &end,
                      bool include_end = false);
@@ -170,6 +180,8 @@ private:
     Eigen::Vector3i updated_min_idx_, updated_max_idx_;
     bool df_bbox_valid_ = false;
     Eigen::Vector3i df_min_idx_, df_max_idx_;
+    std::vector<IndexBox> remote_updated_boxes_;
+    std::vector<IndexBox> remote_df_boxes_;
 };
 
 // ============================================================

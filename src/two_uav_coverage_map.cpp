@@ -451,8 +451,9 @@ void CoverageMap::setOccupancy(const Eigen::Vector3d &pos, uint8_t occ) {
     updateOccupancyFromEvidence(idx);
 }
 
-void CoverageMap::updateOccupancyFromEvidence(const Eigen::Vector3i &idx) {
-    if (!isInMapIndex(idx)) return;
+bool CoverageMap::updateOccupancyFromEvidence(const Eigen::Vector3i &idx,
+                                              bool mark_local_update) {
+    if (!isInMapIndex(idx)) return false;
     int adr = toAddress(idx);
     uint8_t next = 0;
     const int fused_evidence = std::max(-3, std::min(4,
@@ -460,10 +461,13 @@ void CoverageMap::updateOccupancyFromEvidence(const Eigen::Vector3i &idx) {
         static_cast<int>(remote_evidence_buffer_[adr])));
     if (fused_evidence >= 2) next = 2;
     else if (fused_evidence <= -1) next = 1;
-    if (next == occupancy_buffer_[adr]) return;
+    if (next == occupancy_buffer_[adr]) return false;
     occupancy_buffer_[adr] = next;
-    markUpdatedIndex(idx, 1);
-    markDistanceFieldDirtyIndex(idx, 1);
+    if (mark_local_update) {
+        markUpdatedIndex(idx, 1);
+        markDistanceFieldDirtyIndex(idx, 1);
+    }
+    return true;
 }
 
 int8_t CoverageMap::getLocalEvidence(int address) const {
@@ -481,8 +485,7 @@ bool CoverageMap::setRemoteEvidence(int address, int8_t evidence) {
     const int remain = address % yz;
     const int y = remain / grid_size_(2);
     const int z = remain % grid_size_(2);
-    updateOccupancyFromEvidence(Eigen::Vector3i(x, y, z));
-    return true;
+    return updateOccupancyFromEvidence(Eigen::Vector3i(x, y, z), false);
 }
 
 void CoverageMap::integrateHit(const Eigen::Vector3d &pos) {
@@ -613,6 +616,62 @@ bool CoverageMap::getUpdatedBox(Eigen::Vector3d &update_min,
     }
     if (reset) updated_bbox_valid_ = false;
     return true;
+}
+
+void CoverageMap::appendRemoteBox(std::vector<IndexBox> &boxes,
+                                  const Eigen::Vector3i &min_idx,
+                                  const Eigen::Vector3i &max_idx) {
+    Eigen::Vector3i merged_min = min_idx - Eigen::Vector3i::Ones();
+    Eigen::Vector3i merged_max = max_idx + Eigen::Vector3i::Ones();
+    for (int k = 0; k < 3; ++k) {
+        merged_min(k) = std::max(0, merged_min(k));
+        merged_max(k) = std::min(grid_size_(k) - 1, merged_max(k));
+    }
+
+    bool merged = true;
+    while (merged) {
+        merged = false;
+        for (auto it = boxes.begin(); it != boxes.end(); ++it) {
+            bool overlaps = true;
+            for (int k = 0; k < 3; ++k) {
+                if (merged_max(k) < it->first(k) || it->second(k) < merged_min(k)) {
+                    overlaps = false;
+                    break;
+                }
+            }
+            if (!overlaps) continue;
+            merged_min = merged_min.cwiseMin(it->first);
+            merged_max = merged_max.cwiseMax(it->second);
+            boxes.erase(it);
+            merged = true;
+            break;
+        }
+    }
+    boxes.emplace_back(merged_min, merged_max);
+}
+
+void CoverageMap::markRemoteUpdatedBox(const Eigen::Vector3i &min_idx,
+                                       const Eigen::Vector3i &max_idx) {
+    if (!isInMapIndex(min_idx) || !isInMapIndex(max_idx)) return;
+    appendRemoteBox(remote_updated_boxes_, min_idx, max_idx);
+    appendRemoteBox(remote_df_boxes_, min_idx, max_idx);
+    esdf_dirty_ = true;
+}
+
+void CoverageMap::getRemoteUpdatedBoxes(
+    std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> &boxes,
+    bool reset) {
+    boxes.clear();
+    boxes.reserve(remote_updated_boxes_.size());
+    for (const auto &box : remote_updated_boxes_) {
+        Eigen::Vector3d min_pos, max_pos;
+        indexToPos(box.first, min_pos);
+        indexToPos(box.second, max_pos);
+        boxes.emplace_back(
+            min_pos - Eigen::Vector3d::Constant(0.5 * resolution_),
+            max_pos + Eigen::Vector3d::Constant(0.5 * resolution_));
+    }
+    if (reset) remote_updated_boxes_.clear();
 }
 
 void CoverageMap::updateDistanceFields(bool force) {
@@ -785,13 +844,23 @@ void CoverageMap::updateDistanceFields(bool force) {
         return true;
     };
 
-    bool updated_local = false;
-    if (!force && esdf_ready_ && df_bbox_valid_) {
-        updated_local = runLocalESDF(df_min_idx_, df_max_idx_);
+    std::vector<IndexBox> dirty_boxes;
+    if (df_bbox_valid_) dirty_boxes.emplace_back(df_min_idx_, df_max_idx_);
+    dirty_boxes.insert(dirty_boxes.end(), remote_df_boxes_.begin(), remote_df_boxes_.end());
+
+    bool updated_local = !dirty_boxes.empty() && !force && esdf_ready_;
+    if (updated_local) {
+        for (const auto &box : dirty_boxes) {
+            if (!runLocalESDF(box.first, box.second)) {
+                updated_local = false;
+                break;
+            }
+        }
     }
     if (!updated_local) runFullESDF();
 
     df_bbox_valid_ = false;
+    remote_df_boxes_.clear();
     esdf_dirty_ = false;
     esdf_ready_ = true;
 }

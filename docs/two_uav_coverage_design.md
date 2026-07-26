@@ -1214,9 +1214,10 @@ UAV2 local evidence
 - 原始 `isFrontierChanged()` 只问“旧簇中是否有 cell 不再是 frontier”，不能检测
   “新 free frontier 与旧簇连通/旧簇需要重分裂”的拓扑改变。旧 `frontier_flag_` 保持为
   true 后，BFS 会跳过旧 cell，产生过期簇或分裂簇。
-- 当前工作区的 `two_uav_frontier_finder.cpp` 已采用正确的最小修复：只要旧簇 AABB 与
-  更新搜索区相交，就移除该簇、清除其 `frontier_flag_` 并在扩展后的范围重新 BFS；
-  `isFrontierChanged()` 的声明和定义已删除。该路径同时覆盖本地和远端更新。
+- 当时采用的最小修复是：只要旧簇 AABB 与更新搜索区相交，就移除该簇、清除其
+  `frontier_flag_` 并在扩展后的范围重新 BFS；`isFrontierChanged()` 的声明和定义被删除。
+  该路径同时覆盖本地和远端更新。后续发现该策略会使搜索 AABB 沿旧簇连锁扩张并导致秒级耗时，
+  已由本文 2026-07-26“前沿更新中的旧簇 AABB 连锁扩张”章节取代。
 - 不存在静态地图更新时，两机显示的正常传播上界约为 `0.5 + 1.2 = 1.7 s`（另加少量
   bridge/ROS 调度时间）。在这个窗口内的暂时不一致是设计上的最终一致性，不是本缺陷。
   若最后一次 B 区域变化超过约 2 s 后仍不一致，再检查 bridge 的
@@ -1297,3 +1298,122 @@ bridge 的证据。接收端没收到该 chunk 的任何后续 revision 时也�
   `fov_visualizer_uav1` 和 `fov_visualizer_uav2`。RViz 的两个 FOV Display 订阅队列为 1，
   根配置帧率为 60，旧消息不会积压。编译已验证
   `two_uav_fov_visualizer` 与 `two_uav_coverage_search_node`。
+
+### 2026-07-26：前沿更新中的旧簇 AABB 连锁扩张（已优化）
+
+#### 问题
+
+此前为避免旧前沿残留，双机版采用“旧簇 AABB 与更新搜索区相交即删除”的策略，并在删除时将
+`search_min/search_max` 扩展到该簇完整边界及 margin。由于扩展后的搜索区会继续命中更多旧簇，
+形成连锁失效：
+
+```text
+局部地图更新 AABB
+  -> 删除相交簇并扩大搜索 AABB
+  -> 命中更多簇并继续扩大
+  -> 多簇重新 BFS、切分、视点及遮挡射线计算
+```
+
+因此日志中的 `frontier AABB update took 1.8~3 s` 并不只是 AABB 扫描时间；其计时还包含
+ESDF、前沿重搜、视点/可见性计算、RViz Marker 发布和层级网格输入。该行为与单机及 FUEL
+的增量更新机制不同，会在前沿簇较多时退化为近似大范围重建。
+
+#### 解决方案
+
+`FrontierFinder::searchFrontiers()` 改为 FUEL/单机风格的固定增量范围：
+
+```text
+搜索范围：原始 updated AABB + 固定 margin
+旧簇删除：仅当“与原始 updated AABB 相交”且“抽样确认簇内前沿已失效”时执行
+```
+
+实现复用单机的 `isFrontierChanged()` 轻量抽样判定：最多约 180 个采样点，若失效样本达到
+簇大小的 15% 即重建；未变化的簇保留其已有 cells、viewpoints 和 `frontier_flag_`。移除了
+按旧簇动态执行 `cwiseMin/cwiseMax` 扩大 `search_min/search_max` 的代码。
+
+区域生长 `expandFrontier()` 从固定搜索区内的新种子出发时仍会遍历整块连通前沿，因此不需要
+为重建完整簇而扩大扫描 AABB。
+
+#### 边界与后续观察
+
+此修改解决的是“**旧前沿簇导致搜索 AABB 连锁扩大**”这一主矛盾，不修改地图同步协议。两机各自
+的本地地图变化和远端 chunk 融合仍会合并到单一 `updated_bbox`；两机相距较远时，这个原始
+AABB 仍可能较大。若实测仍出现超过 500 ms 的更新，下一项应将单一 dirty AABB 拆为多个独立
+脏区域，而不是恢复旧簇驱动的动态扩大策略。
+
+本优化已编译验证：`two_uav_coverage_search_node` 构建成功。
+
+### 2026-07-26：远端地图 chunk 不再扩大本机前沿 AABB（已优化）
+
+两机相距较远时，旧实现将本机深度更新和远端 `SwarmMapChunk` 的融合变化都写入同一
+`updated_min_idx_/updated_max_idx_`。一次前沿定时更新会把相距很远的两个区域取 min/max
+并合成一块大 AABB，可能横跨两机之间整张地图。
+
+现实现保留本机 `updated_min_idx_/updated_max_idx_` 机制不变，并将远端融合变化单独记录为
+`remote_updated_boxes_`：
+
+```text
+本机占据变化       -> 本机 AABB
+远端一个 chunk 融合 -> 该消息实际发生占据变化的 remote box
+frontier timer      -> 本机 AABB 与每个 remote box 分别增量搜索
+```
+
+远端 evidence 值变化但未改变融合后的占据状态时，不产生前沿/ESDF 更新。相邻或重叠的 remote
+box 才会合并；相距较远的 chunk 始终保持独立，因而不会再经由远端地图传输把本机 AABB 拉长。
+同一轮中一个旧前沿簇即使与多个区域相交，也只会失效和重建一次；所有区域处理完后再统一计算
+新簇视点、发布 RViz Marker。
+
+ESDF 使用独立的 `remote_df_boxes_` 处理远端变化，避免前沿搜索已分区但 ESDF 仍因远端/本机
+min/max 合并而退化为大范围更新。前沿定时器周期保持 1.2 s，未在本次修改中调整。
+
+`two_uav_coverage_search_node` 已重新编译通过。
+
+#### 本机更新与两机融合的最终实现流程
+
+本机和远端仍融合到同一个 `occupancy_buffer_`，因此 A*、碰撞检测、前沿判定和视点可见性始终
+使用同一份融合地图；本次改变的是“地图变化如何触发前沿/ESDF 增量更新”，不是将地图拆成两份。
+
+```text
+本机深度/点云回调
+  -> occupancy_evidence_buffer_ 更新
+  -> updateOccupancyFromEvidence(idx, true)
+  -> markUpdatedIndex(idx, 1) + markDistanceFieldDirtyIndex(idx, 1)
+  -> updated_min_idx_/updated_max_idx_：保持原有单一 local AABB
+
+对方 UAV 每 0.5 s 发送发生变化的 SwarmMapChunk
+  -> remoteChunkCb()
+  -> remote_evidence_buffer_ 更新
+  -> updateOccupancyFromEvidence(idx, false)
+  -> 仅当融合后的 occupancy_buffer_ 状态实际改变时，累计该消息的 changed_min/max
+  -> markRemoteUpdatedBox(changed_min, changed_max)
+  -> remote_updated_boxes_ + remote_df_boxes_：不写入 local AABB
+
+frontier timer（保持 1.2 s）
+  -> updateDistanceFields()：本机 df AABB 与各 remote_df_box 分别局部更新
+  -> searchFrontiers()：消费一个 local AABB 和多个 remote_updated_box
+  -> 仅把重叠/相邻区域合并；远距离区域独立扫描
+  -> 一轮结束后统一重建新簇视点并发布 Marker
+```
+
+`updateOccupancyFromEvidence()` 由原来的无返回 `void` 改为返回“融合占据状态是否改变”。这避免了
+远端 evidence 虽变化、但本机 evidence 抵消后占据状态不变时仍触发无效的前沿与 ESDF 更新。
+
+对每一轮待处理区域，旧前沿簇只要与任一原始区域相交且经 `isFrontierChanged()` 确认失效，就
+清除一次 `frontier_flag_` 并重建一次。随后对各区域执行固定 margin 的增量扫描；同一簇即使跨
+多个 remote chunk，也不会被重复删除和重算。空间连续的 chunk 可以合并以避免边界重复扫描，
+相距较远的本机/远端更新不会被 min/max 合成为横跨地图的大包围盒。
+
+### 2026-07-26：前沿更新时间日志未显示（正常阈值行为）
+
+优化后终端不再持续出现如下警告：
+
+```text
+[CoverageSearch] frontier AABB update took ... ms
+```
+
+这不是前沿更新停止，也不是日志被删除。`CoverageSearchManager::updateFrontiers()` 仍在每次
+前沿定时器触发时执行 ESDF、前沿簇增量更新、Marker 发布和层级网格输入；只是该日志只在总耗时
+超过 120 ms 时输出，并使用 `ROS_WARN_THROTTLE(2.0)` 限制为同类警告最多每 2 s 一条。
+
+因此没有该日志通常意味着：本轮更新低于 120 ms、处于 2 s 节流窗口内，或没有新的本机/远端
+地图脏区域而前沿搜索快速返回。该阈值与节流保持不变，用于避免正常快速更新刷屏。
