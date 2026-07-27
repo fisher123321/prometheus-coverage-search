@@ -35,6 +35,8 @@
         <param name="coverage_search/max_acc" value="0.8"/>
         <!-- 最大偏航角速率 -->
         <param name="coverage_search/max_yaw_rate" value="1.8"/>
+        <!-- 最大偏航角加速度，保证转向从起点到视点全程平滑完成 -->
+        <param name="coverage_search/max_yaw_acc" value="1.8"/>
         <!-- 重规划间隔(秒) -->
         <param name="coverage_search/replan_time" value="3.0"/>
         <!-- 目标到达判定距离(米) -->
@@ -57,7 +59,6 @@
         <!-- Bids use A* path length.  Bound their rate/work so bid generation
              never competes with the real-time command loop. -->
         <param name="coverage_search/swarm_bid_period" value="2.0"/>
-        <param name="coverage_search/swarm_information_gain_weight" value="0.005"/>
         <param name="coverage_search/swarm_bid_max_tasks" value="16"/>
         <param name="coverage_search/swarm_bid_max_astar" value="6"/>
         <!-- 滚动规划：60%起监听新前沿版本；交接点由85%~95%的De Boor状态选择 -->
@@ -71,6 +72,7 @@
         <param name="coverage_search/map_epoch" value="1"/>
         <param name="coverage_search/swarm_chunk_size" value="2.0"/>
         <param name="coverage_search/swarm_chunk_delta_period" value="0.5"/>
+        <param name="coverage_search/peer_state_timeout" value="0.6"/>
         <param name="coverage_search/swarm_tx_prefix" value="$(arg swarm_tx_prefix)"/>
         <param name="coverage_search/swarm_rx_prefix" value="$(arg swarm_rx_prefix)"/>
         <!-- 地图输入源: 0=全局点云, 1=局部点云, 2=激光雷达点云, 3=D435i深度点云 -->
@@ -97,6 +99,9 @@
         <!-- 仅清除P450真实机体体积内的自反射/旧噪点，不清除0.35m安全区 -->
         <param name="map/robot_clear_radius" value="0.22"/>
         <param name="map/robot_clear_half_height" value="0.20"/>
+        <!-- 对方机体是动态目标：不写入静态地图，也不在其周围生成前沿。 -->
+        <param name="map/peer_clear_radius" value="0.40"/>
+        <param name="map/peer_clear_half_height" value="0.30"/>
         <param name="map/tsdf_trunc_dist" value="1.0"/>
         <param name="map/queue_size" value="5"/>
         <!-- 默认匹配 samplemaze.world；其他世界在 roslaunch 命令中覆盖顶部参数。 -->
@@ -110,7 +115,7 @@
         <!-- 前沿查找器参数 -->
         <param name="frontier_finder/cluster_min" value="5"/>
         <param name="frontier_finder/cluster_size_xy" value="2.2"/>
-        <param name="frontier_finder/min_candidate_dist" value="1.0"/>
+        <param name="frontier_finder/min_candidate_dist" value="0.0"/>
         <param name="frontier_finder/candidate_rmin" value="1.2"/>
         <param name="frontier_finder/candidate_rmax" value="1.6"/>
         <param name="frontier_finder/candidate_rnum" value="4"/>

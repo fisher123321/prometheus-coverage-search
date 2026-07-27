@@ -51,9 +51,9 @@ Visualization Manager:
       Enabled: true
       Max. Height Display: 3.4028234663852886e+38
       Max. Octree Depth: 15
-      Min. Height Display: -3.4028234663852886e+38
+      Min. Height Display: 0.5
       Name: OccupancyGrid
-      Octomap Topic: /uav1/octomap_full
+      Octomap Topic: /uav1/octomap_binary
       Queue Size: 5
       Value: true
       Voxel Alpha: 1
@@ -63,9 +63,9 @@ Visualization Manager:
       Enabled: true
       Max. Height Display: 3.4028234663852886e+38
       Max. Octree Depth: 15
-      Min. Height Display: -3.4028234663852886e+38
+      Min. Height Display: 0.5
       Name: OccupancyGrid
-      Octomap Topic: /uav2/octomap_full
+      Octomap Topic: /uav2/octomap_binary
       Queue Size: 5
       Value: true
       Voxel Alpha: 1
@@ -75,24 +75,24 @@ Visualization Manager:
       Class: octomap_rviz_plugin/OccupancyMap
       Color Scheme: map
       Draw Behind: false
-      Enabled: true
+      Enabled: false
       Max. Octree Depth: 15
       Name: OccupancyMap
       Octomap Binary Topic: /uav1/octomap_binary
       Unreliable: false
       Use Timestamp: false
-      Value: true
+      Value: false
     - Alpha: 0.699999988079071
       Class: octomap_rviz_plugin/OccupancyMap
       Color Scheme: map
       Draw Behind: false
-      Enabled: true
+      Enabled: false
       Max. Octree Depth: 15
       Name: OccupancyMap
       Octomap Binary Topic: /uav2/octomap_binary
       Unreliable: false
       Use Timestamp: false
-      Value: true
+      Value: false
     - Class: rviz/Group
       Displays:
         - Angle Tolerance: 0.10000000149011612
@@ -281,7 +281,7 @@ Visualization Manager:
           Name: FOV
           Namespaces:
             depth_camera_fov: true
-          Queue Size: 100
+          Queue Size: 1
           Value: true
         - Class: rviz/Marker
           Enabled: true
@@ -321,7 +321,7 @@ Visualization Manager:
           Name: FOV
           Namespaces:
             depth_camera_fov: true
-          Queue Size: 100
+          Queue Size: 1
           Value: true
         - Class: rviz/Marker
           Enabled: true
@@ -338,7 +338,7 @@ Visualization Manager:
     Background Color: 186; 189; 182
     Default Light: true
     Fixed Frame: world
-    Frame Rate: 20
+    Frame Rate: 60
   Name: root
   Tools:
     - Class: rviz/Interact
@@ -350,7 +350,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 19.28322410583496
+      Distance: 17.421459197998047
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -358,17 +358,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -4.76729679107666
-        Y: 2.9735331535339355
-        Z: -0.34047895669937134
+        X: -3.6334614753723145
+        Y: -2.4032211303710938
+        Z: 1.0705828666687012
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.314795970916748
+      Pitch: 1.1997967958450317
       Target Frame: <Fixed Frame>
-      Yaw: 1.296832799911499
+      Yaw: 3.1568331718444824
     Saved: ~
 Window Geometry:
   Displays:
@@ -386,5 +386,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 1848
-  X: 2173
-  Y: 175
+  X: 2632
+  Y: 212

@@ -164,7 +164,9 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
     const double goal_yaw_unwrapped = uav_yaw_ + yaw_delta;
     double duration = std::max(1.0, std::max(
         1.30 * total_length / std::max(0.20, max_vel_),
-        1.20 * std::fabs(yaw_delta) / std::max(0.10, max_yaw_rate_)));
+        std::max(1.90 * std::fabs(yaw_delta) / std::max(0.10, max_yaw_rate_),
+                 std::sqrt(5.80 * std::fabs(yaw_delta) /
+                           std::max(0.10, max_yaw_acc_)))));
 
     const double hard_clearance = std::max(
         std::max(0.35, coverage_map_.esdf_safe_distance_), traj_cut_clearance_);
@@ -177,10 +179,9 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         candidate.yaw_ctrl.resize(control_count);
         for (int i = 0; i < control_count; ++i) {
             const double fraction = (double)i / (control_count - 1);
-            const double yaw_progress = std::min(1.0, fraction / 0.80);
             candidate.position_ctrl[i] = sampleGuide(fraction * total_length);
             candidate.yaw_ctrl[i] = Eigen::Vector3d(
-                uav_yaw_ + yaw_progress * yaw_delta, 0.0, 0.0);
+                uav_yaw_ + fraction * yaw_delta, 0.0, 0.0);
         }
 
         const int spans = control_count - candidate.degree;
@@ -225,7 +226,9 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         accelerations.reserve(sample_count + 1);
         yaws.reserve(sample_count + 1);
         bool safe = true;
-        double peak_speed = 0.0, peak_acc = 0.0, peak_yaw_rate = 0.0;
+        double peak_speed = 0.0, peak_acc = 0.0, peak_yaw_rate = 0.0,
+               peak_yaw_acc = 0.0;
+        double previous_yaw_progress = 0.0;
         Eigen::Vector3d previous = start_pos;
         for (int i = 0; i <= sample_count; ++i) {
             Eigen::Vector3d p, v, a;
@@ -248,16 +251,31 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
             peak_speed = std::max(peak_speed, v.head<2>().norm());
             peak_acc = std::max(peak_acc, a.head<2>().norm());
             peak_yaw_rate = std::max(peak_yaw_rate, std::fabs(yaw_rate));
+            peak_yaw_acc = std::max(peak_yaw_acc, std::fabs(yaw_acc));
+            if (std::fabs(yaw_delta) > 0.05) {
+                const double yaw_progress = std::atan2(
+                    std::sin(yaw - uav_yaw_), std::cos(yaw - uav_yaw_)) / yaw_delta;
+                if (yaw_progress < previous_yaw_progress - 1e-3 ||
+                    yaw_progress < -1e-3 || yaw_progress > 1.0 + 1e-3) {
+                    last_rejection = "non-monotonic yaw profile";
+                    safe = false;
+                    break;
+                }
+                previous_yaw_progress = yaw_progress;
+            }
             const bool segment_blocked = point_safe && i > 0 &&
                 pathToTargetBlocked(p, previous, traj_cut_clearance_);
             if (!point_safe || peak_speed > 1.03 * max_vel_ ||
                 peak_acc > 1.03 * max_acc_ || peak_yaw_rate > 1.03 * max_yaw_rate_ ||
+                peak_yaw_acc > 1.03 * max_yaw_acc_ ||
                 segment_blocked) {
                 if (!point_safe) last_rejection = "ESDF/free-space point check";
                 else if (segment_blocked) last_rejection = "continuous segment clearance";
                 else if (peak_speed > 1.03 * max_vel_) last_rejection = "speed limit";
                 else if (peak_acc > 1.03 * max_acc_) last_rejection = "acceleration limit";
-                else last_rejection = "yaw-rate limit";
+                else if (peak_yaw_rate > 1.03 * max_yaw_rate_)
+                    last_rejection = "yaw-rate limit";
+                else last_rejection = "yaw-acceleration limit";
                 safe = false;
                 break;
             }
@@ -268,6 +286,29 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
             previous = p;
         }
         if (!safe) continue;
+
+        if (std::fabs(yaw_delta) > 0.05) {
+            auto yawProgressAt = [&](double time) {
+                Eigen::Vector3d p, v, a;
+                double sampled_yaw = 0.0, sampled_rate = 0.0, sampled_acc = 0.0;
+                if (!evaluateTimeBspline(candidate, time, p, v, a, sampled_yaw,
+                                         sampled_rate, sampled_acc)) {
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                return std::atan2(std::sin(sampled_yaw - uav_yaw_),
+                                  std::cos(sampled_yaw - uav_yaw_)) / yaw_delta;
+            };
+            const double yaw_progress_25 = yawProgressAt(0.25 * duration);
+            const double yaw_progress_50 = yawProgressAt(0.50 * duration);
+            const double yaw_progress_75 = yawProgressAt(0.75 * duration);
+            if (!std::isfinite(yaw_progress_25) || !std::isfinite(yaw_progress_50) ||
+                !std::isfinite(yaw_progress_75) || yaw_progress_25 < 0.05 ||
+                yaw_progress_50 < 0.35 || yaw_progress_50 > 0.65 ||
+                yaw_progress_75 < 0.65) {
+                last_rejection = "yaw change is concentrated near trajectory end";
+                continue;
+            }
+        }
 
         Eigen::Vector3d p0, v0, a0;
         double yaw0 = 0.0, yaw_rate0 = 0.0, yaw_acc0 = 0.0;
@@ -292,10 +333,11 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         traj_yaws_.swap(yaws);
         traj_dt_ = sample_dt;
         ROS_INFO("[CoverageSearch] Time B-spline accepted: duration=%.2fs, ctrl=%d, "
-                 "samples=%zu, peak_v=%.2f, peak_a=%.2f, peak_yaw_rate=%.2f; "
+                 "samples=%zu, peak_v=%.2f, peak_a=%.2f, peak_yaw_rate=%.2f, "
+                 "peak_yaw_acc=%.2f; "
                  "P/V/A/yaw are De Boor analytic samples.",
                  duration, control_count, traj_points_.size(), peak_speed,
-                 peak_acc, peak_yaw_rate);
+                 peak_acc, peak_yaw_rate, peak_yaw_acc);
         return true;
     }
 
@@ -1307,6 +1349,7 @@ bool CoverageSearchManager::activatePendingTrajectory() {
 
     current_goal_ = pending_traj_.goal;
     current_goal_yaw_ = pending_traj_.goal_yaw;
+    current_goal_task_id_ = pending_traj_.task_id;
     astar_path_.swap(pending_traj_.astar_path);
     traj_points_.swap(pending_traj_.points);
     traj_vels_.swap(pending_traj_.vels);
@@ -1354,6 +1397,10 @@ void CoverageSearchManager::executeTrajectory() {
     }
 
     const ros::Time execution_now = ros::Time::now();
+    if (!currentGoalLeaseValid()) {
+        abortCurrentGoalForSafety("task lease expired or reassigned");
+        return;
+    }
     const double execution_elapsed = (execution_now - traj_start_time_).toSec();
     const bool handoff_due = pending_traj_.ready &&
         (active_time_spline_.valid && pending_traj_.handoff_time >= 0.0
@@ -1497,7 +1544,6 @@ void CoverageSearchManager::executeTrajectory() {
             return;
         }
 
-        stepYawToward(desired_yaw);
         uav_command_.header.stamp = ros::Time::now();
         uav_command_.Agent_CMD = prometheus_msgs::UAVCommand::Move;
         uav_command_.Move_mode = prometheus_msgs::UAVCommand::TRAJECTORY;
@@ -1506,7 +1552,10 @@ void CoverageSearchManager::executeTrajectory() {
             uav_command_.velocity_ref[axis] = command_vel(axis);
             uav_command_.acceleration_ref[axis] = command_acc(axis);
         }
-        uav_command_.yaw_ref = cmd_yaw_smoothed_;
+        // The time B-spline already bounds yaw rate/acceleration and distributes
+        // the turn across the full flight. A second rate limiter here can lag
+        // the reference and force the remaining turn into the terminal hold.
+        uav_command_.yaw_ref = desired_yaw;
         uav_command_.Command_ID++;
         uav_cmd_pub_.publish(uav_command_);
 

@@ -1,4 +1,9 @@
 uint64 task_id
 uint32 chunk_id
+uint32 cluster_version
+uint32 frontier_cell_count
+geometry_msgs/Point centroid
+geometry_msgs/Point box_min
+geometry_msgs/Point box_max
 geometry_msgs/Pose viewpoint
 float32 information_gain

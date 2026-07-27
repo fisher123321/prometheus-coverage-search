@@ -1,5 +1,11 @@
 uint64 task_id
 uint32 task_version
+uint32 cluster_version
+uint32 frontier_cell_count
 uint32 winner_uav_id
 float32 cost
+time lease_expire_time
+geometry_msgs/Point centroid
+geometry_msgs/Point box_min
+geometry_msgs/Point box_max
 geometry_msgs/Pose goal
