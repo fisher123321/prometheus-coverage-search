@@ -24,7 +24,8 @@ coverage_search:
   camera_pitch: 0.35
   fov_vis_range: 1.5
   rolling_preplan_progress: 0.60
-  rolling_handoff_goal_dist: 0.60
+  rolling_terminal_speed_ratio: 0.10  # capped at 0.10 in code; lower for hardware tuning
+  rolling_terminal_acc_ratio: 0.10    # capped at 0.10 in code; lower for hardware tuning
   traj_step_size: 0.35
   traj_advance_dist: 0.35
   traj_cut_clearance: 0.55

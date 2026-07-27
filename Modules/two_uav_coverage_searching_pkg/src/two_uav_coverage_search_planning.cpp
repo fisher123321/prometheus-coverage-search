@@ -142,7 +142,8 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
         planner->traj_point_dwell_timeout_ = traj_point_dwell_timeout_;
         planner->traj_cut_clearance_ = traj_cut_clearance_;
         planner->rolling_preplan_progress_ = rolling_preplan_progress_;
-        planner->rolling_handoff_goal_dist_ = rolling_handoff_goal_dist_;
+        planner->rolling_terminal_speed_ratio_ = rolling_terminal_speed_ratio_;
+        planner->rolling_terminal_acc_ratio_ = rolling_terminal_acc_ratio_;
         planner->rolling_prepare_in_progress_ = false;
         planner->rolling_snapshot_mode_ = true;
 
@@ -184,47 +185,33 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
         std::max(1e-3, active_time_spline_.duration)));
     if (progress < rolling_preplan_progress_) return false;
 
-    // 在旧轨迹85%~95%窗口内，用De Boor解析值选择已经完成观测和偏航、
-    // 但仍保留非零速度的交接状态。
-    int handoff_idx = -1;
-    double handoff_time = -1.0;
+    // 60% 只触发后台准备；交接状态固定取旧轨迹的终端 T，而不是
+    // 在中段枚举候选。这样旧视点轨迹会完整执行至其规划终点。
+    const double handoff_time = active_time_spline_.duration;
+    const int handoff_idx = n - 1;
     Eigen::Vector3d handoff_pos, handoff_vel, handoff_acc;
     double handoff_yaw = 0.0, handoff_yaw_rate = 0.0, handoff_yaw_acc = 0.0;
-    double best_handoff_score = 1e9;
-    for (double fraction = 0.85; fraction <= 0.9501; fraction += 0.01) {
-        if (fraction <= progress + 0.02) continue;
-        const double t = fraction * active_time_spline_.duration;
-        Eigen::Vector3d p, v, a;
-        double yaw = 0.0, yaw_rate = 0.0, yaw_acc = 0.0;
-        if (!evaluateTimeBspline(active_time_spline_, t, p, v, a,
-                                 yaw, yaw_rate, yaw_acc)) continue;
-        const double goal_dist = (p.head<2>() - current_goal_.head<2>()).norm();
-        const double yaw_error = std::fabs(std::atan2(
-            std::sin(current_goal_yaw_ - yaw), std::cos(current_goal_yaw_ - yaw)));
-        const double speed = v.head<2>().norm();
-        if (goal_dist > rolling_handoff_goal_dist_ || yaw_error > 0.15 || speed < 0.10)
-            continue;
-        const double score = goal_dist + 0.5 * yaw_error - 0.05 * speed;
-        if (score < best_handoff_score) {
-            best_handoff_score = score;
-            handoff_time = t;
-            handoff_pos = p;
-            handoff_vel = v;
-            handoff_acc = a;
-            handoff_yaw = yaw;
-            handoff_yaw_rate = yaw_rate;
-            handoff_yaw_acc = yaw_acc;
-        }
-    }
-    if (handoff_time < 0.0) {
-        ROS_INFO_THROTTLE(2.0,
-            "[CoverageSearch] No De Boor handoff in 85%%~95%% satisfying observation, "
-            "yaw and nonzero-speed constraints; wait for terminal stop.");
+    if (!evaluateTimeBspline(active_time_spline_, handoff_time,
+                             handoff_pos, handoff_vel, handoff_acc,
+                             handoff_yaw, handoff_yaw_rate, handoff_yaw_acc)) {
+        ROS_WARN("[CoverageSearch] Cannot evaluate terminal rolling handoff state.");
         return false;
     }
-    handoff_idx = std::min(n - 2, std::max(traj_idx_ + 1,
-        (int)std::lround(handoff_time / std::max(1e-3, traj_dt_))));
-
+    if (handoff_vel.head<2>().norm() > 1e-3) {
+        const double braking_distance = std::max(goal_reach_dist_,
+            handoff_vel.head<2>().squaredNorm() /
+                (2.0 * std::max(0.3, max_acc_)) + 0.30);
+        Eigen::Vector3d stop_probe = handoff_pos;
+        stop_probe.head<2>() += braking_distance * handoff_vel.head<2>().normalized();
+        if (pathToTargetBlocked(stop_probe, handoff_pos, traj_cut_clearance_)) {
+            ROS_WARN("[CoverageSearch] Reject terminal rolling handoff: braking corridor blocked.");
+            return false;
+        }
+    }
+    if (handoff_time <= progress * active_time_spline_.duration) {
+        ROS_WARN("[CoverageSearch] Terminal rolling handoff is already due.");
+        return false;
+    }
     const Eigen::Vector3d old_uav_pos = uav_pos_;
     const Eigen::Vector3d old_uav_vel = uav_vel_;
     const double old_uav_yaw = uav_yaw_;
@@ -352,7 +339,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
     }
 
     pending_traj_ = std::move(prepared);
-    ROS_INFO("[CoverageSearch] Rolling trajectory ready: DeBoor handoff=%.2fs (%d/%d), "
+    ROS_INFO("[CoverageSearch] Terminal rolling trajectory ready: DeBoor handoff=%.2fs (%d/%d), "
              "next_goal=(%.2f,%.2f), next_points=%zu, planning=%.1f ms.",
              pending_traj_.handoff_time, pending_traj_.handoff_idx, n, pending_traj_.goal(0),
              pending_traj_.goal(1), pending_traj_.points.size(), planning_ms);

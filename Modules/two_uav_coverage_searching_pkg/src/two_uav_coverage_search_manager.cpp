@@ -51,7 +51,8 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     nh.param("coverage_search/traj_point_dwell_timeout", traj_point_dwell_timeout_, 5.0);
     nh.param("coverage_search/traj_cut_clearance", traj_cut_clearance_, 0.55);
     nh.param("coverage_search/rolling_preplan_progress", rolling_preplan_progress_, 0.60);
-    nh.param("coverage_search/rolling_handoff_goal_dist", rolling_handoff_goal_dist_, 0.60);
+    nh.param("coverage_search/rolling_terminal_speed_ratio", rolling_terminal_speed_ratio_, 0.10);
+    nh.param("coverage_search/rolling_terminal_acc_ratio", rolling_terminal_acc_ratio_, 0.10);
     nh.param("coverage_search/completion_known_ratio", completion_known_ratio_, 0.99);
     nh.param("coverage_search/completion_no_frontier_dwell", completion_no_frontier_dwell_, 8.0);
     nh.param("coverage_search/residual_scan_yaw_rate", residual_scan_yaw_rate_, 0.6);

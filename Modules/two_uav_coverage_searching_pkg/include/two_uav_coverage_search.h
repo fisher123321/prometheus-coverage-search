@@ -527,7 +527,8 @@ private:
     } pending_traj_;
     bool rolling_prepare_in_progress_;
     double rolling_preplan_progress_;
-    double rolling_handoff_goal_dist_;
+    double rolling_terminal_speed_ratio_ = 0.10;
+    double rolling_terminal_acc_ratio_ = 0.10;
     bool rolling_snapshot_mode_ = false;
     uint64_t rolling_generation_ = 0;
     uint64_t rolling_last_attempt_frontier_generation_ = 0;

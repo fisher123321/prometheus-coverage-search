@@ -144,6 +144,15 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
     const Eigen::Vector3d start_pos = traj_points_.front();
     Eigen::Vector3d start_vel = uav_vel_;
     Eigen::Vector3d desired_start_acc = start_acc;
+    Eigen::Vector3d terminal_tangent = sampleGuide(total_length) -
+        sampleGuide(std::max(0.0, total_length - std::min(0.50, total_length)));
+    terminal_tangent(2) = 0.0;
+    if (terminal_tangent.norm() > 1e-3) terminal_tangent.normalize();
+    else terminal_tangent.setZero();
+    const double terminal_speed_ratio = std::max(0.0, std::min(0.10, rolling_terminal_speed_ratio_));
+    const double terminal_acc_ratio = std::max(0.0, std::min(0.10, rolling_terminal_acc_ratio_));
+    const Eigen::Vector3d terminal_vel = terminal_speed_ratio * max_vel_ * terminal_tangent;
+    const Eigen::Vector3d terminal_acc = terminal_acc_ratio * max_acc_ * terminal_tangent;
     start_vel(2) = 0.0;
     desired_start_acc(2) = 0.0;
     if (!planning_start_state_valid_) {
@@ -193,8 +202,8 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
             else candidate.knots[i] = (i - candidate.degree) * knot_span;
         }
 
-        // 钳制三次B样条的首三个控制点直接编码交接P/V/A；末三个重合，
-        // 因而无后续轨迹时自然以零速度、零加速度停在视点。
+        // 钳制三次B样条的首、末三个控制点直接编码 P/V/A。终端仅保留
+        // 最大值 10% 的切向速度和加速度，供成功的终端交接连续接入。
         candidate.position_ctrl[0] = start_pos;
         const Eigen::Vector3d start_d1 = start_vel;
         const Eigen::Vector3d next_d1 = start_d1 +
@@ -202,9 +211,11 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         candidate.position_ctrl[1] = start_pos + knot_span / 3.0 * start_d1;
         candidate.position_ctrl[2] = candidate.position_ctrl[1] +
                                      2.0 * knot_span / 3.0 * next_d1;
-        candidate.position_ctrl[control_count - 1] = traj_points_.back();
-        candidate.position_ctrl[control_count - 2] = traj_points_.back();
-        candidate.position_ctrl[control_count - 3] = traj_points_.back();
+        const Eigen::Vector3d terminal_pos = traj_points_.back();
+        candidate.position_ctrl[control_count - 1] = terminal_pos;
+        candidate.position_ctrl[control_count - 2] = terminal_pos - knot_span / 3.0 * terminal_vel;
+        candidate.position_ctrl[control_count - 3] = candidate.position_ctrl[control_count - 2] +
+            2.0 * knot_span / 3.0 * (-terminal_vel + 0.5 * knot_span * terminal_acc);
 
         const double next_yaw_rate = start_yaw_rate +
                                      0.5 * knot_span * start_yaw_acceleration;
@@ -310,19 +321,28 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
             }
         }
 
-        Eigen::Vector3d p0, v0, a0;
+        Eigen::Vector3d p0, v0, a0, p_end, v_end, a_end;
         double yaw0 = 0.0, yaw_rate0 = 0.0, yaw_acc0 = 0.0;
+        double yaw_end = 0.0, yaw_rate_end = 0.0, yaw_acc_end = 0.0;
         if (!evaluateTimeBspline(candidate, 0.0, p0, v0, a0,
                                  yaw0, yaw_rate0, yaw_acc0) ||
+            !evaluateTimeBspline(candidate, duration, p_end, v_end, a_end,
+                                 yaw_end, yaw_rate_end, yaw_acc_end) ||
             (p0 - start_pos).norm() > 1e-6 ||
             (v0 - start_vel).norm() > 1e-6 ||
             (a0 - desired_start_acc).norm() > 1e-5 ||
             std::fabs(std::atan2(std::sin(yaw0 - uav_yaw_),
                                  std::cos(yaw0 - uav_yaw_))) > 1e-6 ||
             std::fabs(yaw_rate0 - start_yaw_rate) > 1e-6 ||
-            std::fabs(yaw_acc0 - start_yaw_acceleration) > 1e-5) {
-            ROS_ERROR("[CoverageSearch] Reject time B-spline: De Boor start-state "
-                      "invariant failed.");
+            std::fabs(yaw_acc0 - start_yaw_acceleration) > 1e-5 ||
+            (p_end - terminal_pos).norm() > 1e-6 ||
+            (v_end - terminal_vel).norm() > 1e-6 ||
+            (a_end - terminal_acc).norm() > 1e-5 ||
+            std::fabs(std::atan2(std::sin(yaw_end - goal_yaw_unwrapped),
+                                 std::cos(yaw_end - goal_yaw_unwrapped))) > 1e-6 ||
+            std::fabs(yaw_rate_end) > 1e-6 || std::fabs(yaw_acc_end) > 1e-5) {
+            ROS_ERROR("[CoverageSearch] Reject time B-spline: De Boor endpoint "
+                      "P/V/A/yaw invariant failed.");
             return false;
         }
 
@@ -1504,6 +1524,43 @@ void CoverageSearchManager::executeTrajectory() {
     if (active_time_spline_.valid) {
         const double elapsed = std::max(
             0.0, (ros::Time::now() - traj_start_time_).toSec());
+        if (elapsed >= active_time_spline_.duration && !pending_traj_.ready) {
+            if (pathToTargetBlocked(current_goal_, uav_pos_, traj_cut_clearance_)) {
+                ROS_WARN("[CoverageSearch] Terminal hold path is blocked; replan same goal.");
+                uav_command_.header.stamp = ros::Time::now();
+                uav_command_.Agent_CMD = prometheus_msgs::UAVCommand::Move;
+                uav_command_.Move_mode = prometheus_msgs::UAVCommand::XYZ_POS;
+                uav_command_.position_ref[0] = uav_pos_(0);
+                uav_command_.position_ref[1] = uav_pos_(1);
+                uav_command_.position_ref[2] = fly_height_;
+                uav_command_.yaw_ref = uav_yaw_;
+                uav_command_.Command_ID++;
+                uav_cmd_pub_.publish(uav_command_);
+                has_traj_ = false;
+                has_goal_ = true;
+                replan_count_++;
+                return;
+            }
+            uav_command_.header.stamp = ros::Time::now();
+            uav_command_.Agent_CMD = prometheus_msgs::UAVCommand::Move;
+            uav_command_.Move_mode = prometheus_msgs::UAVCommand::XYZ_POS;
+            uav_command_.position_ref[0] = current_goal_(0);
+            uav_command_.position_ref[1] = current_goal_(1);
+            uav_command_.position_ref[2] = fly_height_;
+            uav_command_.yaw_ref = current_goal_yaw_;
+            uav_command_.Command_ID++;
+            uav_cmd_pub_.publish(uav_command_);
+            const double goal_dist = (uav_pos_.head<2>() - current_goal_.head<2>()).norm();
+            const double yaw_error = std::fabs(std::atan2(
+                std::sin(current_goal_yaw_ - uav_yaw_),
+                std::cos(current_goal_yaw_ - uav_yaw_)));
+            if (goal_dist <= goal_reach_dist_ && yaw_error <= 0.15 &&
+                uav_vel_.head<2>().norm() <= 0.15) {
+                has_traj_ = false;
+                has_goal_ = false;
+            }
+            return;
+        }
         const double command_time = std::min(active_time_spline_.duration, elapsed);
         Eigen::Vector3d target, command_vel, command_acc;
         double desired_yaw = 0.0, desired_yaw_rate = 0.0, desired_yaw_acc = 0.0;

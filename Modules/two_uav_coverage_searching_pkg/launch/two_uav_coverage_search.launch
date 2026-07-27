@@ -61,9 +61,10 @@
         <param name="coverage_search/swarm_bid_period" value="2.0"/>
         <param name="coverage_search/swarm_bid_max_tasks" value="16"/>
         <param name="coverage_search/swarm_bid_max_astar" value="6"/>
-        <!-- 滚动规划：60%起监听新前沿版本；交接点由85%~95%的De Boor状态选择 -->
+        <!-- 滚动规划：60%起准备 successor；交接点固定为旧轨迹的终端 De Boor 状态 -->
         <param name="coverage_search/rolling_preplan_progress" value="0.60"/>
-        <param name="coverage_search/rolling_handoff_goal_dist" value="0.60"/>
+        <param name="coverage_search/rolling_terminal_speed_ratio" value="0.10"/>
+        <param name="coverage_search/rolling_terminal_acc_ratio" value="0.10"/>
         <!-- 自动开始 -->
         <param name="coverage_search/auto_start" value="$(arg auto_start)"/>
         <param name="coverage_search/cooperative_mode" value="$(arg cooperative_mode)"/>
