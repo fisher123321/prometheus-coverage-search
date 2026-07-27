@@ -13,6 +13,7 @@
 #include <set>
 #include <functional>
 #include <chrono>
+#include <cassert>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -27,6 +28,7 @@
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <std_msgs/UInt64MultiArray.h>
+#include <std_msgs/Bool.h>
 
 #include <prometheus_msgs/UAVCommand.h>
 #include <prometheus_msgs/UAVState.h>
@@ -407,7 +409,7 @@ private:
     ros::Subscriber global_pcl_sub_, local_pcl_sub_, scan_pcl_sub_, depth_pcl_sub_, goal_sub_;
     ros::Subscriber remote_chunk_sub_, map_request_sub_, remote_frontier_sub_, remote_state_sub_;
     ros::Subscriber local_task_sub_, remote_task_sub_;
-    ros::Publisher uav_cmd_pub_, path_vis_pub_, fov_vis_pub_, coverage_status_pub_, uav_label_pub_;
+    ros::Publisher uav_cmd_pub_, path_vis_pub_, fov_vis_pub_, coverage_status_pub_, uav_label_pub_, completion_ready_pub_;
     ros::Publisher swarm_frontier_pub_, swarm_bid_pub_, swarm_traj_pub_, map_chunk_pub_, map_request_pub_;
     ros::Timer mainloop_timer_, frontier_timer_, swarm_data_timer_;
 
@@ -546,13 +548,16 @@ private:
     uint64_t current_goal_task_id_ = 0;
 
     ros::Time start_time_, finish_time_;
+    ros::Time coverage_25_time_, coverage_50_time_, coverage_75_time_;
     ros::Time traj_start_time_;  // 轨迹开始时间，用于超时检测
     ros::Time hover_wait_start_; // 悬停等待开始时间
     int replan_count_;
 
-    // ★ 严格完成：固定区域已知率达标，并且持续无前沿；否则原地旋转恢复观测
+    // ★ 严格完成：固定区域已知率达标、持续无前沿，并与对机达成完成共识。
     ros::Time last_frontier_found_time_;
     bool last_frontier_found_valid_;
+    bool completion_ready_ = false;
+    bool peer_completion_ready_ = false;
     double completion_known_ratio_;
     double completion_no_frontier_dwell_;
     double residual_scan_yaw_rate_;
@@ -593,6 +598,7 @@ private:
     void mainloopCb(const ros::TimerEvent &e);
     void frontierCb(const ros::TimerEvent &e);
     void updateFrontiers();
+    void setCompletionReady(bool ready);
 
     // ★ 核心方法
     bool selectNextFrontier();       // 选择下一个前沿簇目标

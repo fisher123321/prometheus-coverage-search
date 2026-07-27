@@ -1579,3 +1579,155 @@ bundle 中但未被本机选为最终目标
 本次修改了 `SwarmFrontier.msg`、`SwarmTask.msg` 和 `SwarmTrajectory.msg`，已重新生成 ROS
 消息并编译验证：`two_uav_coverage_search_node`、`two_uav_coordinator`、`two_uav_swarm_bridge`
 均构建成功。测试前必须同时重启两侧覆盖节点、协调器和 bridge，不能让新旧消息定义混用。
+
+### 2026-07-27：覆盖完成共识、任务 lease 防抢占与滚动交接说明
+
+本节覆盖上文“执行进展续租”和“区域匹配”的旧细节；当前代码以本节为准。
+
+#### 使用范围与启动入口
+
+本轮修改只面向 `two_uav_coverage_searching_pkg` 的双机仿真流程。常用启动顺序为：
+
+```bash
+~/Prometheus/Modules/two_uav_coverage_searching_pkg/scripts/start_two_uav_sim.sh 1 2 1.5
+~/Prometheus/Modules/two_uav_coverage_searching_pkg/scripts/arm_two_uav_sim.sh 1 2
+~/Prometheus/Modules/two_uav_coverage_searching_pkg/scripts/start_two_uav_coverage_sim.sh 1 2 1.5
+```
+
+两台无人机运行相同的覆盖搜索与协调算法；不能把 UAV1 视为中心控制器或唯一完成裁决者。
+
+#### 2D 覆盖率、阶段统计与双机完成共识
+
+覆盖率继续使用 `CoverageMap::getKnownSpaceRatio()` 的二维体素统计。任务的**本地完成就绪**条件为：
+
+```text
+二维已知比例 >= 99%
+且
+连续无前沿 >= completion_no_frontier_dwell（默认 8 s）
+```
+
+达到条件的 UAV 不会单独结束，而是发布 latched 主题：
+
+```text
+/uav<N>/prometheus/coverage_search/completion_ready = true
+```
+
+本机 coordinator 将该标志随 `SwarmState.completion_ready` 经现有 bridge 转发给对机。只有同时满足
+“本机 ready + 对机状态新鲜且 ready”时，两台无人机才各自进入 `FINISH`，悬停后走既有降落流程。
+单机模式不等待对机。在达成双机共识并进入 `FINISH` 前，若前沿再次出现、已知比例跌破阈值，
+或对机状态超时，则 ready 被撤销。
+
+`publishCoverageStatus()` 在覆盖开始后锁存首次达到 25%、50%、75% 的时刻，并持续打印：
+
+```text
+Duration, T25, T50, T75, Known, Frontiers, Ready, Peer ready
+```
+
+进入 `FINISH` 后 `Duration` 锁定为 `finish_time - start_time`，不把悬停和降落时间继续累加。
+为了避免两台终端重复刷统计，协同模式仍按 `global_coverage_source` 选择一个日志输出源；这不改变
+完成共识本身，两个 UAV 都必须 ready 才会结束。
+
+实现位置：
+
+- `msg/SwarmState.msg`：新增 `bool completion_ready`；
+- `two_uav_coverage_search_manager.cpp`：本地 ready 判定、阶段时间锁存与 FINISH 时间锁定；
+- `two_uav_coordinator.cpp`：本地 Bool 到 `SwarmState` 的转发。
+
+#### 任务归属的唯一事实来源：有效 lease
+
+RViz 视点上的 `UAV1/UAV2` 不再由“这一轮最新 bid 的理论赢家”重算，而是由已发布且未过期的
+`SwarmTask` lease 决定。标签格式为：
+
+```text
+UAV1_7s
+```
+
+其中 `7s` 是 lease 的剩余秒数向上取整。两侧任务表对同一 `task_id` 的 owner 不一致时显示红色
+`CONFLICT`，而不是伪造一个 owner。
+
+任务状态遵循：
+
+```text
+FREE -> LEASED(owner, expiry) -> ACTIVE(owner, heartbeat renew) -> natural expiry
+```
+
+- coordinator 维护 `own_leases_`，不会因一次前沿更新或候选列表缺席而删除未过期任务；
+- `SwarmTrajectory.active_task_id` 在新鲜（<= 2.5 s）时持续为 ACTIVE 任务续约 8 s；
+- 未 ACTIVE 的 bundle 任务仅保留到自然到期，不无限续租；
+- 对机任务表不新鲜（> 5 s）或任一方 bid 不新鲜时，协调器**只重发已有 lease，不做新竞价**；
+- 对机任务表中任意未过期的同 ID 条目都视为占用，即使消息的 owner 字段异常，也绝不抢占；
+- 执行端在每次轨迹循环检查当前 `task_id` 是否仍是本机有效 lease。过期或被重分配时执行安全中止。
+
+因此空闲机只能得到真正 FREE 的任务。当前没有“提前释放/主动接管”协议：ACTIVE 不再上报后，旧
+lease 仅等待自然过期。这是有意选择的保守最小实现，优先避免双机同时飞向同一簇；若后续需要故障
+接管，应增加带单调 revision 的明确 release/active-absence 协议，而不是用两次本地选点作确认。
+
+“连续两次选择到对机任务才允许执行”的去抖机制没有加入。它不能解决任务表陈旧，且会把一次可靠
+lease 的问题变成依赖 10 Hz 调用次数的偶然行为。上述 lease 锁定已在根源排除对机未释放任务。
+
+#### 密集前沿的任务匹配与冲突策略
+
+`task_id` 仍是 0.5 m 区域键，单独使用可能让相邻簇碰撞。执行端当前将前沿簇与任务认定为同一
+任务，必须同时满足：
+
+```text
+task_id 相同
+AND 中心距离 <= 1.0 m
+AND 2D AABB 在 0.5 m margin 下重叠
+```
+
+如果本机/对机新鲜任务表对同一前沿匹配出不同 owner，执行端返回“不属于本机”，而不是按 UAV ID
+选一个赢家；协调器也不会竞价对机表中未过期的同 ID 条目。这一策略会在碰撞时暂时少分配任务，
+但不会造成抢占。
+
+这不是跨地图更新的完整簇跟踪器：在极密集前沿中，0.5 m ID 仍可能发生真实碰撞。若日志或 RViz
+持续出现 `CONFLICT`，下一步应维护前沿簇轨迹，并以 IoU/中心匹配生成稳定 ID；不要继续放宽当前
+三重匹配条件。
+
+#### 滚动轨迹预规划：确定交接时刻，而非 60% 时直接换目标
+
+当前已有滚动预规划，目的是避免每个视点到达后悬停。其严格时序如下：
+
+```text
+旧轨迹执行进度 >= 60%
+  -> 以该时刻的地图、前沿和旧 B 样条创建后台快照
+  -> 在旧轨迹 85%..95% 搜索候选交接时刻（步长 1%）
+  -> 对每个候选用 De Boor 求未来 p/v/a/yaw
+  -> 选出一个确定的 handoff_time，再以该未来状态选择新视点并规划新轨迹
+  -> 到 handoff_time 时，用真实状态复核；成功才切换
+```
+
+候选交接状态必须满足：距旧视点不超过 `rolling_handoff_goal_dist`（默认 0.60 m）、预测偏航误差
+不超过 `0.15 rad`、预测水平速度不低于 `0.10 m/s`，且候选时刻至少落在当前执行进度之后。候选
+评分为：
+
+```text
+score = goal_distance + 0.5 * yaw_error - 0.05 * speed
+```
+
+分数最小者写入唯一的 `handoff_time/handoff_pos/handoff_vel/handoff_yaw`；因此 85%..95% 只是搜索
+窗口，选择下一个视点时使用的是一个确定的未来预测状态，而不是 60% 时的当前状态。
+
+交接前还会核验实际位置、速度、偏航误差及**新**前沿仍存在；任一失败则丢弃 pending 轨迹并完成
+旧轨迹。安全切断（lease 失效、目标/路径碰撞、ESDF 间隙不足、跟踪卡住等）则中止轨迹；大部分安全
+问题重规划同一目标，只有目标本身不安全时才放弃并重新选点。
+
+当前滚动交接的已知限制是：它不验证**旧**前沿簇是否已经被看清或在最新地图中消失，只验证几何
+接近旧视点。因此无人机可能在距旧视点约 0.60 m 时切往新目标，留下尚未完成的旧簇。这与“必须
+完成旧簇观测后才离开”的任务语义不一致，本轮按需求只记录原因、未改动轨迹策略。
+
+若要修复，应在未来单独加入“旧任务观测完成屏障”：到达视点并保持足够观测后，用最新地图确认
+与旧 `task_id` 匹配的前沿簇已消失，才允许准备或激活 successor。该功能会引入任务完成状态与
+跨机同步，不能以简单的二次选点确认替代。
+
+#### 验证与重启要求
+
+已执行：
+
+```bash
+make -C build/two_uav_coverage_searching_pkg -j2
+git diff --check
+```
+
+构建成功。由于 `SwarmState.msg` 的消息定义已变更，测试时必须同时重启两台 UAV 的覆盖节点、
+coordinator 和 bridge，避免一侧仍使用旧消息定义。

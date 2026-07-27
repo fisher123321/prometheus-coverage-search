@@ -4,6 +4,7 @@ uint64 sequence
 uint64 ack_sequence
 bool odom_valid
 bool command_ready
+bool completion_ready
 uint8 phase
 geometry_msgs/Pose pose
 geometry_msgs/Vector3 velocity

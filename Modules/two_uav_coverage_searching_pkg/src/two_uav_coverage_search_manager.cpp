@@ -99,6 +99,8 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
         uav_name_ + "/prometheus/coverage_search/status", 1);
     uav_label_pub_ = nh.advertise<visualization_msgs::Marker>(
         uav_name_ + "/prometheus/coverage_search/uav_label", 1);
+    completion_ready_pub_ = nh.advertise<std_msgs::Bool>(
+        uav_name_ + "/prometheus/coverage_search/completion_ready", 1, true);
 
     if (cooperative_mode_) {
         swarm_frontier_pub_ = nh.advertise<prometheus_two_uav_coverage_search::SwarmFrontierArray>(
@@ -173,6 +175,12 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     traj_point_reach_time_ = ros::Time::now();
     last_frontier_found_time_ = ros::Time::now();
     last_frontier_found_valid_ = false;
+    completion_ready_ = false;
+    peer_completion_ready_ = false;
+    completion_ready_pub_.publish(std_msgs::Bool());
+    coverage_25_time_ = ros::Time(0);
+    coverage_50_time_ = ros::Time(0);
+    coverage_75_time_ = ros::Time(0);
     residual_scan_yaw_ = 0.0;
     last_residual_search_time_ = ros::Time(0);
     cout << GREEN << "[CoverageSearch] init. UAV: " << uav_name_
@@ -269,6 +277,9 @@ void CoverageSearchManager::goalCb(const geometry_msgs::PoseStampedConstPtr &msg
     if (exec_state_ == EXEC_STATE::INIT) {
         exec_state_ = EXEC_STATE::EXPLORING;
         start_time_ = ros::Time::now();
+        finish_time_ = ros::Time(0);
+        coverage_25_time_ = coverage_50_time_ = coverage_75_time_ = ros::Time(0);
+        setCompletionReady(false);
         cout << GREEN << "[CoverageSearch] Triggered! Start exploring." << TAIL << endl;
     }
 }
@@ -278,13 +289,23 @@ void CoverageSearchManager::remoteStateCb(
     if (!cooperative_mode_ || static_cast<int>(msg->uav_id) == uav_id_) return;
     if (!msg->odom_valid) {
         peer_state_valid_ = false;
+        peer_completion_ready_ = false;
         coverage_map_.setDynamicPeerVolume(Eigen::Vector3d::Zero(), false);
         return;
     }
     peer_pos_ = Eigen::Vector3d(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
     peer_state_received_ = ros::Time::now();
     peer_state_valid_ = true;
+    peer_completion_ready_ = msg->completion_ready;
     coverage_map_.setDynamicPeerVolume(peer_pos_, true);
+}
+
+void CoverageSearchManager::setCompletionReady(bool ready) {
+    if (completion_ready_ == ready) return;
+    completion_ready_ = ready;
+    std_msgs::Bool msg;
+    msg.data = ready;
+    completion_ready_pub_.publish(msg);
 }
 
 void CoverageSearchManager::frontierCb(const ros::TimerEvent &e) {
@@ -623,8 +644,7 @@ bool CoverageSearchManager::frontierMatchesTask(
         frontier.box_max_(0) + margin >= task.box_min.x &&
         frontier.box_min_(1) <= task.box_max.y + margin &&
         frontier.box_max_(1) + margin >= task.box_min.y;
-    return (frontierTaskId(frontier) == task.task_id && centers_close) ||
-           (boxes_overlap && centers_close);
+    return frontierTaskId(frontier) == task.task_id && centers_close && boxes_overlap;
 }
 
 uint64_t CoverageSearchManager::leasedTaskIdForFrontier(
@@ -642,13 +662,18 @@ uint64_t CoverageSearchManager::leasedTaskIdForFrontier(
 
     uint32_t owner = std::numeric_limits<uint32_t>::max();
     uint64_t selected_task_id = 0;
+    bool owner_conflict = false;
     const auto merge = [&](const prometheus_two_uav_coverage_search::SwarmTaskArray &tasks,
                            bool fresh) {
         if (!fresh) return;
         for (const auto &task : tasks.tasks) {
             if (task.lease_expire_time <= now || !frontierMatchesTask(frontier, task)) continue;
-            if (task.winner_uav_id < owner ||
-                (task.winner_uav_id == owner && (selected_task_id == 0 || task.task_id < selected_task_id))) {
+            if (owner != std::numeric_limits<uint32_t>::max() &&
+                task.winner_uav_id != owner) {
+                owner_conflict = true;
+                continue;
+            }
+            if (owner == std::numeric_limits<uint32_t>::max()) {
                 owner = task.winner_uav_id;
                 selected_task_id = task.task_id;
             }
@@ -656,6 +681,7 @@ uint64_t CoverageSearchManager::leasedTaskIdForFrontier(
     };
     merge(local_swarm_tasks_, local_fresh);
     merge(remote_swarm_tasks_, remote_fresh);
+    if (owner_conflict) return 0;
     return owner == static_cast<uint32_t>(uav_id_) ? selected_task_id : 0;
 }
 
@@ -685,6 +711,7 @@ void CoverageSearchManager::mapRequestCb(
 void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
     const bool peer_fresh = cooperative_mode_ && peer_state_valid_ &&
         (ros::Time::now() - peer_state_received_).toSec() <= peer_state_timeout_;
+    if (!peer_fresh) peer_completion_ready_ = false;
     coverage_map_.setDynamicPeerVolume(peer_pos_, peer_fresh);
     if (peer_fresh && coverage_map_.map_ready_) {
         if (last_peer_clear_valid_ &&
@@ -758,6 +785,9 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
                 if (ftr_count > 0) {
                     exec_state_ = EXEC_STATE::EXPLORING;
                     start_time_ = ros::Time::now();
+                    finish_time_ = ros::Time(0);
+                    coverage_25_time_ = coverage_50_time_ = coverage_75_time_ = ros::Time(0);
+                    setCompletionReady(false);
                     // 普通目标选择不使用方向硬过滤。
                     has_committed_heading_ = false;
                     cout << GREEN << "[CoverageSearch] Map ready. " << ftr_count
@@ -912,6 +942,7 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
         if (!selected_frontier) {
             int current_frontiers = frontier_finder_.getFrontierCount();
             if (current_frontiers > 0) {
+                setCompletionReady(false);
                 double observe_yaw = uav_yaw_;
                 double best_dist = 1e9;
                 for (const auto &frontier : frontier_finder_.frontiers_) {
@@ -954,13 +985,24 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
 
             if (known_ratio >= completion_known_ratio_ &&
                 no_ftr_elapsed >= completion_no_frontier_dwell_) {
-                exec_state_ = EXEC_STATE::FINISH;
-                finish_time_ = ros::Time::now();
-                double duration = (finish_time_ - start_time_).toSec();
-                cout << GREEN << "[CoverageSearch] FINISHED! Duration: " << duration
-                     << "s, Known: " << known_ratio * 100.0
-                     << "%, no-frontier: " << no_ftr_elapsed << "s" << TAIL << endl;
+                if (!completion_ready_) {
+                    setCompletionReady(true);
+                    cout << GREEN << "[CoverageSearch] Local completion ready: Known "
+                         << known_ratio * 100.0 << "%, no-frontier "
+                         << no_ftr_elapsed << "s. Waiting for peer." << TAIL << endl;
+                }
+                const bool peer_ready = peer_fresh && peer_completion_ready_;
+                if (!cooperative_mode_ || peer_ready) {
+                    assert(!cooperative_mode_ || (completion_ready_ && peer_ready));
+                    exec_state_ = EXEC_STATE::FINISH;
+                    finish_time_ = ros::Time::now();
+                    double duration = (finish_time_ - start_time_).toSec();
+                    cout << GREEN << "[CoverageSearch] CONSENSUS FINISHED! Duration: " << duration
+                         << "s, Known: " << known_ratio * 100.0
+                         << "%" << TAIL << endl;
+                }
             } else {
+                setCompletionReady(false);
                 residual_scan_yaw_ = atan2(
                     sin(residual_scan_yaw_ + residual_scan_yaw_rate_ * 0.1),
                     cos(residual_scan_yaw_ + residual_scan_yaw_rate_ * 0.1));
@@ -982,6 +1024,7 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
             break;
         }
         // ★ 选到了前沿，重置无前沿计时
+        setCompletionReady(false);
         last_frontier_found_valid_ = false;
 
         // 3. 选到了前沿目标，逐个尝试规划，直到成功
@@ -1069,7 +1112,7 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
                 uav_cmd_pub_.publish(uav_command_);
 
                 double coverage = coverage_map_.getKnownSpaceRatio();
-                double duration = (ros::Time::now() - start_time_).toSec();
+                double duration = (finish_time_ - start_time_).toSec();
                 cout << GREEN << "[CoverageSearch] FINISHED! Hovering... "
                      << (5.0 - hover_elapsed) << "s left. "
                      << "Known: " << coverage * 100.0 << "%, Duration: " << duration << "s" << TAIL << endl;
@@ -1082,7 +1125,7 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
                 landing_cmd_sent = true;
 
                 double coverage = coverage_map_.getKnownSpaceRatio();
-                double duration = (ros::Time::now() - start_time_).toSec();
+                double duration = (finish_time_ - start_time_).toSec();
                 cout << GREEN << "[CoverageSearch] Landing! Known: " << coverage * 100.0
                      << "%, Duration: " << duration << "s" << TAIL << endl;
             }
@@ -1276,8 +1319,14 @@ void CoverageSearchManager::publishCameraFov() {
 
 void CoverageSearchManager::publishCoverageStatus() {
     if (cooperative_mode_ && global_coverage_source_ != 0 && uav_id_ != global_coverage_source_) return;
+    if (start_time_.isZero()) return;
     double coverage = coverage_map_.getKnownSpaceRatio();
-    double duration = (ros::Time::now() - start_time_).toSec();
+    const ros::Time now = ros::Time::now();
+    if (coverage >= 0.25 && coverage_25_time_.isZero()) coverage_25_time_ = now;
+    if (coverage >= 0.50 && coverage_50_time_.isZero()) coverage_50_time_ = now;
+    if (coverage >= 0.75 && coverage_75_time_.isZero()) coverage_75_time_ = now;
+    const ros::Time end_time = finish_time_.isZero() ? now : finish_time_;
+    double duration = (end_time - start_time_).toSec();
     int frontier_count = frontier_finder_.getFrontierCount();
 
     static int print_cnt = 0;
@@ -1288,6 +1337,11 @@ void CoverageSearchManager::publishCoverageStatus() {
              << ", Known: " << coverage * 100.0 << "%"
              << ", Frontiers: " << frontier_count
              << ", Duration: " << duration << "s"
+             << ", T25: " << (coverage_25_time_.isZero() ? -1.0 : (coverage_25_time_ - start_time_).toSec()) << "s"
+             << ", T50: " << (coverage_50_time_.isZero() ? -1.0 : (coverage_50_time_ - start_time_).toSec()) << "s"
+             << ", T75: " << (coverage_75_time_.isZero() ? -1.0 : (coverage_75_time_ - start_time_).toSec()) << "s"
+             << ", Ready: " << completion_ready_
+             << ", Peer ready: " << peer_completion_ready_
              << ", Replan: " << replan_count_ << TAIL << endl;
     }
 }
