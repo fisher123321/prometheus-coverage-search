@@ -44,7 +44,7 @@ class TwoUavCoordinator {
     nh_.param("peer_timeout", peer_timeout_, 0.6);
     nh_.param("trajectory_timeout", trajectory_timeout_, 0.6);
     nh_.param("max_vel", max_vel_, 1.0);
-    nh_.param("task_bundle_size", task_bundle_size_, 3);
+    nh_.param("task_bundle_size", task_bundle_size_, 16);
     nh_.param("task_reach_dist", task_reach_dist_, 0.35);
     nh_.param("task_commit_timeout", task_commit_timeout_, 15.0);
     nh_.param("task_retry_cooldown", task_retry_cooldown_, 12.0);
@@ -498,7 +498,7 @@ class TwoUavCoordinator {
   }
 
   ros::NodeHandle nh_;
-  int uav_id_ = 1, peer_uav_id_ = 2, map_epoch_ = 1, task_bundle_size_ = 3;
+  int uav_id_ = 1, peer_uav_id_ = 2, map_epoch_ = 1, task_bundle_size_ = 16;
   double fly_height_ = 1.5, min_start_separation_ = 1.0, safe_separation_ = 1.2;
   double peer_timeout_ = 0.6, trajectory_timeout_ = 0.6, max_vel_ = 1.0;
   double auction_period_ = 2.0, task_reach_dist_ = 0.35;

@@ -49,7 +49,6 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     nh.param("coverage_search/traj_step_size", traj_step_size_, 0.5);
     nh.param("coverage_search/traj_advance_dist", traj_advance_dist_, 0.3);
     nh.param("coverage_search/traj_point_dwell_timeout", traj_point_dwell_timeout_, 5.0);
-    nh.param("coverage_search/traj_cut_clearance", traj_cut_clearance_, 0.55);
     nh.param("coverage_search/rolling_preplan_progress", rolling_preplan_progress_, 0.60);
     nh.param("coverage_search/rolling_terminal_speed_ratio", rolling_terminal_speed_ratio_, 0.10);
     nh.param("coverage_search/rolling_terminal_acc_ratio", rolling_terminal_acc_ratio_, 0.10);
@@ -62,6 +61,8 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     uav_name_ = "/uav" + std::to_string(uav_id_);
 
     coverage_map_.init(nh);
+    // 轨迹安全阈值与 ESDF 保持同一个值，不单独提供配置项。
+    traj_cut_clearance_ = coverage_map_.esdf_safe_distance_;
     frontier_finder_.init(nh, &coverage_map_);
     hierarchical_grid_.init(nh, &coverage_map_);
     astar2d_.init(&coverage_map_);
@@ -639,13 +640,19 @@ bool CoverageSearchManager::frontierMatchesTask(
     const prometheus_two_uav_coverage_search::SwarmTask &task) {
     const double dx = frontier.average(0) - task.centroid.x;
     const double dy = frontier.average(1) - task.centroid.y;
-    const bool centers_close = std::hypot(dx, dy) <= 1.0;
-    const double margin = 0.5;
-    const bool boxes_overlap = frontier.box_min_(0) <= task.box_max.x + margin &&
-        frontier.box_max_(0) + margin >= task.box_min.x &&
-        frontier.box_min_(1) <= task.box_max.y + margin &&
-        frontier.box_max_(1) + margin >= task.box_min.y;
-    return frontierTaskId(frontier) == task.task_id && centers_close && boxes_overlap;
+    const bool centers_close = std::hypot(dx, dy) <= 0.5;
+    const double overlap_x = std::max(0.0, std::min(frontier.box_max_(0), task.box_max.x) -
+                                      std::max(frontier.box_min_(0), task.box_min.x));
+    const double overlap_y = std::max(0.0, std::min(frontier.box_max_(1), task.box_max.y) -
+                                      std::max(frontier.box_min_(1), task.box_min.y));
+    const double frontier_area = (frontier.box_max_(0) - frontier.box_min_(0)) *
+                                 (frontier.box_max_(1) - frontier.box_min_(1));
+    const double task_area = (task.box_max.x - task.box_min.x) *
+                             (task.box_max.y - task.box_min.y);
+    const double smaller_area = std::min(frontier_area, task_area);
+    const bool boxes_overlap_75 = smaller_area > 1e-6 &&
+        overlap_x * overlap_y >= 0.75 * smaller_area;
+    return frontierTaskId(frontier) == task.task_id && centers_close && boxes_overlap_75;
 }
 
 uint64_t CoverageSearchManager::leasedTaskIdForFrontier(
@@ -842,9 +849,8 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
             last_frontier_found_valid_ = false;
         }
 
-        // 1. 正在执行轨迹：提前准备下一目标，并在旧轨迹上的安全状态无缝交接。
+        // 1. 执行当前轨迹至目标；到达后才按真实状态重新选择下一视点。
         if (has_traj_) {
-            tryPrepareRollingHandoff();
             executeTrajectory();
             break;
         }

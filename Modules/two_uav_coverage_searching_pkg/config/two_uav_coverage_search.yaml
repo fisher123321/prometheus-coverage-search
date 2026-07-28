@@ -28,7 +28,6 @@ coverage_search:
   rolling_terminal_acc_ratio: 0.10    # capped at 0.10 in code; lower for hardware tuning
   traj_step_size: 0.35
   traj_advance_dist: 0.35
-  traj_cut_clearance: 0.55
   completion_known_ratio: 0.99
   completion_no_frontier_dwell: 8.0
   residual_scan_yaw_rate: 0.6
@@ -42,7 +41,7 @@ sensor:
 # ===== 地图参数 =====
 map:
   resolution: 0.2
-  esdf_safe_distance: 0.35
+  esdf_safe_distance: 0.45
   esdf_max_distance: 6.0
   robot_clear_radius: 0.22       # P450机体自清除半径，不包含安全膨胀区
   robot_clear_half_height: 0.20  # P450机体自清除半高度
@@ -66,7 +65,7 @@ frontier_finder:
   candidate_dphi: 0.262    # 视点采样角度步长(~15度)
   down_sample: 1
   min_visib_num: 3         # 最小可见前沿数
-  min_candidate_clearance: 0.12
+  min_candidate_clearance: 0.45
   min_candidate_occupied_clearance: 0.55
   min_viewpoint_frontier_dist: 0.55
   min_frontier_height: 0.30

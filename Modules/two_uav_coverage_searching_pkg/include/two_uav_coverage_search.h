@@ -137,6 +137,7 @@ public:
     bool map_ready_;
 
     std::vector<uint8_t> occupancy_buffer_;
+    std::vector<uint8_t> observed_buffer_;
     std::vector<int8_t> occupancy_evidence_buffer_;
     std::vector<float> esdf_buffer_;
     std::vector<float> tsdf_buffer_;
@@ -170,11 +171,12 @@ private:
                      bool mark_local_update);
     void pubMapTimerCb(const ros::TimerEvent &e);
     void raycastFree(const Eigen::Vector3d &start, const Eigen::Vector3d &end,
-                     bool include_end = false);
+                     bool include_end = false, bool stop_at_occupied = true);
     bool traceRay(const Eigen::Vector3d &start, const Eigen::Vector3d &end,
                   bool include_end, bool integrate_free,
                   std::set<int> *unknown_addresses = nullptr,
-                  bool projected_occlusion = false);
+                  bool projected_occlusion = false,
+                  bool stop_at_occupied = true);
     void raycastCameraFovFree(const Eigen::Vector3d &camera_pos,
                               const Eigen::Matrix3d &R_wc,
                               const pcl::PointCloud<pcl::PointXYZ> &real_points);
@@ -569,7 +571,7 @@ private:
     double traj_step_size_;          // 轨迹点间距
     double traj_advance_dist_;       // 推进到下一点所需的距离阈值
     double traj_point_dwell_timeout_; // 单点最长停留时间
-    double traj_cut_clearance_;      // 执行期提前截断重规划的ESDF距离
+    double traj_cut_clearance_;      // 与 map/esdf_safe_distance 同步的执行期阈值
 
     // 卡住检测
     Eigen::Vector3d last_pos_;

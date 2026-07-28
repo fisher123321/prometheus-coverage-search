@@ -42,7 +42,7 @@
     <param name="rx_prefix" value="$(arg rx_prefix)"/>
     <param name="min_start_separation" value="1.0"/>
     <param name="safe_separation" value="1.2"/>
-    <param name="task_bundle_size" value="3"/>
+    <param name="task_bundle_size" value="16"/>
     <param name="task_reach_dist" value="0.35"/>
     <!-- A bad goal must not leave the aircraft waiting for the former 30 s. -->
     <param name="task_commit_timeout" value="15.0"/>

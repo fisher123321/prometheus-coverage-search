@@ -14,7 +14,7 @@ void FrontierFinder::init(ros::NodeHandle &nh, CoverageMap *map) {
     nh.param("frontier_finder/down_sample", down_sample_, 1);
     nh.param("frontier_finder/min_candidate_dist", min_candidate_dist_, 0.0);
     nh.param("frontier_finder/min_visib_num", min_visib_num_, 3);
-    nh.param("frontier_finder/min_candidate_clearance", min_candidate_clearance_, 0.2);
+    nh.param("frontier_finder/min_candidate_clearance", min_candidate_clearance_, 0.45);
     nh.param("frontier_finder/min_candidate_occupied_clearance", min_candidate_occupied_clearance_, 0.55);
     nh.param("frontier_finder/min_viewpoint_frontier_dist", min_viewpoint_frontier_dist_, 0.55);
     nh.param("frontier_finder/min_frontier_height", min_frontier_height_, 0.25);
@@ -464,11 +464,11 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
     ftr.viewpoint_visib_nums.clear();
     ftr.visib_num = 0;
 
-    std::vector<Eigen::Vector3d> viewpoint_tiers[4];
-    std::vector<double> yaw_tiers[4];
-    std::vector<int> visib_tiers[4];
-    const double clearance_levels[4] = {
-        min_candidate_occupied_clearance_, 0.50, 0.45, 0.35};
+    std::vector<Eigen::Vector3d> viewpoint_tiers[3];
+    std::vector<double> yaw_tiers[3];
+    std::vector<int> visib_tiers[3];
+    const double clearance_levels[3] = {
+        min_candidate_occupied_clearance_, 0.50, 0.45};
     int reject_not_free = 0;
     int reject_occ = 0;
     int reject_unknown = 0;
@@ -507,8 +507,10 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
             return;
         }
 
-        bool near_unknown = isNearUnknown(sample_pos);
-        if (near_unknown) reject_unknown++;
+        if (isNearUnknown(sample_pos)) {
+            reject_unknown++;
+            return;
+        }
 
         double avg_yaw = averageYawToFrontier(sample_pos, cells);
         double center_yaw = atan2(sample_center(1) - sample_pos(1),
@@ -564,10 +566,8 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
         int unknown_gain = countVisibleUnknown(sample_pos, yaw);
         int view_score = visib + unknown_gain;
         ftr.visib_num = std::max(ftr.visib_num, view_score);
-        if (near_unknown) view_score = std::max(1, view_score - 1);
-
         int clearance_tier = -1;
-        for (int tier = 0; tier < 4; ++tier) {
+        for (int tier = 0; tier < 3; ++tier) {
             if (!isNearOccupied(sample_pos, clearance_levels[tier])) {
                 clearance_tier = tier;
                 break;
@@ -592,7 +592,7 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
     }
 
     bool have_any_viewpoint = false;
-    for (int tier = 0; tier < 4; ++tier)
+    for (int tier = 0; tier < 3; ++tier)
         have_any_viewpoint = have_any_viewpoint || !viewpoint_tiers[tier].empty();
     if (!have_any_viewpoint) {
         Eigen::Vector3d to_frontier = sample_center - cur_pos;
@@ -611,7 +611,7 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
     }
 
     int selected_tier = -1;
-    for (int tier = 0; tier < 4; ++tier) {
+    for (int tier = 0; tier < 3; ++tier) {
         if (!viewpoint_tiers[tier].empty()) {
             selected_tier = tier;
             break;
@@ -619,7 +619,7 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
     }
     if (selected_tier < 0) {
         ROS_DEBUG_THROTTLE(5.0,
-            "[FrontierFinder] No viewpoint at or above 0.35m clearance: "
+            "[FrontierFinder] No viewpoint at or above 0.45m clearance: "
             "cluster=(%.2f,%.2f), rejected=%d.",
             sample_center(0), sample_center(1), reject_occ);
         return;
@@ -640,12 +640,15 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
     std::sort(order.begin(), order.end(), [&](int a, int b) {
         return visib_nums[a] > visib_nums[b];
     });
-    const int best = order.front();
-    ROS_ASSERT_MSG(visib_nums[best] >= min_visib_num_,
-                   "Stored viewpoint must directly see its frontier cluster");
-    ftr.viewpoints.push_back(viewpoints[best]);
-    ftr.viewpoint_yaws.push_back(yaws[best]);
-    ftr.viewpoint_visib_nums.push_back(visib_nums[best]);
+    const int stored_num = std::min(2, (int)order.size());
+    for (int i = 0; i < stored_num; ++i) {
+        const int candidate = order[i];
+        ROS_ASSERT_MSG(visib_nums[candidate] >= min_visib_num_,
+                       "Stored viewpoint must directly see its frontier cluster");
+        ftr.viewpoints.push_back(viewpoints[candidate]);
+        ftr.viewpoint_yaws.push_back(yaws[candidate]);
+        ftr.viewpoint_visib_nums.push_back(visib_nums[candidate]);
+    }
 
     if (ftr.viewpoints.empty()) {
         ROS_DEBUG_THROTTLE(5.0,
@@ -659,7 +662,7 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
 }
 
 bool FrontierFinder::isNearUnknown(const Eigen::Vector3d &pos) {
-    const int vox_num = floor(min_candidate_clearance_ / map_->resolution_);
+    const int vox_num = ceil(min_candidate_clearance_ / map_->resolution_);
     for (int dx = -vox_num; dx <= vox_num; ++dx) {
         for (int dy = -vox_num; dy <= vox_num; ++dy) {
             for (int dz = -1; dz <= 1; ++dz) {
@@ -667,7 +670,8 @@ bool FrontierFinder::isNearUnknown(const Eigen::Vector3d &pos) {
                                                           dy * map_->resolution_,
                                                           dz * map_->resolution_);
                 if (!map_->isInMap(p)) continue;
-                if (map_->isUnknown(p)) return true;
+                if ((p - pos).norm() <= min_candidate_clearance_ + 1e-3 &&
+                    map_->isUnknown(p)) return true;
             }
         }
     }
