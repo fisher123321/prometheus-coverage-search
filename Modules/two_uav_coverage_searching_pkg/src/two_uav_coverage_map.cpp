@@ -67,8 +67,8 @@ void CoverageMap::init(ros::NodeHandle &nh) {
     nh.param("map/map_size_y", map_size_3d_(1), 30.0);
     nh.param("map/map_size_z", map_size_3d_(2), 3.0);
     nh.param("map/queue_size", queue_size_, 5);
-    nh.param("sensor/depth_min_range", depth_min_range_, 0.3);
-    nh.param("sensor/depth_max_range", depth_max_range_, 3.0);
+    nh.param("sensor/depth_min_range", depth_min_range_, 0.2);
+    nh.param("sensor/depth_max_range", depth_max_range_, 4.5);
     nh.param("sensor/depth_height_tolerance", depth_height_tolerance_, 0.6);
     nh.param("sensor/depth_ground_ignore_height", depth_ground_ignore_height_, 0.25);
     nh.param("coverage_search/sensing_fov_h", depth_fov_h_, 1.571);

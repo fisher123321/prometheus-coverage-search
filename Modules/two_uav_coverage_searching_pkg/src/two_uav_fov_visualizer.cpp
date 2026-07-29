@@ -10,7 +10,7 @@ public:
     explicit FovVisualizer(ros::NodeHandle &nh) {
         int uav_id;
         nh.param("uav_id", uav_id, 1);
-        nh.param("sensing_range", sensing_range_, 3.0);
+        nh.param("sensing_range", sensing_range_, 4.5);
         nh.param("sensing_fov_h", sensing_fov_h_, 1.571);
         nh.param("sensing_fov_v", sensing_fov_v_, 1.287);
         nh.param("camera_offset_x", camera_offset_(0), 0.095);

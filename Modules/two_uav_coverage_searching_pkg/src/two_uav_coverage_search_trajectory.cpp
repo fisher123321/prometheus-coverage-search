@@ -373,7 +373,7 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
 void CoverageSearchManager::generateBsplineTraj() {
     if (!rolling_prepare_in_progress_) {
         pending_traj_ = PendingTrajectory();
-        rolling_last_attempt_frontier_generation_ = 0;
+        rolling_last_attempt_time_ = ros::Time::now();
         ++rolling_generation_;
     }
     active_time_spline_ = TimeBspline();
@@ -1341,13 +1341,11 @@ bool CoverageSearchManager::activatePendingTrajectory() {
     const double max_switch_error = std::max(0.45, 1.5 * traj_advance_dist_);
     bool frontier_still_present = false;
     for (const auto &frontier : frontier_finder_.frontiers_) {
-        for (const auto &viewpoint : frontier.viewpoints) {
-            if ((viewpoint.head<2>() - pending_traj_.goal.head<2>()).norm() < 0.35) {
-                frontier_still_present = true;
-                break;
-            }
+        if (active_goal_frontier_valid_ &&
+            frontierMatchesTask(frontier, active_goal_frontier_)) {
+            frontier_still_present = true;
+            break;
         }
-        if (frontier_still_present) break;
     }
     const double active_elapsed = (ros::Time::now() - traj_start_time_).toSec();
     const bool missed_handoff = active_time_spline_.valid &&
@@ -1383,12 +1381,10 @@ bool CoverageSearchManager::activatePendingTrajectory() {
     astar_path_idx_ = 0;
     has_goal_ = true;
     has_traj_ = true;
-    same_goal_replan_count_ = 0;
-    goal_commit_time_ = ros::Time::now();
     traj_start_time_ = ros::Time::now();
     traj_point_reach_time_ = ros::Time::now();
     pending_traj_ = PendingTrajectory();
-    rolling_last_attempt_frontier_generation_ = 0;
+    rolling_last_attempt_time_ = traj_start_time_;
     ++rolling_generation_;
 
     ROS_INFO("[CoverageSearch] Rolling handoff activated: next_goal=(%.2f,%.2f), "
@@ -1421,6 +1417,11 @@ void CoverageSearchManager::executeTrajectory() {
         abortCurrentGoalForSafety("task lease expired or reassigned");
         return;
     }
+    if (currentGoalFrontierCovered()) {
+        releaseCurrentGoal("active frontier absent in two consecutive updates", false, false);
+        return;
+    }
+    tryPrepareRollingHandoff();
     const double execution_elapsed = (execution_now - traj_start_time_).toSec();
     const bool handoff_due = pending_traj_.ready &&
         (active_time_spline_.valid && pending_traj_.handoff_time >= 0.0

@@ -528,12 +528,12 @@ private:
         uint64_t frontier_generation = 0;
     } pending_traj_;
     bool rolling_prepare_in_progress_;
-    double rolling_preplan_progress_;
     double rolling_terminal_speed_ratio_ = 0.10;
     double rolling_terminal_acc_ratio_ = 0.10;
     bool rolling_snapshot_mode_ = false;
     uint64_t rolling_generation_ = 0;
-    uint64_t rolling_last_attempt_frontier_generation_ = 0;
+    ros::Time rolling_last_attempt_time_;
+    uint64_t rolling_replan_count_ = 0;
     bool planning_start_state_valid_ = false;
     Eigen::Vector3d planning_start_acc_ = Eigen::Vector3d::Zero();
     double planning_start_yaw_rate_ = 0.0;
@@ -549,6 +549,10 @@ private:
     std::vector<uint64_t> frontier_target_task_ids_;
     int frontier_target_idx_;
     uint64_t current_goal_task_id_ = 0;
+    prometheus_two_uav_coverage_search::SwarmTask active_goal_frontier_;
+    bool active_goal_frontier_valid_ = false;
+    uint64_t active_goal_frontier_checked_generation_ = 0;
+    int active_goal_frontier_missing_updates_ = 0;
 
     ros::Time start_time_, finish_time_;
     ros::Time coverage_25_time_, coverage_50_time_, coverage_75_time_;
@@ -638,6 +642,8 @@ private:
                              double min_clearance = -1.0);
     bool currentGoalUnsafe(std::string &reason);
     void abortCurrentGoalForSafety(const std::string &reason);
+    void releaseCurrentGoal(const std::string &reason, bool mark_failed,
+                            bool count_as_replan);
     // ★ 目标点前沿验证：目标点附近必须有unknown区域
     bool isNearFrontier(const Eigen::Vector3d &pos);
     bool tryPrepareRollingHandoff();
@@ -665,6 +671,8 @@ private:
     bool frontierMatchesTask(const FrontierFinder::FrontierCluster &frontier,
                              const prometheus_two_uav_coverage_search::SwarmTask &task);
     bool currentGoalLeaseValid() const;
+    bool captureActiveGoalFrontier();
+    bool currentGoalFrontierCovered();
 
 };
 

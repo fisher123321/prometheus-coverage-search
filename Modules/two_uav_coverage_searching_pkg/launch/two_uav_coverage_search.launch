@@ -24,8 +24,8 @@
         <param name="coverage_search/sim_mode" value="true"/>
         <!-- 无人机飞行高度(必须与uav_control起飞高度一致) -->
         <param name="coverage_search/fly_height" value="$(arg fly_height)"/>
-        <!-- 传感器感知范围(米) - D435i深度点云只信任0.3~3.0m -->
-        <param name="coverage_search/sensing_range" value="3.0"/>
+        <!-- 传感器感知范围(米) - 深度点云只信任0.2~4.5m -->
+        <param name="coverage_search/sensing_range" value="4.5"/>
         <!-- 传感器水平FOV(弧度) - D435i深度相机约90度 -->
         <param name="coverage_search/sensing_fov_h" value="1.571"/>
         <!-- 传感器垂直FOV(弧度) -->
@@ -60,8 +60,7 @@
         <param name="coverage_search/swarm_bid_period" value="2.0"/>
         <param name="coverage_search/swarm_bid_max_tasks" value="16"/>
         <param name="coverage_search/swarm_bid_max_astar" value="6"/>
-        <!-- 滚动规划：60%起准备 successor；交接点固定为旧轨迹的终端 De Boor 状态 -->
-        <param name="coverage_search/rolling_preplan_progress" value="0.60"/>
+        <!-- 滚动重规划保持终端状态的速度、加速度上限 -->
         <param name="coverage_search/rolling_terminal_speed_ratio" value="0.10"/>
         <param name="coverage_search/rolling_terminal_acc_ratio" value="0.10"/>
         <!-- 自动开始 -->
@@ -87,8 +86,8 @@
         <param name="coverage_search/camera_pitch" value="0.35"/>
         <param name="coverage_search/fov_vis_range" value="1.5"/>
 
-        <param name="sensor/depth_min_range" value="0.1"/>
-        <param name="sensor/depth_max_range" value="3.0"/>
+        <param name="sensor/depth_min_range" value="0.2"/>
+        <param name="sensor/depth_max_range" value="4.5"/>
         <param name="sensor/depth_height_tolerance" value="0.6"/>
         <param name="sensor/depth_ground_ignore_height" value="0.15"/>
 

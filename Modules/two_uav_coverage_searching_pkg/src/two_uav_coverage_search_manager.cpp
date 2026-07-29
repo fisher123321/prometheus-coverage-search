@@ -49,7 +49,6 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     nh.param("coverage_search/traj_step_size", traj_step_size_, 0.5);
     nh.param("coverage_search/traj_advance_dist", traj_advance_dist_, 0.3);
     nh.param("coverage_search/traj_point_dwell_timeout", traj_point_dwell_timeout_, 5.0);
-    nh.param("coverage_search/rolling_preplan_progress", rolling_preplan_progress_, 0.60);
     nh.param("coverage_search/rolling_terminal_speed_ratio", rolling_terminal_speed_ratio_, 0.10);
     nh.param("coverage_search/rolling_terminal_acc_ratio", rolling_terminal_acc_ratio_, 0.10);
     nh.param("coverage_search/completion_known_ratio", completion_known_ratio_, 0.99);
@@ -172,7 +171,11 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     pending_traj_ = PendingTrajectory();
     completed_pending_traj_ = PendingTrajectory();
     rolling_generation_ = 0;
-    rolling_last_attempt_frontier_generation_ = 0;
+    rolling_last_attempt_time_ = ros::Time(0);
+    rolling_replan_count_ = 0;
+    active_goal_frontier_valid_ = false;
+    active_goal_frontier_checked_generation_ = 0;
+    active_goal_frontier_missing_updates_ = 0;
     rolling_worker_running_ = false;
     traj_point_reach_time_ = ros::Time::now();
     last_frontier_found_time_ = ros::Time::now();
@@ -706,6 +709,55 @@ bool CoverageSearchManager::currentGoalLeaseValid() const {
     return false;
 }
 
+bool CoverageSearchManager::captureActiveGoalFrontier() {
+    active_goal_frontier_valid_ = false;
+    active_goal_frontier_checked_generation_ = frontier_finder_.update_generation_;
+    active_goal_frontier_missing_updates_ = 0;
+    if (current_goal_task_id_ == 0) return false;
+
+    for (const auto &frontier : frontier_finder_.frontiers_) {
+        if (frontierTaskId(frontier) != current_goal_task_id_) continue;
+        bool owns_goal = false;
+        for (const auto &viewpoint : frontier.viewpoints) {
+            if ((viewpoint.head<2>() - current_goal_.head<2>()).norm() < 0.10) {
+                owns_goal = true;
+                break;
+            }
+        }
+        if (!owns_goal) continue;
+        active_goal_frontier_.task_id = current_goal_task_id_;
+        active_goal_frontier_.centroid.x = frontier.average(0);
+        active_goal_frontier_.centroid.y = frontier.average(1);
+        active_goal_frontier_.centroid.z = frontier.average(2);
+        active_goal_frontier_.box_min.x = frontier.box_min_(0);
+        active_goal_frontier_.box_min.y = frontier.box_min_(1);
+        active_goal_frontier_.box_min.z = frontier.box_min_(2);
+        active_goal_frontier_.box_max.x = frontier.box_max_(0);
+        active_goal_frontier_.box_max.y = frontier.box_max_(1);
+        active_goal_frontier_.box_max.z = frontier.box_max_(2);
+        active_goal_frontier_valid_ = true;
+        return true;
+    }
+    return false;
+}
+
+bool CoverageSearchManager::currentGoalFrontierCovered() {
+    if (!active_goal_frontier_valid_ || !has_goal_) return false;
+    const uint64_t generation = frontier_finder_.update_generation_;
+    if (generation == 0 || generation <= active_goal_frontier_checked_generation_) return false;
+    active_goal_frontier_checked_generation_ = generation;
+
+    bool present = false;
+    for (const auto &frontier : frontier_finder_.frontiers_) {
+        if (frontierMatchesTask(frontier, active_goal_frontier_)) {
+            present = true;
+            break;
+        }
+    }
+    active_goal_frontier_missing_updates_ = present ? 0 : active_goal_frontier_missing_updates_ + 1;
+    return active_goal_frontier_missing_updates_ >= 2;
+}
+
 void CoverageSearchManager::mapRequestCb(
     const prometheus_two_uav_coverage_search::SwarmMapRequestConstPtr &msg) {
     if (!cooperative_mode_ || msg->requester_uav_id == static_cast<uint32_t>(uav_id_) ||
@@ -857,7 +909,6 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
 
         // 当前轨迹因完成或安全检查退出后，不能把上一条轨迹的待交接结果带入重规划。
         pending_traj_ = PendingTrajectory();
-        rolling_last_attempt_frontier_generation_ = 0;
 
         // 协同模式的任务由外部共识竞价指定；没有获胜任务时原地保持，不能退回单机贪心选点。
         if (external_goal_only_ && !has_goal_) {
@@ -1048,6 +1099,10 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
             if (path_found) {
                 generateBsplineTraj();
                 if (has_traj_) {
+                    if (!captureActiveGoalFrontier()) {
+                        ROS_WARN("[CoverageSearch] Active frontier signature unavailable; "
+                                 "rolling task-completion check is disabled for this goal.");
+                    }
                     consecutive_plan_failures_ = 0;
                     if (!has_committed_heading_) {
                         Eigen::Vector3d to_goal = current_goal_ - uav_pos_;
