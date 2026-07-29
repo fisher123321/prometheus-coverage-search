@@ -1,5 +1,9 @@
 #include "two_uav_coverage_search.h"
 
+namespace {
+constexpr double kRollingHandoffLead = 0.30;
+}
+
 bool CoverageSearchManager::isStuck() {
     // ★ 如果已经非常接近目标，不算卡住（正常到达）
     if (has_goal_) {
@@ -81,11 +85,11 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
         const ros::Time now = ros::Time::now();
         const double elapsed = std::max(0.0, (now - traj_start_time_).toSec());
         const double remaining = active_time_spline_.duration - elapsed;
-        if (remaining <= 0.20) return false;
+        if (remaining <= kRollingHandoffLead) return false;
         const bool periodic_due = elapsed >= 1.5 &&
             (rolling_last_attempt_time_.isZero() ||
              (now - rolling_last_attempt_time_).toSec() >= 1.5);
-        const bool terminal_due = remaining <= 0.25;
+        const bool terminal_due = remaining <= 0.50;
         if (!periodic_due && !terminal_due) return false;
         const uint64_t frontier_generation = frontier_finder_.update_generation_;
 
@@ -102,6 +106,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
         planner->max_vel_ = max_vel_;
         planner->max_acc_ = max_acc_;
         planner->max_yaw_rate_ = max_yaw_rate_;
+        planner->max_yaw_acc_ = max_yaw_acc_;
         planner->goal_reach_dist_ = goal_reach_dist_;
         planner->sim_mode_ = sim_mode_;
         planner->cooperative_mode_ = cooperative_mode_;
@@ -159,6 +164,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
                                            frontier_generation]() {
                 planner->tryPrepareRollingHandoff();
                 PendingTrajectory result = std::move(planner->pending_traj_);
+                result.result_ready_time = ros::Time::now();
                 result.source_generation = source_generation;
                 result.frontier_generation = frontier_generation;
                 {
@@ -186,7 +192,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
 
     const int n = (int)traj_points_.size();
     const double elapsed = std::max(0.0, (ros::Time::now() - traj_start_time_).toSec());
-    const double handoff_time = elapsed + 0.20;
+    const double handoff_time = elapsed + kRollingHandoffLead;
     if (handoff_time > active_time_spline_.duration) return false;
     const int handoff_idx = std::min(n - 1, std::max(0, (int)std::lround(
         handoff_time / std::max(1e-3, active_time_spline_.duration) * (n - 1))));
@@ -699,17 +705,8 @@ bool CoverageSearchManager::selectNextFrontier() {
 bool CoverageSearchManager::planPathToGoal() {
     if (!has_goal_) return false;
 
-    // 先检查直线是否可通行
-    if (astar2d_.isPathTraversable(uav_pos_, current_goal_)) {
-        astar_path_.clear();
-        // ★ 必须同时包含起点和终点，这样Hermite插值才能生成完整的平滑轨迹
-        astar_path_.push_back(uav_pos_);
-        astar_path_.push_back(current_goal_);
-        astar_path_idx_ = 0;
-        return true;
-    }
-
-    // A*搜索
+    // 所有正常任务都经过带低净空代价的 A*，不能因一条仅满足硬阈值的
+    // 直线而贴墙飞行。直线段检查仍只用于执行期安全验证。
     bool found = astar2d_.search(uav_pos_, current_goal_, astar_path_);
     if (found && !astar_path_.empty()) {
         astar_path_idx_ = 0;
@@ -873,6 +870,7 @@ void CoverageSearchManager::releaseCurrentGoal(const std::string &reason,
     frontier_target_yaws_.clear();
     frontier_target_task_ids_.clear();
     frontier_target_idx_ = 0;
+    eraseLocalReservation(current_goal_task_id_);
     current_goal_task_id_ = 0;
     same_goal_replan_count_ = 0;
     active_goal_frontier_valid_ = false;

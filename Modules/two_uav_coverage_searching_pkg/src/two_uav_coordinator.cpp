@@ -248,8 +248,23 @@ class TwoUavCoordinator {
         // Both coordinators must choose the same representation for a task ID.
         // Lower ID is a deterministic tie-breaker while map chunks converge.
         if (found == task_sources.end() || source.source_uav_id < found->second) {
-          tasks[frontier.task_id] = frontier;
+          auto selected = frontier;
+          if (found != task_sources.end() &&
+              tasks[frontier.task_id].reservation_expire_time >
+                  selected.reservation_expire_time) {
+            selected.reservation_owner_uav_id =
+                tasks[frontier.task_id].reservation_owner_uav_id;
+            selected.reservation_expire_time =
+                tasks[frontier.task_id].reservation_expire_time;
+          }
+          tasks[frontier.task_id] = selected;
           task_sources[frontier.task_id] = source.source_uav_id;
+        } else if (frontier.reservation_expire_time >
+                   tasks[frontier.task_id].reservation_expire_time) {
+          tasks[frontier.task_id].reservation_owner_uav_id =
+              frontier.reservation_owner_uav_id;
+          tasks[frontier.task_id].reservation_expire_time =
+              frontier.reservation_expire_time;
         }
       }
     };
@@ -271,6 +286,27 @@ class TwoUavCoordinator {
         if (static_cast<int>(bid.bidder_uav_id) == peer_uav_id_ && bid.reachable &&
             std::isfinite(bid.cost)) peer_route_cost[bid.task_id] = bid.cost;
       }
+      if (active_fresh && own_leases_.count(active_task_id) == 0) {
+        const auto active = tasks.find(active_task_id);
+        if (active != tasks.end() &&
+            active->second.reservation_expire_time <= now) {
+          const auto self_bid = self_route_cost.find(active_task_id);
+          prometheus_two_uav_coverage_search::SwarmTask held;
+          held.task_id = active_task_id;
+          held.task_version = std::max(local_bids_.frontier_revision,
+                                       peer_bids_.frontier_revision);
+          held.cluster_version = active->second.cluster_version;
+          held.frontier_cell_count = active->second.frontier_cell_count;
+          held.winner_uav_id = uav_id_;
+          held.cost = self_bid == self_route_cost.end()
+              ? std::numeric_limits<float>::infinity() : self_bid->second;
+          held.centroid = active->second.centroid;
+          held.box_min = active->second.box_min;
+          held.box_max = active->second.box_max;
+          held.goal = active->second.viewpoint;
+          own.push_back(held);
+        }
+      }
       struct Candidate {
         prometheus_two_uav_coverage_search::SwarmTask task;
         double peer_cost;
@@ -279,6 +315,9 @@ class TwoUavCoordinator {
       for (const auto& entry : tasks) {
         const auto& frontier = entry.second;
         if (own_leases_.count(frontier.task_id) != 0) continue;
+        if (active_fresh && frontier.task_id == active_task_id) continue;
+        if (frontier.reservation_owner_uav_id != 0 &&
+            frontier.reservation_expire_time > now) continue;
         bool peer_already_leases = false;
         for (const auto& task : peer_tasks_.tasks) {
           // A fresh unexpired peer entry is authoritative even if its owner

@@ -311,6 +311,7 @@ public:
         std::vector<int> viewpoint_visib_nums;
         int visib_num = 0;
         uint64_t changed_generation = 0;
+        bool local_discovery = false;
     };
 
     std::vector<FrontierCluster> frontiers_;
@@ -526,6 +527,7 @@ private:
         TimeBspline time_spline;
         uint64_t source_generation = 0;
         uint64_t frontier_generation = 0;
+        ros::Time result_ready_time;
     } pending_traj_;
     bool rolling_prepare_in_progress_;
     double rolling_terminal_speed_ratio_ = 0.10;
@@ -549,6 +551,11 @@ private:
     std::vector<uint64_t> frontier_target_task_ids_;
     int frontier_target_idx_;
     uint64_t current_goal_task_id_ = 0;
+    struct LocalFrontierReservation {
+        prometheus_two_uav_coverage_search::SwarmTask task;
+        bool active = false;
+    };
+    std::vector<LocalFrontierReservation> local_frontier_reservations_;
     prometheus_two_uav_coverage_search::SwarmTask active_goal_frontier_;
     bool active_goal_frontier_valid_ = false;
     uint64_t active_goal_frontier_checked_generation_ = 0;
@@ -605,6 +612,7 @@ private:
     void mainloopCb(const ros::TimerEvent &e);
     void frontierCb(const ros::TimerEvent &e);
     void updateFrontiers();
+    void updateLocalFrontierReservations();
     void setCompletionReady(bool ready);
 
     // ★ 核心方法
@@ -628,6 +636,8 @@ private:
     bool buildTimeParameterizedSpline(const Eigen::Vector3d &start_acc,
                                       double start_yaw_rate,
                                       double start_yaw_acceleration);
+    bool optimizeTimeBspline2D(TimeBspline &spline, bool rolling,
+                               std::string &reason);
     // 三项统一为时间并取瓶颈最大值：路径、运动方向转向、偏航。
     double computeFrontierCost(const Eigen::Vector3d &vp, double vp_yaw,
                                double path_len,
@@ -673,6 +683,11 @@ private:
     bool currentGoalLeaseValid() const;
     bool captureActiveGoalFrontier();
     bool currentGoalFrontierCovered();
+    uint64_t localReservationTaskIdForFrontier(
+        const FrontierFinder::FrontierCluster &frontier);
+    void markLocalReservationActive(uint64_t task_id);
+    bool hasActiveLocalReservation(uint64_t task_id) const;
+    void eraseLocalReservation(uint64_t task_id);
 
 };
 

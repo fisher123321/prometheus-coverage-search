@@ -31,12 +31,12 @@
         <!-- 传感器垂直FOV(弧度) -->
         <param name="coverage_search/sensing_fov_v" value="1.287"/>
         <!-- 最大速度 -->
-        <param name="coverage_search/max_vel" value="1.0"/>
-        <param name="coverage_search/max_acc" value="0.8"/>
+        <param name="coverage_search/max_vel" value="1.5"/>
+        <param name="coverage_search/max_acc" value="1.0"/>
         <!-- 最大偏航角速率 -->
-        <param name="coverage_search/max_yaw_rate" value="1.8"/>
+        <param name="coverage_search/max_yaw_rate" value="1.3962634"/>
         <!-- 最大偏航角加速度，保证转向从起点到视点全程平滑完成 -->
-        <param name="coverage_search/max_yaw_acc" value="1.8"/>
+        <param name="coverage_search/max_yaw_acc" value="1.5707963"/>
         <!-- 重规划间隔(秒) -->
         <param name="coverage_search/replan_time" value="3.0"/>
         <!-- 目标到达判定距离(米) -->

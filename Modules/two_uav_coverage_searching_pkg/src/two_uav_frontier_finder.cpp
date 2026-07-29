@@ -115,8 +115,10 @@ void FrontierFinder::searchResidualFrontiers(const Eigen::Vector3d &cur_pos) {
 void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
     Eigen::Vector3d update_min, update_max;
     std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> update_boxes;
+    std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> local_update_boxes;
     if (map_->getUpdatedBox(update_min, update_max, true)) {
         update_boxes.emplace_back(update_min, update_max);
+        local_update_boxes.emplace_back(update_min, update_max);
     }
     std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> remote_boxes;
     map_->getRemoteUpdatedBoxes(remote_boxes, true);
@@ -197,6 +199,13 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
                         ftr.cells = cluster_cells;
                         ftr.changed_generation = update_generation_;
                         computeFrontierInfo(ftr);
+                        for (const auto &local_box : local_update_boxes) {
+                            if (haveOverlap(ftr.box_min_, ftr.box_max_,
+                                            local_box.first, local_box.second)) {
+                                ftr.local_discovery = true;
+                                break;
+                            }
+                        }
                         frontiers_.push_back(ftr);
                         ++new_count;
                     }
@@ -389,6 +398,8 @@ void FrontierFinder::splitLargeFrontiers() {
         FrontierCluster f1, f2;
         f1.changed_generation = ftr.changed_generation;
         f2.changed_generation = ftr.changed_generation;
+        f1.local_discovery = ftr.local_discovery;
+        f2.local_discovery = ftr.local_discovery;
         for (auto &cell : ftr.cells) {
             if ((cell.head<2>() - ftr.average.head<2>()).dot(pc) >= 0)
                 f1.cells.push_back(cell);

@@ -146,7 +146,7 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     }
 
     mainloop_timer_ = nh.createTimer(ros::Duration(0.1), &CoverageSearchManager::mainloopCb, this);
-    frontier_timer_ = nh.createTimer(ros::Duration(1.2), &CoverageSearchManager::frontierCb, this);
+    frontier_timer_ = nh.createTimer(ros::Duration(0.8), &CoverageSearchManager::frontierCb, this);
 
     exec_state_ = EXEC_STATE::INIT;
     odom_ready_ = false; drone_ready_ = false; sensor_ready_ = false;
@@ -323,6 +323,7 @@ void CoverageSearchManager::updateFrontiers() {
     auto t0 = std::chrono::high_resolution_clock::now();
     coverage_map_.updateDistanceFields();
     frontier_finder_.searchFrontiers(uav_pos_);
+    updateLocalFrontierReservations();
     int ftr_count = frontier_finder_.getFrontierCount();
     frontier_finder_.publishFrontiers();
     std::vector<Eigen::Vector3d> frontier_avgs;
@@ -336,6 +337,56 @@ void CoverageSearchManager::updateFrontiers() {
     if (ms > 120.0) {
         ROS_WARN_THROTTLE(2.0, "[CoverageSearch] frontier AABB update took %.1f ms, frontiers=%d",
                           ms, frontier_finder_.getFrontierCount());
+    }
+}
+
+void CoverageSearchManager::updateLocalFrontierReservations() {
+    const ros::Time now = ros::Time::now();
+    local_frontier_reservations_.erase(
+        std::remove_if(local_frontier_reservations_.begin(), local_frontier_reservations_.end(),
+            [&](const LocalFrontierReservation &reservation) {
+                return !reservation.active && reservation.task.lease_expire_time <= now;
+            }),
+        local_frontier_reservations_.end());
+
+    int created = 0;
+    for (auto &frontier : frontier_finder_.frontiers_) {
+        if (!frontier.local_discovery) continue;
+        frontier.local_discovery = false;
+        bool known = false;
+        for (const auto &reservation : local_frontier_reservations_) {
+            if (frontierMatchesTask(frontier, reservation.task)) {
+                known = true;
+                break;
+            }
+        }
+        if (known) continue;
+
+        LocalFrontierReservation reservation;
+        reservation.task.task_id = frontierTaskId(frontier);
+        reservation.task.winner_uav_id = uav_id_;
+        reservation.task.cluster_version = frontier.changed_generation;
+        reservation.task.frontier_cell_count = frontier.cells.size();
+        reservation.task.centroid.x = frontier.average(0);
+        reservation.task.centroid.y = frontier.average(1);
+        reservation.task.centroid.z = frontier.average(2);
+        reservation.task.box_min.x = frontier.box_min_(0);
+        reservation.task.box_min.y = frontier.box_min_(1);
+        reservation.task.box_min.z = frontier.box_min_(2);
+        reservation.task.box_max.x = frontier.box_max_(0);
+        reservation.task.box_max.y = frontier.box_max_(1);
+        reservation.task.box_max.z = frontier.box_max_(2);
+        if (!frontier.viewpoints.empty()) {
+            reservation.task.goal.position.x = frontier.viewpoints.front()(0);
+            reservation.task.goal.position.y = frontier.viewpoints.front()(1);
+            reservation.task.goal.position.z = fly_height_;
+        }
+        reservation.task.lease_expire_time = now + ros::Duration(5.0);
+        local_frontier_reservations_.push_back(reservation);
+        ++created;
+    }
+    if (created > 0) {
+        ROS_INFO("[CoverageSearch] Locally reserved %d new frontier(s) for 5.0s.", created);
     }
 }
 
@@ -438,6 +489,15 @@ void CoverageSearchManager::publishSwarmFrontiers() {
         item.viewpoint.orientation.w = std::cos(0.5 * yaw);
         item.viewpoint.orientation.z = std::sin(0.5 * yaw);
         item.information_gain = std::max(1, frontier.visib_num);
+        const ros::Time now = ros::Time::now();
+        for (const auto &reservation : local_frontier_reservations_) {
+            if (reservation.task.lease_expire_time > now &&
+                frontierMatchesTask(frontier, reservation.task)) {
+                item.reservation_owner_uav_id = uav_id_;
+                item.reservation_expire_time = reservation.task.lease_expire_time;
+                break;
+            }
+        }
         out.frontiers.push_back(item);
     }
     local_swarm_frontiers_ = out;
@@ -666,11 +726,6 @@ uint64_t CoverageSearchManager::leasedTaskIdForFrontier(
         (now - local_swarm_task_received_).toSec() <= 5.0;
     const bool remote_fresh = !remote_swarm_task_received_.isZero() &&
         (now - remote_swarm_task_received_).toSec() <= 5.0;
-    // Bids are published independently of execution, so waiting here cannot
-    // deadlock startup; it prevents both aircraft from taking an unleased
-    // frontier during the first auction interval.
-    if (!local_fresh && !remote_fresh) return 0;
-
     uint32_t owner = std::numeric_limits<uint32_t>::max();
     uint64_t selected_task_id = 0;
     bool owner_conflict = false;
@@ -693,11 +748,63 @@ uint64_t CoverageSearchManager::leasedTaskIdForFrontier(
     merge(local_swarm_tasks_, local_fresh);
     merge(remote_swarm_tasks_, remote_fresh);
     if (owner_conflict) return 0;
-    return owner == static_cast<uint32_t>(uav_id_) ? selected_task_id : 0;
+    if (owner != std::numeric_limits<uint32_t>::max()) {
+        return owner == static_cast<uint32_t>(uav_id_) ? selected_task_id : 0;
+    }
+
+    const uint64_t local_reservation = localReservationTaskIdForFrontier(frontier);
+    if (local_reservation != 0) return local_reservation;
+    for (const auto &remote : remote_swarm_frontiers_.frontiers) {
+        if (remote.reservation_owner_uav_id == 0 ||
+            remote.reservation_owner_uav_id == static_cast<uint32_t>(uav_id_) ||
+            remote.reservation_expire_time <= now) continue;
+        prometheus_two_uav_coverage_search::SwarmTask reservation;
+        reservation.task_id = remote.task_id;
+        reservation.centroid = remote.centroid;
+        reservation.box_min = remote.box_min;
+        reservation.box_max = remote.box_max;
+        if (frontierMatchesTask(frontier, reservation)) return 0;
+    }
+    return 0;
+}
+
+uint64_t CoverageSearchManager::localReservationTaskIdForFrontier(
+    const FrontierFinder::FrontierCluster &frontier) {
+    const ros::Time now = ros::Time::now();
+    for (const auto &reservation : local_frontier_reservations_) {
+        if ((reservation.active || reservation.task.lease_expire_time > now) &&
+            frontierMatchesTask(frontier, reservation.task)) {
+            return reservation.task.task_id;
+        }
+    }
+    return 0;
+}
+
+void CoverageSearchManager::markLocalReservationActive(uint64_t task_id) {
+    for (auto &reservation : local_frontier_reservations_) {
+        if (reservation.task.task_id == task_id) reservation.active = true;
+    }
+}
+
+bool CoverageSearchManager::hasActiveLocalReservation(uint64_t task_id) const {
+    for (const auto &reservation : local_frontier_reservations_) {
+        if (reservation.task.task_id == task_id && reservation.active) return true;
+    }
+    return false;
+}
+
+void CoverageSearchManager::eraseLocalReservation(uint64_t task_id) {
+    local_frontier_reservations_.erase(
+        std::remove_if(local_frontier_reservations_.begin(), local_frontier_reservations_.end(),
+            [&](const LocalFrontierReservation &reservation) {
+                return reservation.task.task_id == task_id;
+            }),
+        local_frontier_reservations_.end());
 }
 
 bool CoverageSearchManager::currentGoalLeaseValid() const {
     if (!cooperative_mode_ || current_goal_task_id_ == 0) return true;
+    if (hasActiveLocalReservation(current_goal_task_id_)) return true;
     const ros::Time now = ros::Time::now();
     if (local_swarm_task_received_.isZero() ||
         (now - local_swarm_task_received_).toSec() > 5.0) return false;
@@ -1103,6 +1210,7 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
                         ROS_WARN("[CoverageSearch] Active frontier signature unavailable; "
                                  "rolling task-completion check is disabled for this goal.");
                     }
+                    markLocalReservationActive(current_goal_task_id_);
                     consecutive_plan_failures_ = 0;
                     if (!has_committed_heading_) {
                         Eigen::Vector3d to_goal = current_goal_ - uav_pos_;

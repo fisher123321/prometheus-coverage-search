@@ -8,9 +8,10 @@ coverage_search:
   sensing_range: 4.5
   sensing_fov_h: 1.5708    # 90 degrees
   sensing_fov_v: 1.287     # ~74 degrees
-  max_vel: 1.0
-  max_acc: 0.8
-  max_yaw_rate: 1.8
+  max_vel: 1.5
+  max_acc: 1.0
+  max_yaw_rate: 1.3962634  # RACER exploration/yd: 80 deg/s
+  max_yaw_acc: 1.5707963   # RACER exploration/ydd: 90 deg/s^2
   replan_time: 3.0
   goal_reach_dist: 0.25
   auto_start: true
