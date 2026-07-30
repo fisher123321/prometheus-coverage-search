@@ -12,7 +12,7 @@ coverage_search:
   max_acc: 1.0
   max_yaw_rate: 1.3962634  # RACER exploration/yd: 80 deg/s
   max_yaw_acc: 1.5707963   # RACER exploration/ydd: 90 deg/s^2
-  replan_time: 3.0
+  replan_time: 0.25
   goal_reach_dist: 0.25
   auto_start: true
   map_input_source: 3      # 0=global pcl, 1=local pcl, 2=scan pcl, 3=D435i depth pcl

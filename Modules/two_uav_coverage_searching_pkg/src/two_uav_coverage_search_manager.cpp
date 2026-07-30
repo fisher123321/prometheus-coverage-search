@@ -21,7 +21,7 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     nh.param("coverage_search/max_acc", max_acc_, 0.8);
     nh.param("coverage_search/max_yaw_rate", max_yaw_rate_, 0.5);
     nh.param("coverage_search/max_yaw_acc", max_yaw_acc_, 1.8);
-    nh.param("coverage_search/replan_time", replan_time_, 3.0);
+    nh.param("coverage_search/replan_time", replan_time_, 0.25);
     nh.param("coverage_search/goal_reach_dist", goal_reach_dist_, 0.25);
     nh.param("coverage_search/auto_start", auto_start_, true);
     nh.param("coverage_search/cooperative_mode", cooperative_mode_, false);
@@ -57,6 +57,8 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     nh.param("coverage_search/swarm_bid_period", swarm_bid_period_, 2.0);
     nh.param("coverage_search/swarm_bid_max_tasks", swarm_bid_max_tasks_, 16);
     nh.param("coverage_search/swarm_bid_max_astar", swarm_bid_max_astar_, 6);
+    nh.param("coverage_search/peer_avoidance_radius", peer_avoidance_radius_, 0.75);
+    nh.param("coverage_search/peer_avoidance_duration", peer_avoidance_duration_, 2.0);
     uav_name_ = "/uav" + std::to_string(uav_id_);
 
     coverage_map_.init(nh);
@@ -87,6 +89,9 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
 
     goal_sub_ = nh.subscribe<geometry_msgs::PoseStamped>(
         uav_name_ + "/prometheus/coverage_search/goal", 1, &CoverageSearchManager::goalCb, this);
+    peer_collision_replan_sub_ = nh.subscribe<std_msgs::Bool>(
+        uav_name_ + "/prometheus/coverage_search/peer_collision_replan", 1,
+        &CoverageSearchManager::peerCollisionReplanCb, this);
 
     const string command_topic = cooperative_mode_
         ? uav_name_ + "/prometheus/coverage_search/raw_command"
@@ -146,6 +151,7 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     }
 
     mainloop_timer_ = nh.createTimer(ros::Duration(0.1), &CoverageSearchManager::mainloopCb, this);
+    trajectory_timer_ = nh.createTimer(ros::Duration(0.01), &CoverageSearchManager::trajectoryCb, this);
     frontier_timer_ = nh.createTimer(ros::Duration(0.8), &CoverageSearchManager::frontierCb, this);
 
     exec_state_ = EXEC_STATE::INIT;
@@ -305,6 +311,12 @@ void CoverageSearchManager::remoteStateCb(
     coverage_map_.setDynamicPeerVolume(peer_pos_, true);
 }
 
+void CoverageSearchManager::peerCollisionReplanCb(const std_msgs::Bool::ConstPtr &msg) {
+    if (!cooperative_mode_ || !msg->data) return;
+    peer_collision_replan_requested_ = true;
+    peer_avoidance_until_ = ros::Time::now() + ros::Duration(peer_avoidance_duration_);
+}
+
 void CoverageSearchManager::setCompletionReady(bool ready) {
     if (completion_ready_ == ready) return;
     completion_ready_ = ready;
@@ -315,6 +327,16 @@ void CoverageSearchManager::setCompletionReady(bool ready) {
 
 void CoverageSearchManager::frontierCb(const ros::TimerEvent &e) {
     updateFrontiers();
+}
+
+void CoverageSearchManager::trajectoryCb(const ros::TimerEvent &) {
+    if (exec_state_ == EXEC_STATE::EXPLORING && has_traj_) executeTrajectory();
+    static ros::Time last_publish;
+    if (cooperative_mode_ && (last_publish.isZero() ||
+        (ros::Time::now() - last_publish).toSec() >= 0.1)) {
+        publishSwarmTrajectory();
+        last_publish = ros::Time::now();
+    }
 }
 
 void CoverageSearchManager::updateFrontiers() {
@@ -613,7 +635,6 @@ void CoverageSearchManager::swarmDataCb(const ros::TimerEvent &) {
     if (!cooperative_mode_) return;
     publishSwarmFrontiers();
     publishSwarmBids();
-    publishSwarmTrajectory();
     publishSwarmMapDelta();
 }
 
@@ -880,6 +901,10 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
         (ros::Time::now() - peer_state_received_).toSec() <= peer_state_timeout_;
     if (!peer_fresh) peer_completion_ready_ = false;
     coverage_map_.setDynamicPeerVolume(peer_pos_, peer_fresh);
+    const bool peer_avoidance_active = peer_fresh &&
+        ros::Time::now() < peer_avoidance_until_;
+    coverage_map_.setDynamicPeerAvoidance(peer_pos_, peer_avoidance_active,
+                                           peer_avoidance_radius_);
     if (peer_fresh && coverage_map_.map_ready_) {
         if (last_peer_clear_valid_ &&
             (last_peer_clear_pos_ - peer_pos_).norm() > 0.05) {
@@ -1008,11 +1033,19 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
             last_frontier_found_valid_ = false;
         }
 
-        // 1. 执行当前轨迹至目标；到达后才按真实状态重新选择下一视点。
-        if (has_traj_) {
-            executeTrajectory();
-            break;
+        if (peer_collision_replan_requested_) {
+            peer_collision_replan_requested_ = false;
+            if (has_traj_ && has_goal_) {
+                ++rolling_generation_;  // Invalidate a successor made before the peer became blocked.
+                pending_traj_ = PendingTrajectory();
+                has_traj_ = false;
+                ROS_WARN("[CoverageSearch] Peer trajectory conflict: replan current goal with peer exclusion %.2fm.",
+                         peer_avoidance_radius_);
+            }
         }
+
+        // 1. 执行当前轨迹至目标；到达后才按真实状态重新选择下一视点。
+        if (has_traj_) break;
 
         // 当前轨迹因完成或安全检查退出后，不能把上一条轨迹的待交接结果带入重规划。
         pending_traj_ = PendingTrajectory();
@@ -1270,36 +1303,11 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
     }
 
     case EXEC_STATE::FINISH: {
-        static ros::Time finish_hover_start = ros::Time::now();
-        static bool landing_cmd_sent = false;
-
-        if (!landing_cmd_sent) {
-            double hover_elapsed = (ros::Time::now() - finish_hover_start).toSec();
-            if (hover_elapsed < 5.0) {
-                uav_command_.header.stamp = ros::Time::now();
-                uav_command_.Agent_CMD = prometheus_msgs::UAVCommand::Current_Pos_Hover;
-                uav_command_.Command_ID++;
-                uav_cmd_pub_.publish(uav_command_);
-
-                double coverage = coverage_map_.getKnownSpaceRatio();
-                double duration = (finish_time_ - start_time_).toSec();
-                cout << GREEN << "[CoverageSearch] FINISHED! Hovering... "
-                     << (5.0 - hover_elapsed) << "s left. "
-                     << "Known: " << coverage * 100.0 << "%, Duration: " << duration << "s" << TAIL << endl;
-            } else {
-                uav_command_.header.stamp = ros::Time::now();
-                uav_command_.header.frame_id = "ENU";
-                uav_command_.Agent_CMD = prometheus_msgs::UAVCommand::Land;
-                uav_command_.Command_ID++;
-                uav_cmd_pub_.publish(uav_command_);
-                landing_cmd_sent = true;
-
-                double coverage = coverage_map_.getKnownSpaceRatio();
-                double duration = (finish_time_ - start_time_).toSec();
-                cout << GREEN << "[CoverageSearch] Landing! Known: " << coverage * 100.0
-                     << "%, Duration: " << duration << "s" << TAIL << endl;
-            }
-        }
+        uav_command_.header.stamp = ros::Time::now();
+        uav_command_.Agent_CMD = prometheus_msgs::UAVCommand::Current_Pos_Hover;
+        uav_command_.Command_ID++;
+        uav_cmd_pub_.publish(uav_command_);
+        ROS_INFO_THROTTLE(2.0, "[CoverageSearch] FINISHED! Holding position; no auto landing.");
         break;
     }
     }

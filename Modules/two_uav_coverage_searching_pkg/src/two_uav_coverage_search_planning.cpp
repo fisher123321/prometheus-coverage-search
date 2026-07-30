@@ -1,7 +1,7 @@
 #include "two_uav_coverage_search.h"
 
 namespace {
-constexpr double kRollingHandoffLead = 0.30;
+constexpr double kRollingPeriodicInterval = 1.0;
 }
 
 bool CoverageSearchManager::isStuck() {
@@ -47,7 +47,7 @@ bool CoverageSearchManager::isNearFrontier(const Eigen::Vector3d &pos) {
     return false;
 }
 
-bool CoverageSearchManager::tryPrepareRollingHandoff() {
+bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal) {
     if (!rolling_snapshot_mode_) {
         if (!rolling_worker_running_ && rolling_worker_.joinable()) {
             rolling_worker_.join();
@@ -77,7 +77,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
             }
         }
 
-        if (!has_traj_ || !has_goal_ || !active_goal_frontier_valid_ ||
+        if (!has_traj_ || !has_goal_ || (!force_new_goal && !active_goal_frontier_valid_) ||
             pending_traj_.ready || rolling_worker_running_ ||
             traj_points_.size() < 3 || !active_time_spline_.valid) {
             return false;
@@ -85,12 +85,13 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
         const ros::Time now = ros::Time::now();
         const double elapsed = std::max(0.0, (now - traj_start_time_).toSec());
         const double remaining = active_time_spline_.duration - elapsed;
-        if (remaining <= kRollingHandoffLead) return false;
-        const bool periodic_due = elapsed >= 1.5 &&
+        const double handoff_lead = std::max(0.05, replan_time_);
+        if (remaining <= handoff_lead) return false;
+        const bool periodic_due = elapsed >= kRollingPeriodicInterval &&
             (rolling_last_attempt_time_.isZero() ||
-             (now - rolling_last_attempt_time_).toSec() >= 1.5);
+             (now - rolling_last_attempt_time_).toSec() >= kRollingPeriodicInterval);
         const bool terminal_due = remaining <= 0.50;
-        if (!periodic_due && !terminal_due) return false;
+        if (!force_new_goal && !periodic_due && !terminal_due) return false;
         const uint64_t frontier_generation = frontier_finder_.update_generation_;
 
         // 工作线程只接触这一时刻的地图、前沿和活动轨迹副本；主线程继续发布旧轨迹。
@@ -107,6 +108,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
         planner->max_acc_ = max_acc_;
         planner->max_yaw_rate_ = max_yaw_rate_;
         planner->max_yaw_acc_ = max_yaw_acc_;
+        planner->replan_time_ = replan_time_;
         planner->goal_reach_dist_ = goal_reach_dist_;
         planner->sim_mode_ = sim_mode_;
         planner->cooperative_mode_ = cooperative_mode_;
@@ -161,8 +163,8 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
         const uint64_t source_generation = rolling_generation_;
         try {
             rolling_worker_ = std::thread([this, planner, source_generation,
-                                           frontier_generation]() {
-                planner->tryPrepareRollingHandoff();
+                                           frontier_generation, force_new_goal]() {
+                planner->tryPrepareRollingHandoff(force_new_goal);
                 PendingTrajectory result = std::move(planner->pending_traj_);
                 result.result_ready_time = ros::Time::now();
                 result.source_generation = source_generation;
@@ -176,7 +178,8 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
             ROS_INFO("[CoverageSearch] Rolling replan #%llu: trigger=%s, remaining=%.2fs, "
                      "frontier_generation=%llu.",
                      (unsigned long long)rolling_replan_count_,
-                     terminal_due ? "terminal" : "periodic", remaining,
+                     force_new_goal ? "frontier-cleared" :
+                         (terminal_due ? "terminal" : "periodic"), remaining,
                      (unsigned long long)frontier_generation);
         } catch (const std::exception &e) {
             rolling_worker_running_ = false;
@@ -192,7 +195,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
 
     const int n = (int)traj_points_.size();
     const double elapsed = std::max(0.0, (ros::Time::now() - traj_start_time_).toSec());
-    const double handoff_time = elapsed + kRollingHandoffLead;
+    const double handoff_time = elapsed + std::max(0.05, replan_time_);
     if (handoff_time > active_time_spline_.duration) return false;
     const int handoff_idx = std::min(n - 1, std::max(0, (int)std::lround(
         handoff_time / std::max(1e-3, active_time_spline_.duration) * (n - 1))));
@@ -206,14 +209,15 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
     }
 
     const FrontierFinder::FrontierCluster *active_frontier = nullptr;
-    for (const auto &frontier : frontier_finder_.frontiers_) {
-        if (frontierMatchesTask(frontier, active_goal_frontier_) &&
-            !frontier.viewpoints.empty()) {
-            active_frontier = &frontier;
-            break;
+    if (!force_new_goal) {
+        for (const auto &frontier : frontier_finder_.frontiers_) {
+            if (frontierMatchesTask(frontier, active_goal_frontier_) &&
+                !frontier.viewpoints.empty()) {
+                active_frontier = &frontier;
+                break;
+            }
         }
     }
-    if (!active_frontier) return false;
     const Eigen::Vector3d old_uav_pos = uav_pos_;
     const Eigen::Vector3d old_uav_vel = uav_vel_;
     const double old_uav_yaw = uav_yaw_;
@@ -259,13 +263,24 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
     planning_start_yaw_acc_ = handoff_yaw_acc;
 
     rolling_prepare_in_progress_ = true;
-    current_goal_ = active_frontier->viewpoints.front();
-    current_goal_(2) = fly_height_;
-    current_goal_yaw_ = active_frontier->viewpoint_yaws.empty()
-        ? handoff_yaw : active_frontier->viewpoint_yaws.front();
-    current_goal_task_id_ = active_goal_frontier_.task_id;
-    has_goal_ = true;
-    if (planPathToGoal()) {
+    bool successor_selected = false;
+    if (active_frontier) {
+        current_goal_ = active_frontier->viewpoints.front();
+        current_goal_(2) = fly_height_;
+        current_goal_yaw_ = active_frontier->viewpoint_yaws.empty()
+            ? handoff_yaw : active_frontier->viewpoint_yaws.front();
+        current_goal_task_id_ = active_goal_frontier_.task_id;
+        successor_selected = true;
+    } else if (force_new_goal && selectNextFrontier() && !frontier_targets_.empty()) {
+        current_goal_ = frontier_targets_.front();
+        current_goal_(2) = fly_height_;
+        current_goal_yaw_ = frontier_target_yaws_.front();
+        current_goal_task_id_ = frontier_target_task_ids_.front();
+        successor_selected = true;
+    }
+    has_goal_ = successor_selected;
+    astar2d_.setSearchTimeout(50.0);
+    if (successor_selected && planPathToGoal()) {
         generateBsplineTraj();
         if (has_traj_ && active_time_spline_.valid) {
             prepared.ready = true;
@@ -282,6 +297,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
             prepared.time_spline = active_time_spline_;
         }
     }
+    astar2d_.setSearchTimeout(250.0);
     rolling_prepare_in_progress_ = false;
 
     // 规划过程只允许写入待交接缓冲；旧轨迹以及真实状态继续作为活动状态。
@@ -604,23 +620,24 @@ bool CoverageSearchManager::selectNextFrontier() {
             auto evaluateCandidateSet = [&](const std::vector<TargetCandidate> &candidate_set) {
                 if (candidate_set.empty()) return;
                 const int primary_count = std::min((int)candidate_set.size(),
-                    rolling_prepare_in_progress_ ? 24 : 48);
+                    rolling_prepare_in_progress_ ? 12 : 48);
                 std::vector<TargetCandidate> primary_pool(candidate_set.begin(),
                                                           candidate_set.begin() + primary_count);
                 evaluatePool(primary_pool, primary_count,
-                    rolling_prepare_in_progress_ ? 8 : 16,
-                    rolling_prepare_in_progress_ ? 80.0 : 150.0,
-                    rolling_prepare_in_progress_ ? 650.0 : 1800.0);
+                    rolling_prepare_in_progress_ ? 3 : 16,
+                    rolling_prepare_in_progress_ ? 35.0 : 150.0,
+                    rolling_prepare_in_progress_ ? 100.0 : 1800.0);
 
                 if (reachable.empty()) {
                     ROS_WARN_THROTTLE(2.0,
                         "[CoverageSearch] Candidate A* checks found no reachable viewpoint; "
                         "retry up to 3 nearest candidates with 250 ms.");
-                    const int rescue_count = std::min((int)candidate_set.size(), 12);
+                    const int rescue_count = std::min((int)candidate_set.size(),
+                        rolling_prepare_in_progress_ ? 4 : 12);
                     evaluatePool(candidate_set, rescue_count,
-                        rolling_prepare_in_progress_ ? 2 : 3,
-                        rolling_prepare_in_progress_ ? 150.0 : 250.0,
-                        rolling_prepare_in_progress_ ? 350.0 : 800.0, true);
+                        rolling_prepare_in_progress_ ? 1 : 3,
+                        rolling_prepare_in_progress_ ? 35.0 : 250.0,
+                        rolling_prepare_in_progress_ ? 50.0 : 800.0, true);
                 }
             };
 
@@ -747,10 +764,10 @@ double CoverageSearchManager::computeFrontierCost(const Eigen::Vector3d &vp,
     return bottleneck;
 }
 
-// 轨迹与 ESDF 使用同一个硬安全距离；视点的 0.55/0.50/0.45m 分层仅用于选点。
+// B样条轨迹与执行期统一使用 0.60m 硬安全距离；视点分层仅用于选点。
 double CoverageSearchManager::requiredTrajectoryClearance(
     const Eigen::Vector3d &, double) {
-    return std::max(0.35, coverage_map_.esdf_safe_distance_);
+    return std::max(0.60, coverage_map_.esdf_safe_distance_);
 }
 
 // ★ 执行期把 raw free 和 ESDF clearance 都当作硬安全约束。

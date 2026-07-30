@@ -82,6 +82,8 @@ class TwoUavCoordinator {
     bid_pub_ = nh_.advertise<prometheus_two_uav_coverage_search::SwarmBidArray>(tx_prefix_ + "/bid", 2);
     task_pub_ = nh_.advertise<prometheus_two_uav_coverage_search::SwarmTaskArray>(tx_prefix_ + "/task", 2);
     trajectory_pub_ = nh_.advertise<prometheus_two_uav_coverage_search::SwarmTrajectory>(tx_prefix_ + "/trajectory", 2);
+    peer_collision_replan_pub_ = nh_.advertise<std_msgs::Bool>(
+        uav + "/prometheus/coverage_search/peer_collision_replan", 1);
     command_pub_ = nh_.advertise<prometheus_msgs::UAVCommand>(uav + "/prometheus/command", 10);
     task_label_pub_ = nh_.advertise<visualization_msgs::Marker>(
         uav + "/prometheus/coverage_search/task_labels", 10);
@@ -189,15 +191,78 @@ class TwoUavCoordinator {
     state_pub_.publish(out);
   }
 
-  bool peerTrajectorySafe(const prometheus_msgs::UAVCommand& command, std::string* reason) const {
-    if (!peerFresh()) {
-      if (reason) *reason = "peer state is stale";
+  bool sampleTrajectory(const prometheus_two_uav_coverage_search::SwarmTrajectory& trajectory,
+                        const ros::Time& when, geometry_msgs::Point* point) const {
+    if (trajectory.points.empty() || trajectory.dt <= 1e-3 || trajectory.header.stamp.isZero()) {
       return false;
     }
-    // Close-aircraft holds are disabled for this lease/selection experiment.
-    // Map-side dynamic peer filtering remains enabled, so this only removes
-    // the coordinator's command-forwarding stop.
+    const double offset = std::max(0.0, (when - trajectory.header.stamp).toSec());
+    const double sample = offset / trajectory.dt;
+    const int first = static_cast<int>(std::floor(sample));
+    if (first >= static_cast<int>(trajectory.points.size())) return false;
+    const int second = std::min(first + 1, static_cast<int>(trajectory.points.size()) - 1);
+    const double alpha = std::min(1.0, std::max(0.0, sample - first));
+    const auto& a = trajectory.points[first];
+    const auto& b = trajectory.points[second];
+    point->x = a.x + alpha * (b.x - a.x);
+    point->y = a.y + alpha * (b.y - a.y);
+    point->z = a.z + alpha * (b.z - a.z);
     return true;
+  }
+
+  bool peerTrajectorySafe(std::string* reason) {
+    const ros::Time now = ros::Time::now();
+    const bool trajectories_fresh = !local_trajectory_received_.isZero() &&
+        !peer_trajectory_received_.isZero() &&
+        (now - local_trajectory_received_).toSec() <= trajectory_timeout_ &&
+        (now - peer_trajectory_received_).toSec() <= trajectory_timeout_;
+    if (!peerFresh() || !trajectories_fresh) return true;
+
+    geometry_msgs::Point self, peer;
+    bool high_id_escaping = false;
+    double previous_separation = 0.0;
+    for (double t = 0.0; t <= 2.0; t += 0.05) {
+      const ros::Time when = now + ros::Duration(t);
+      if (!sampleTrajectory(local_trajectory_, when, &self) ||
+          !sampleTrajectory(peer_trajectory_, when, &peer)) break;
+      const double separation = std::sqrt(
+          (self.x - peer.x) * (self.x - peer.x) +
+          (self.y - peer.y) * (self.y - peer.y) +
+          (self.z - peer.z) * (self.z - peer.z));
+      if (separation >= safe_separation_) {
+        if (high_id_escaping) return true;
+        continue;
+      }
+
+      if (uav_id_ > peer_uav_id_ &&
+          (last_collision_replan_request_.isZero() ||
+           (now - last_collision_replan_request_).toSec() >= 0.5)) {
+        std_msgs::Bool request;
+        request.data = true;
+        peer_collision_replan_pub_.publish(request);
+        last_collision_replan_request_ = now;
+      }
+      // 两机已经进入安全间距内时，高 ID 机不能因 t=0 的既有重叠
+      // 永远被拦截；只允许它沿间距单调增加的轨迹退出，低 ID 保持悬停。
+      if (uav_id_ > peer_uav_id_) {
+        if (!high_id_escaping) {
+          high_id_escaping = true;
+          previous_separation = separation;
+          continue;
+        }
+        if (separation + 1e-3 >= previous_separation) {
+          previous_separation = separation;
+          continue;
+        }
+      }
+      if (reason) {
+        *reason = "predicted peer collision in " + std::to_string(t) +
+            "s at " + std::to_string(separation) + "m; " +
+            (uav_id_ < peer_uav_id_ ? "lower ID holds" : "higher ID replans");
+      }
+      return false;
+    }
+    return !high_id_escaping;
   }
 
   void publishHold() {
@@ -215,6 +280,23 @@ class TwoUavCoordinator {
     hold.yaw_ref = have_raw_command_ ? raw_command_.yaw_ref : state_.attitude[2];
     hold.Command_ID = ++command_id_;
     command_pub_.publish(hold);
+  }
+
+  void publishHoldTrajectory() {
+    prometheus_two_uav_coverage_search::SwarmTrajectory hold;
+    hold.header.stamp = ros::Time::now();
+    hold.source_uav_id = uav_id_;
+    hold.sequence = command_id_;
+    hold.active_task_id = local_trajectory_.active_task_id;
+    hold.active_task_distance = local_trajectory_.active_task_distance;
+    hold.dt = 0.05;
+    const geometry_msgs::Point point = ownPoint();
+    geometry_msgs::Vector3 velocity;
+    for (int i = 0; i <= 40; ++i) {
+      hold.points.push_back(point);
+      hold.velocities.push_back(velocity);
+    }
+    trajectory_pub_.publish(hold);
   }
 
   void runAuction() {
@@ -438,6 +520,13 @@ class TwoUavCoordinator {
       publishHold();
       return;
     }
+    if ((phase_ == WAIT_PEER || phase_ == WAIT_TAKEOFF) && !startSeparationOk()) {
+      ROS_WARN_THROTTLE(1.0, "[two_uav_coordinator] UAV %d waits: start separation < %.2fm",
+                        uav_id_, min_start_separation_);
+      phase_ = WAIT_TAKEOFF;
+      publishHold();
+      return;
+    }
     // Low speed is a takeoff-readiness condition, not a flight-speed limit.
     // Applying it while ACTIVE repeatedly changed a valid trajectory command
     // into a position hold whenever the aircraft accelerated past 0.35 m/s.
@@ -454,7 +543,6 @@ class TwoUavCoordinator {
     }
     phase_ = ACTIVE;
     frontier_pub_.publish(local_frontiers_);
-    trajectory_pub_.publish(local_trajectory_);
     runAuction();
     if (!have_raw_command_) {
       ROS_WARN_THROTTLE(1.0, "[two_uav_coordinator] UAV %d has no raw coverage command: hold", uav_id_);
@@ -463,12 +551,15 @@ class TwoUavCoordinator {
       return;
     }
     std::string safety_reason;
-    if (!peerTrajectorySafe(raw_command_, &safety_reason)) {
+    if (!peerTrajectorySafe(&safety_reason)) {
       ROS_WARN_THROTTLE(1.0, "[two_uav_coordinator] UAV %d holds: %s", uav_id_, safety_reason.c_str());
       phase_ = HOLD;
       publishHold();
+      if (uav_id_ < peer_uav_id_) publishHoldTrajectory();
+      else trajectory_pub_.publish(local_trajectory_);
       return;
     }
+    trajectory_pub_.publish(local_trajectory_);
     raw_command_.header.stamp = ros::Time::now();
     raw_command_.Command_ID = ++command_id_;
     command_pub_.publish(raw_command_);
@@ -557,12 +648,13 @@ class TwoUavCoordinator {
   ros::Time peer_received_, local_frontier_received_, peer_frontier_received_, local_task_published_, peer_task_received_;
   ros::Time local_bid_received_, peer_bid_received_;
   ros::Time local_trajectory_received_, peer_trajectory_received_, last_auction_;
+  ros::Time last_collision_replan_request_;
   uint64_t state_sequence_ = 0;
   uint32_t task_revision_ = 0, command_id_ = 0;
   std::map<uint64_t, prometheus_two_uav_coverage_search::SwarmTask> own_leases_;
   ros::Subscriber state_sub_, control_sub_, raw_command_sub_, local_frontier_sub_, local_bid_sub_, local_trajectory_sub_, completion_ready_sub_;
   ros::Subscriber peer_state_sub_, peer_frontier_sub_, peer_bid_sub_, peer_task_sub_, peer_trajectory_sub_;
-  ros::Publisher state_pub_, frontier_pub_, bid_pub_, task_pub_, trajectory_pub_, command_pub_, task_label_pub_;
+  ros::Publisher state_pub_, frontier_pub_, bid_pub_, task_pub_, trajectory_pub_, peer_collision_replan_pub_, command_pub_, task_label_pub_;
   int last_task_label_count_ = 0;
   ros::Timer timer_;
 };

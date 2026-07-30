@@ -138,6 +138,12 @@ void CoverageMap::init(ros::NodeHandle &nh) {
 // ★ 新增：2D索引查询（使用缓存的z层索引，避免重复计算）
 bool CoverageMap::isOccupied2D(int x, int y) {
     if (!isInMap2D(x, y)) return true;
+    if (dynamic_peer_avoidance_valid_) {
+        Eigen::Vector3d p;
+        indexToPos(Eigen::Vector3i(x, y, min_z_idx_), p);
+        if ((p.head<2>() - dynamic_peer_avoidance_pos_.head<2>()).norm() <=
+            dynamic_peer_avoidance_radius_) return true;
+    }
     for (int z = min_z_idx_; z <= max_z_idx_; z++) {
         Eigen::Vector3i idx(x, y, z);
         int adr = toAddress(idx);
@@ -391,6 +397,7 @@ bool CoverageMap::isInMap(const Eigen::Vector3d &pos) {
 
 bool CoverageMap::isOccupied(const Eigen::Vector3d &pos) {
     if (!isInMap(pos)) return true;
+    if (isInDynamicPeerAvoidance(pos)) return true;
     Eigen::Vector3i idx;
     posToIndex(pos, idx);
     return occupancy_buffer_[toAddress(idx)] == 2;
@@ -405,6 +412,7 @@ bool CoverageMap::isUnknown(const Eigen::Vector3d &pos) {
 
 bool CoverageMap::isFree(const Eigen::Vector3d &pos) {
     if (!isInMap(pos)) return false;
+    if (isInDynamicPeerAvoidance(pos)) return false;
     Eigen::Vector3i idx;
     posToIndex(pos, idx);
     return occupancy_buffer_[toAddress(idx)] == 1;
@@ -543,10 +551,25 @@ void CoverageMap::setDynamicPeerVolume(const Eigen::Vector3d &body_pos, bool act
     if (dynamic_peer_valid_) dynamic_peer_pos_ = body_pos;
 }
 
+void CoverageMap::setDynamicPeerAvoidance(const Eigen::Vector3d &body_pos, bool active,
+                                          double radius) {
+    dynamic_peer_avoidance_valid_ = active && radius > 0.0 && isInMap(body_pos);
+    if (dynamic_peer_avoidance_valid_) {
+        dynamic_peer_avoidance_pos_ = body_pos;
+        dynamic_peer_avoidance_radius_ = radius;
+    }
+}
+
 bool CoverageMap::isInDynamicPeerVolume(const Eigen::Vector3d &pos) const {
     if (!dynamic_peer_valid_) return false;
     return (pos.head<2>() - dynamic_peer_pos_.head<2>()).norm() <= peer_clear_radius_ &&
            std::fabs(pos(2) - dynamic_peer_pos_(2)) <= peer_clear_half_height_;
+}
+
+bool CoverageMap::isInDynamicPeerAvoidance(const Eigen::Vector3d &pos) const {
+    return dynamic_peer_avoidance_valid_ &&
+        (pos.head<2>() - dynamic_peer_avoidance_pos_.head<2>()).norm() <=
+            dynamic_peer_avoidance_radius_;
 }
 
 void CoverageMap::clearRobotVolume(const Eigen::Vector3d &body_pos) {

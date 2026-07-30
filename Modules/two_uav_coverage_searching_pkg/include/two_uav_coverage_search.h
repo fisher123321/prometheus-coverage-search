@@ -71,8 +71,11 @@ public:
                             const Eigen::Matrix3d &R_wc);
     void clearRobotVolume(const Eigen::Vector3d &body_pos);
     void setDynamicPeerVolume(const Eigen::Vector3d &body_pos, bool active);
+    void setDynamicPeerAvoidance(const Eigen::Vector3d &body_pos, bool active,
+                                 double radius);
     void clearDynamicPeerVolume(const Eigen::Vector3d &body_pos);
     bool isInDynamicPeerVolume(const Eigen::Vector3d &pos) const;
+    bool isInDynamicPeerAvoidance(const Eigen::Vector3d &pos) const;
 
     // 栅格状态查询
     bool isInMap(const Eigen::Vector3d &pos);
@@ -186,6 +189,9 @@ private:
     double peer_clear_radius_, peer_clear_half_height_;
     Eigen::Vector3d dynamic_peer_pos_ = Eigen::Vector3d::Zero();
     bool dynamic_peer_valid_ = false;
+    Eigen::Vector3d dynamic_peer_avoidance_pos_ = Eigen::Vector3d::Zero();
+    double dynamic_peer_avoidance_radius_ = 0.0;
+    bool dynamic_peer_avoidance_valid_ = false;
     unsigned int occupancy_update_epoch_ = 0;
     std::vector<unsigned int> occupancy_update_stamp_;
     std::vector<int8_t> remote_evidence_buffer_;
@@ -411,10 +417,10 @@ private:
     ros::Subscriber uav_state_sub_, uav_control_state_sub_;
     ros::Subscriber global_pcl_sub_, local_pcl_sub_, scan_pcl_sub_, depth_pcl_sub_, goal_sub_;
     ros::Subscriber remote_chunk_sub_, map_request_sub_, remote_frontier_sub_, remote_state_sub_;
-    ros::Subscriber local_task_sub_, remote_task_sub_;
+    ros::Subscriber local_task_sub_, remote_task_sub_, peer_collision_replan_sub_;
     ros::Publisher uav_cmd_pub_, path_vis_pub_, fov_vis_pub_, coverage_status_pub_, uav_label_pub_, completion_ready_pub_;
     ros::Publisher swarm_frontier_pub_, swarm_bid_pub_, swarm_traj_pub_, map_chunk_pub_, map_request_pub_;
-    ros::Timer mainloop_timer_, frontier_timer_, swarm_data_timer_;
+    ros::Timer mainloop_timer_, trajectory_timer_, frontier_timer_, swarm_data_timer_;
 
     prometheus_msgs::UAVState uav_state_;
     prometheus_msgs::UAVControlState uav_control_state_;
@@ -427,11 +433,14 @@ private:
     ros::Time peer_state_received_;
     bool peer_state_valid_ = false;
     bool last_peer_clear_valid_ = false;
+    bool peer_collision_replan_requested_ = false;
+    ros::Time peer_avoidance_until_;
     int uav_id_;
     string uav_name_;
 
     double fly_height_, sensing_range_, sensing_fov_h_, sensing_fov_v_;
     double max_vel_, max_acc_, max_yaw_rate_, max_yaw_acc_, replan_time_, goal_reach_dist_;
+    double peer_avoidance_radius_ = 0.75, peer_avoidance_duration_ = 2.0;
     bool sim_mode_, auto_start_, cooperative_mode_, external_goal_only_;
     int global_coverage_source_;
     int map_input_source_;
@@ -604,12 +613,14 @@ private:
     void depthPclCb(const sensor_msgs::PointCloud2ConstPtr &msg);
     void goalCb(const geometry_msgs::PoseStampedConstPtr &msg);
     void remoteStateCb(const prometheus_two_uav_coverage_search::SwarmState::ConstPtr &msg);
+    void peerCollisionReplanCb(const std_msgs::Bool::ConstPtr &msg);
     void remoteChunkCb(const prometheus_two_uav_coverage_search::SwarmMapChunkConstPtr &msg);
     void remoteFrontierCb(const prometheus_two_uav_coverage_search::SwarmFrontierArrayConstPtr &msg);
     void swarmTaskCb(const prometheus_two_uav_coverage_search::SwarmTaskArrayConstPtr &msg);
     void mapRequestCb(const prometheus_two_uav_coverage_search::SwarmMapRequestConstPtr &msg);
 
     void mainloopCb(const ros::TimerEvent &e);
+    void trajectoryCb(const ros::TimerEvent &e);
     void frontierCb(const ros::TimerEvent &e);
     void updateFrontiers();
     void updateLocalFrontierReservations();
@@ -656,7 +667,7 @@ private:
                             bool count_as_replan);
     // ★ 目标点前沿验证：目标点附近必须有unknown区域
     bool isNearFrontier(const Eigen::Vector3d &pos);
-    bool tryPrepareRollingHandoff();
+    bool tryPrepareRollingHandoff(bool force_new_goal = false);
     bool buildContinuousBridge(const Eigen::Vector3d &start_pos,
                                const Eigen::Vector3d &start_vel,
                                const Eigen::Vector3d &start_acc,
