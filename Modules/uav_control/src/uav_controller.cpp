@@ -830,7 +830,8 @@ void UAV_controller::send_pos_cmd_to_px4_original_controller()
             }
             else if (uav_command.Move_mode == prometheus_msgs::UAVCommand::TRAJECTORY)
             {
-                send_pos_vel_acc_xyz_setpoint(pos_des, vel_des, acc_des, yaw_des);
+                send_pos_vel_acc_xyz_setpoint(pos_des, vel_des, acc_des, yaw_des,
+                                               yaw_rate_des);
                 vel_control = false;
                 yaw_control = false;
             }
@@ -1452,10 +1453,10 @@ void UAV_controller::send_pos_vel_xyz_setpoint(const Eigen::Vector3d &pos_sp, co
 void UAV_controller::send_pos_vel_acc_xyz_setpoint(const Eigen::Vector3d &pos_sp,
                                                    const Eigen::Vector3d &vel_sp,
                                                    const Eigen::Vector3d &acc_sp,
-                                                   float yaw_sp)
+                                                   float yaw_sp, float yaw_rate_sp)
 {
     mavros_msgs::PositionTarget pos_setpoint;
-    pos_setpoint.type_mask = 0b100000000000; // P/V/A + yaw; ignore yaw_rate only
+    pos_setpoint.type_mask = 0; // P/V/A + yaw + yaw-rate feed-forward
     pos_setpoint.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
     pos_setpoint.position.x = pos_sp[0];
     pos_setpoint.position.y = pos_sp[1];
@@ -1467,6 +1468,7 @@ void UAV_controller::send_pos_vel_acc_xyz_setpoint(const Eigen::Vector3d &pos_sp
     pos_setpoint.acceleration_or_force.y = acc_sp[1];
     pos_setpoint.acceleration_or_force.z = acc_sp[2];
     pos_setpoint.yaw = yaw_sp;
+    pos_setpoint.yaw_rate = yaw_rate_sp;
     px4_setpoint_raw_local_pub.publish(pos_setpoint);
 }
 

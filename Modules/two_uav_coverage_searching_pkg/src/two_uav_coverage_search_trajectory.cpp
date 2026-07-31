@@ -4,6 +4,15 @@
 
 namespace {
 
+constexpr double kYawEarlyFinishRatio = 0.80;
+constexpr double kQuinticYawPeakRate = 1.875;
+constexpr double kQuinticYawPeakAcceleration = 5.7735026919;
+
+double quinticProgress(double x) {
+    x = std::max(0.0, std::min(1.0, x));
+    return x * x * x * (10.0 + x * (-15.0 + 6.0 * x));
+}
+
 struct LocalBsplineOptContext {
     CoverageMap *map = nullptr;
     std::vector<Eigen::Vector3d> initial_ctrl;
@@ -78,7 +87,7 @@ double localBsplineCost(const std::vector<double> &x, std::vector<double> &grad,
         addGrad(i, 2.0 * kGuideWeight * deviation);
 
         const double dist = localBsplineDistance(ctx, q[i]);
-        if (dist <= 0.60) return 1e12;  // numerical infinity: hard B-spline clearance
+        if (dist <= 0.45) return 1e12;  // numerical infinity: hard B-spline clearance
         if (dist < ctx->desired_clearance) {
             const double lack = ctx->desired_clearance - dist;
             cost += kDistanceWeight * lack * lack;
@@ -265,7 +274,7 @@ bool CoverageSearchManager::optimizeTimeBspline2D(TimeBspline &spline, bool roll
     ctx.first_free = first_free;
     ctx.last_free = last_free;
     ctx.knot_span = spline.duration / std::max(1, (int)spline.position_ctrl.size() - spline.degree);
-    ctx.desired_clearance = 1.20;
+    ctx.desired_clearance = 0.80;
     ctx.max_vel = max_vel_;
     ctx.max_acc = max_acc_;
     Eigen::Vector3d ignored_p, ignored_v, ignored_a;
@@ -293,7 +302,10 @@ bool CoverageSearchManager::optimizeTimeBspline2D(TimeBspline &spline, bool roll
                                     p(1) + 1.0);
     }
     variables.back() = spline.duration;
-    lower.back() = 0.50 * spline.duration;
+    // A failed sampled trajectory asks the outer loop for more time.  Keeping
+    // that as the lower bound lets the outer retry/refinement find the shortest
+    // duration that actually satisfies the hard P/V/A/yaw limits.
+    lower.back() = spline.duration;
     upper.back() = 1.50 * spline.duration;
     std::vector<double> initial_grad;
     localBsplineCost(variables, initial_grad, &ctx);
@@ -457,6 +469,16 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
 
     const double hard_clearance = std::max(
         std::max(0.35, coverage_map_.esdf_safe_distance_), traj_cut_clearance_);
+    const bool yaw_initially_opposes_goal = yaw_delta * start_yaw_rate < -1e-4;
+    // With C2 handoff, an opposite inherited yaw rate must first be braked.
+    // Permit exactly that physically required initial backtrack, plus one
+    // sample margin; yaw-rate/acceleration limits below remain hard bounds.
+    const double yaw_backtrack_limit = yaw_initially_opposes_goal
+        ? 0.05 + start_yaw_rate * start_yaw_rate /
+              (2.0 * std::max(1e-3, max_yaw_acc_))
+        : 1e-3;
+    const double yaw_backtrack_progress_limit = yaw_backtrack_limit /
+        std::max(0.05, std::fabs(yaw_delta));
     std::string last_rejection = "unknown";
     TimeBspline best_candidate;
     std::vector<Eigen::Vector3d> best_points, best_velocities, best_accelerations;
@@ -464,6 +486,7 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
     double best_duration = 0.0, best_sample_dt = 0.0;
     double best_peak_speed = 0.0, best_peak_acc = 0.0;
     double best_peak_yaw_rate = 0.0, best_peak_yaw_acc = 0.0;
+    double best_yaw_finish_fraction = 1.0;
     double last_failed_duration = 0.0;
     int expansion_attempts = 0;
     int refinement_attempts = 0;
@@ -484,11 +507,27 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         candidate.duration = duration;
         candidate.position_ctrl.resize(control_count);
         candidate.yaw_ctrl.resize(control_count);
+        const double abs_yaw_delta = std::fabs(yaw_delta);
+        const bool rolling_yaw_handoff = rolling_prepare_in_progress_ &&
+            (std::fabs(start_yaw_rate) > 1e-3 ||
+             std::fabs(start_yaw_acceleration) > 1e-3);
+        const double earliest_yaw_finish = std::max({
+            (rolling_yaw_handoff ? 1.0 : kYawEarlyFinishRatio) * duration,
+            kQuinticYawPeakRate * abs_yaw_delta / std::max(1e-3, max_yaw_rate_),
+            std::sqrt(kQuinticYawPeakAcceleration * abs_yaw_delta /
+                      std::max(1e-3, max_yaw_acc_))});
+        const double yaw_finish_fraction = earliest_yaw_finish < duration
+            ? earliest_yaw_finish / duration : 1.0;
+        const auto yawProgress = [&](double time_fraction) {
+            return yaw_finish_fraction < 1.0
+                ? quinticProgress(time_fraction / yaw_finish_fraction)
+                : std::max(0.0, std::min(1.0, time_fraction));
+        };
         for (int i = 0; i < control_count; ++i) {
             const double fraction = (double)i / (control_count - 1);
             candidate.position_ctrl[i] = sampleGuide(fraction * total_length);
             candidate.yaw_ctrl[i] = Eigen::Vector3d(
-                uav_yaw_ + fraction * yaw_delta, 0.0, 0.0);
+                uav_yaw_ + yawProgress(fraction) * yaw_delta, 0.0, 0.0);
         }
 
         const int spans = control_count - candidate.degree;
@@ -533,9 +572,10 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
             break;
         }
 
+        const double candidate_duration = candidate.duration;
         const int sample_count = std::max(2, (int)std::ceil(
-            duration / std::min(0.10, 0.05 / std::max(0.20, max_vel_))));
-        const double sample_dt = duration / sample_count;
+            candidate_duration / std::min(0.10, 0.05 / std::max(0.20, max_vel_))));
+        const double sample_dt = candidate_duration / sample_count;
         std::vector<Eigen::Vector3d> points, velocities, accelerations;
         std::vector<double> yaws;
         points.reserve(sample_count + 1);
@@ -546,6 +586,7 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         double peak_speed = 0.0, peak_acc = 0.0, peak_yaw_rate = 0.0,
                peak_yaw_acc = 0.0;
         double previous_yaw_progress = 0.0;
+        bool yaw_has_turned_toward_goal = false;
         Eigen::Vector3d previous = start_pos;
         for (int i = 0; i <= sample_count; ++i) {
             Eigen::Vector3d p, v, a;
@@ -572,12 +613,16 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
             if (std::fabs(yaw_delta) > 0.05) {
                 const double yaw_progress = std::atan2(
                     std::sin(yaw - uav_yaw_), std::cos(yaw - uav_yaw_)) / yaw_delta;
-                if (yaw_progress < previous_yaw_progress - 1e-3 ||
-                    yaw_progress < -1e-3 || yaw_progress > 1.0 + 1e-3) {
+                const bool initial_backtrack = yaw_progress < -1e-3;
+                if (yaw_progress < -yaw_backtrack_progress_limit ||
+                    yaw_progress > 1.0 + 1e-3 ||
+                    (yaw_has_turned_toward_goal &&
+                     yaw_progress < previous_yaw_progress - 1e-3)) {
                     last_rejection = "non-monotonic yaw profile";
                     safe = false;
                     break;
                 }
+                if (i > 0 && !initial_backtrack) yaw_has_turned_toward_goal = true;
                 previous_yaw_progress = yaw_progress;
             }
             const bool segment_blocked = point_safe && i > 0 &&
@@ -618,13 +663,18 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
                 return std::atan2(std::sin(sampled_yaw - uav_yaw_),
                                   std::cos(sampled_yaw - uav_yaw_)) / yaw_delta;
             };
-            const double yaw_progress_25 = yawProgressAt(0.25 * duration);
-            const double yaw_progress_50 = yawProgressAt(0.50 * duration);
-            const double yaw_progress_75 = yawProgressAt(0.75 * duration);
+            const double yaw_progress_25 = yawProgressAt(0.25 * candidate_duration);
+            const double yaw_progress_50 = yawProgressAt(0.50 * candidate_duration);
+            const double yaw_progress_75 = yawProgressAt(0.75 * candidate_duration);
+            const double expected_50 = yawProgress(0.50);
+            const double expected_75 = yawProgress(0.75);
+            const double min_progress_25 = yaw_initially_opposes_goal
+                ? -yaw_backtrack_progress_limit : 0.05;
             if (!std::isfinite(yaw_progress_25) || !std::isfinite(yaw_progress_50) ||
-                !std::isfinite(yaw_progress_75) || yaw_progress_25 < 0.05 ||
-                yaw_progress_50 < 0.35 || yaw_progress_50 > 0.65 ||
-                yaw_progress_75 < 0.65) {
+                !std::isfinite(yaw_progress_75) || yaw_progress_25 < min_progress_25 ||
+                yaw_progress_50 < std::max(0.35, expected_50 - 0.10) ||
+                yaw_progress_50 > std::min(0.95, expected_50 + 0.15) ||
+                yaw_progress_75 < std::max(0.65, expected_75 - 0.10)) {
                 last_rejection = "yaw change is concentrated near trajectory end";
                 if (retryDuration()) continue;
                 break;
@@ -636,7 +686,7 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         double yaw_end = 0.0, yaw_rate_end = 0.0, yaw_acc_end = 0.0;
         if (!evaluateTimeBspline(candidate, 0.0, p0, v0, a0,
                                  yaw0, yaw_rate0, yaw_acc0) ||
-            !evaluateTimeBspline(candidate, duration, p_end, v_end, a_end,
+            !evaluateTimeBspline(candidate, candidate_duration, p_end, v_end, a_end,
                                  yaw_end, yaw_rate_end, yaw_acc_end) ||
             (p0 - start_pos).norm() > 1e-6 ||
             (v0 - start_vel).norm() > 1e-6 ||
@@ -661,12 +711,13 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         best_velocities.swap(velocities);
         best_accelerations.swap(accelerations);
         best_yaws.swap(yaws);
-        best_duration = duration;
+        best_duration = candidate_duration;
         best_sample_dt = sample_dt;
         best_peak_speed = peak_speed;
         best_peak_acc = peak_acc;
         best_peak_yaw_rate = peak_yaw_rate;
         best_peak_yaw_acc = peak_yaw_acc;
+        best_yaw_finish_fraction = yaw_finish_fraction;
         if (last_failed_duration <= 0.0) break;
         if (refinement_attempts == 0) refinement_attempts = 3;
         else --refinement_attempts;
@@ -681,10 +732,11 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         traj_accs_.swap(best_accelerations);
         traj_yaws_.swap(best_yaws);
         traj_dt_ = best_sample_dt;
-        ROS_INFO("[CoverageSearch] Time B-spline accepted: duration=%.2fs, ctrl=%d, "
+        ROS_INFO("[CoverageSearch] Time B-spline accepted: duration=%.2fs, yaw_finish=%.0f%%, ctrl=%d, "
                  "samples=%zu, peak_v=%.2f, peak_a=%.2f, peak_yaw_rate=%.2f, "
                  "peak_yaw_acc=%.2f; minimum feasible duration after refinement.",
-                 best_duration, control_count, traj_points_.size(), best_peak_speed,
+                 best_duration, 100.0 * best_yaw_finish_fraction, control_count,
+                 traj_points_.size(), best_peak_speed,
                  best_peak_acc, best_peak_yaw_rate, best_peak_yaw_acc);
         return true;
     }
@@ -716,7 +768,7 @@ void CoverageSearchManager::generateBsplineTraj() {
     std::string traj_type = "Bspline";
     const double traj_min_clearance = std::max(
         std::max(0.35, coverage_map_.esdf_safe_distance_), traj_cut_clearance_);
-    const double preferred_clearance = std::max(0.70, 2.0 * traj_min_clearance);
+    const double preferred_clearance = std::max(0.80, traj_min_clearance);
     const std::vector<Eigen::Vector3d> raw_astar_path = astar_path_;
     Eigen::Vector3i start_idx;
     coverage_map_.posToIndex(uav_pos_, start_idx);

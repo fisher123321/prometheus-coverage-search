@@ -155,7 +155,9 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
     for (auto &ftr : frontiers_) {
         bool affected = false;
         for (const auto &box : merged_boxes) {
-            if (haveOverlap(ftr.box_min_, ftr.box_max_, box.first, box.second)) {
+            if (haveOverlap(ftr.box_min_, ftr.box_max_,
+                            box.first - Eigen::Vector3d::Constant(margin),
+                            box.second + Eigen::Vector3d::Constant(margin))) {
                 affected = true;
                 break;
             }
@@ -201,7 +203,8 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
                         computeFrontierInfo(ftr);
                         for (const auto &local_box : local_update_boxes) {
                             if (haveOverlap(ftr.box_min_, ftr.box_max_,
-                                            local_box.first, local_box.second)) {
+                                            local_box.first - Eigen::Vector3d::Constant(margin),
+                                            local_box.second + Eigen::Vector3d::Constant(margin))) {
                                 ftr.local_discovery = true;
                                 break;
                             }
@@ -227,16 +230,24 @@ bool FrontierFinder::haveOverlap(const Eigen::Vector3d &min1, const Eigen::Vecto
 
 bool FrontierFinder::isFrontierChanged(const FrontierCluster &ftr) {
     if (ftr.cells.empty()) return true;
-    int changed = 0;
-    const int threshold = std::max(1, (int)ceil(0.15 * (double)ftr.cells.size()));
-    const int stride = std::max(1, (int)ftr.cells.size() / 180);
-    for (int i = 0; i < (int)ftr.cells.size(); i += stride) {
+    for (const auto &cell : ftr.cells) {
         Eigen::Vector3i idx;
-        map_->posToIndex(ftr.cells[i], idx);
-        if (!isFrontierCell(idx)) {
-            changed += stride;
-            if (changed >= threshold) return true;
-        }
+        map_->posToIndex(cell, idx);
+        if (!isFrontierCell(idx)) return true;
+    }
+    return false;
+}
+
+bool FrontierFinder::isFrontierCellsCovered(const std::vector<Eigen::Vector3d> &cells,
+                                            double changed_fraction) {
+    if (cells.empty()) return false;
+    const int threshold = std::max(1, static_cast<int>(std::ceil(
+        changed_fraction * static_cast<double>(cells.size()))));
+    int changed = 0;
+    for (const auto &cell : cells) {
+        Eigen::Vector3i idx;
+        map_->posToIndex(cell, idx);
+        if (!isFrontierCell(idx) && ++changed >= threshold) return true;
     }
     return false;
 }
@@ -445,6 +456,20 @@ void FrontierFinder::computeViewpoints(const Eigen::Vector3d &cur_pos) {
     for (auto &ftr : frontiers_) {
         if (ftr.viewpoints.empty()) sampleViewpoints(ftr, cur_pos);
     }
+}
+
+bool FrontierFinder::isViewpointVisible(const FrontierCluster &ftr,
+                                        const Eigen::Vector3d &pos, double yaw) {
+    const auto &cells = ftr.filtered_cells.empty() ? ftr.cells : ftr.filtered_cells;
+    return countVisibleCells(pos, yaw, cells) >= min_visib_num_;
+}
+
+void FrontierFinder::refreshViewpoints(FrontierCluster &ftr,
+                                       const Eigen::Vector3d &cur_pos) {
+    ftr.viewpoints.clear();
+    ftr.viewpoint_yaws.clear();
+    ftr.viewpoint_visib_nums.clear();
+    sampleViewpoints(ftr, cur_pos);
 }
 
 void FrontierFinder::downsample(const std::vector<Eigen::Vector3d> &cluster_in,

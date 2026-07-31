@@ -24,7 +24,7 @@ bool Astar2D::isWalkable(int x, int y) {
     if (x < 0 || x >= map_->grid_size_(0) || y < 0 || y >= map_->grid_size_(1))
         return false;
     if (!map_->isFree2D(x, y) || map_->isOccupied2D(x, y)) return false;
-    const double hard_clearance = std::max(0.60, map_->esdf_safe_distance_);
+    const double hard_clearance = std::max(0.45, map_->esdf_safe_distance_);
     return map_->getDistance2D(x, y) >= hard_clearance;
 }
 
@@ -57,13 +57,13 @@ bool Astar2D::search(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
             walkable_cache[key] =
                 map_->isFree2D(x, y) &&
                 !map_->isOccupied2D(x, y) &&
-                distance_cache[key] >= std::max(0.60, map_->esdf_safe_distance_);
+                distance_cache[key] >= std::max(0.45, map_->esdf_safe_distance_);
         }
         return walkable_cache[key] != 0;
     };
 
     const Eigen::Vector2i requested_si = si;
-    const double hard_clearance = std::max(0.60, map_->esdf_safe_distance_);
+    const double hard_clearance = std::max(0.45, map_->esdf_safe_distance_);
     const double bridge_step = std::max(0.05, 0.5 * map_->resolution_);
     auto hardBridgeClear = [&](const Eigen::Vector3d &from,
                                const Eigen::Vector3d &to) {
@@ -181,8 +181,8 @@ bool Astar2D::search(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
     const int MAX_EXPAND = 90000;
     auto clearancePenalty = [&](int x, int y) -> double {
         int key = toAddress2D(x, y);
-        const double hard_clearance = std::max(0.60, map_->esdf_safe_distance_);
-        const double desired_clearance = std::max(0.70, 2.0 * hard_clearance);
+        const double hard_clearance = std::max(0.45, map_->esdf_safe_distance_);
+        const double desired_clearance = std::max(0.80, hard_clearance);
         const double dist = distance_cache[key] >= 0.0
                                 ? distance_cache[key]
                                 : map_->getDistance2D(x, y);
@@ -360,7 +360,7 @@ bool Astar2D::isPathClear(const Eigen::Vector3d &start, const Eigen::Vector3d &g
     if (dist < 0.01) return true;
     dir.normalize();
 
-    const double hard_clearance = std::max(0.60, map_->esdf_safe_distance_);
+    const double hard_clearance = std::max(0.45, map_->esdf_safe_distance_);
     double step = std::max(0.05, 0.5 * map_->resolution_);
     for (double d = step; d <= dist; d += step) {
         Eigen::Vector3d check_pos = start + d * dir;
@@ -390,7 +390,7 @@ bool Astar2D::isPathTraversable(const Eigen::Vector3d &start,
 
     int unknown = 0;
     int checked = 0;
-    const double hard_clearance = std::max(0.60, map_->esdf_safe_distance_);
+    const double hard_clearance = std::max(0.45, map_->esdf_safe_distance_);
     double step = std::max(0.05, 0.5 * map_->resolution_);
     for (double d = step; d <= dist; d += step) {
         Eigen::Vector3d check_pos = start + d * dir;

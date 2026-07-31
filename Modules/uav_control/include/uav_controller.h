@@ -232,7 +232,7 @@ private:
     void send_pos_vel_acc_xyz_setpoint(const Eigen::Vector3d &pos_sp,
                                        const Eigen::Vector3d &vel_sp,
                                        const Eigen::Vector3d &acc_sp,
-                                       float yaw_sp);
+                                       float yaw_sp, float yaw_rate_sp);
     void send_acc_xyz_setpoint(const Eigen::Vector3d &accel_sp, float yaw_sp);
     void send_attitude_setpoint(Eigen::Vector4d &u_att);
     void send_global_setpoint(const Eigen::Vector3d &global_pos_sp, float yaw_sp);

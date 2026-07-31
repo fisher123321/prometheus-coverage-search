@@ -435,6 +435,7 @@ bool CoverageSearchManager::selectNextFrontier() {
         frontier_target_task_ids_.clear();
 
         struct TargetCandidate {
+            FrontierFinder::FrontierCluster *frontier;
             Eigen::Vector3d pos;
             double yaw;
             double euclid_dist;
@@ -442,11 +443,13 @@ bool CoverageSearchManager::selectNextFrontier() {
             Eigen::Vector3d backup_pos;
             double backup_yaw;
             bool has_backup;
+            bool local_reserved;
         };
 
         std::vector<TargetCandidate> candidates;
         int clusters_without_view = 0;
-        int skipped_no_lease = 0;
+        int skipped_peer_lease = 0;
+        int free_candidates = 0;
         int skipped_not_free = 0;
         int reach_astar_tried = 0;
         int reach_astar_failed = 0;
@@ -462,10 +465,13 @@ bool CoverageSearchManager::selectNextFrontier() {
                 continue;
             }
             const uint64_t lease_task_id = leasedTaskIdForFrontier(ftr);
-            if (lease_task_id == 0) {
-                skipped_no_lease++;
+            const bool local_reserved = localReservationTaskIdForFrontier(ftr) != 0;
+            if (lease_task_id == 0 && isFrontierLeasedToPeer(ftr)) {
+                skipped_peer_lease++;
                 continue;
             }
+            const bool is_free = lease_task_id == 0;
+            if (is_free) ++free_candidates;
 
             // 竞价和成本排序只使用最佳视点；次视点仅在该最佳视点规划失败时
             // 作为同一前沿簇的立即备选。
@@ -491,8 +497,9 @@ bool CoverageSearchManager::selectNextFrontier() {
             const Eigen::Vector3d &backup_vp = has_backup ? ftr.viewpoints[1] : vp;
             const double backup_yaw = ftr.viewpoint_yaws.size() > 1
                 ? ftr.viewpoint_yaws[1] : yaw;
-            candidates.push_back({vp, yaw, dist, lease_task_id,
-                                  backup_vp, backup_yaw, has_backup});
+            candidates.push_back({&ftr, vp, yaw, dist,
+                                  is_free ? frontierTaskId(ftr) : lease_task_id,
+                                  backup_vp, backup_yaw, has_backup, local_reserved});
 
         }
 
@@ -503,6 +510,7 @@ bool CoverageSearchManager::selectNextFrontier() {
             std::sort(candidates.begin(), candidates.end(), by_euclid);
 
             struct ReachableCandidate {
+                FrontierFinder::FrontierCluster *frontier;
                 Eigen::Vector3d pos;
                 double yaw;
                 uint64_t task_id;
@@ -514,6 +522,7 @@ bool CoverageSearchManager::selectNextFrontier() {
                 Eigen::Vector3d backup_pos;
                 double backup_yaw;
                 bool has_backup;
+                bool local_reserved;
             };
             std::vector<ReachableCandidate> reachable;
             std::vector<Eigen::Vector3d> astar_attempted;
@@ -601,6 +610,7 @@ bool CoverageSearchManager::selectNextFrontier() {
                         cand.pos, cand.yaw, path_len, initial_path_dir,
                         &path_time, &direction_time, &yaw_time);
                     reachable.push_back({
+                        cand.frontier,
                         cand.pos,
                         cand.yaw,
                         cand.task_id,
@@ -611,7 +621,8 @@ bool CoverageSearchManager::selectNextFrontier() {
                         yaw_time,
                         cand.backup_pos,
                         cand.backup_yaw,
-                        cand.has_backup
+                        cand.has_backup,
+                        cand.local_reserved
                     });
                 }
                 astar2d_.setSearchTimeout(250.0);
@@ -641,9 +652,8 @@ bool CoverageSearchManager::selectNextFrontier() {
                 }
             };
 
-            evaluateCandidateSet(candidates);
-
-            if (!reachable.empty()) {
+            auto collectVisibleTargets = [&]() {
+                if (reachable.empty()) return false;
                 std::sort(reachable.begin(), reachable.end(),
                           [](const ReachableCandidate &a, const ReachableCandidate &b) {
                               if (fabs(a.final_cost - b.final_cost) > 1e-3)
@@ -658,24 +668,61 @@ bool CoverageSearchManager::selectNextFrontier() {
                          reachable.front().yaw_time,
                          reachable.front().path_len);
 
-                const int target_num = std::min(5, (int)reachable.size());
-                for (int i = 0; i < target_num; ++i) {
-                    frontier_targets_.push_back(reachable[i].pos);
-                    frontier_target_yaws_.push_back(reachable[i].yaw);
-                    frontier_target_task_ids_.push_back(reachable[i].task_id);
-                    if (reachable[i].has_backup) {
-                        frontier_targets_.push_back(reachable[i].backup_pos);
-                        frontier_target_yaws_.push_back(reachable[i].backup_yaw);
-                        frontier_target_task_ids_.push_back(reachable[i].task_id);
+                int selected_clusters = 0;
+                for (const auto &candidate : reachable) {
+                    if (selected_clusters >= 5) break;
+                    auto &frontier = *candidate.frontier;
+                    const bool primary_visible = frontier_finder_.isViewpointVisible(
+                        frontier, candidate.pos, candidate.yaw);
+                    const bool backup_visible = candidate.has_backup &&
+                        frontier_finder_.isViewpointVisible(
+                            frontier, candidate.backup_pos, candidate.backup_yaw);
+
+                    if (!primary_visible && !backup_visible) {
+                        frontier_finder_.refreshViewpoints(frontier, uav_pos_);
+                        ROS_WARN_THROTTLE(1.0,
+                            "[CoverageSearch] Cached viewpoints are occluded; refreshed frontier viewpoints.");
+                        continue;
                     }
+
+                    if (primary_visible) {
+                        frontier_targets_.push_back(candidate.pos);
+                        frontier_target_yaws_.push_back(candidate.yaw);
+                        frontier_target_task_ids_.push_back(candidate.task_id);
+                    }
+                    if (backup_visible) {
+                        frontier_targets_.push_back(candidate.backup_pos);
+                        frontier_target_yaws_.push_back(candidate.backup_yaw);
+                        frontier_target_task_ids_.push_back(candidate.task_id);
+                    }
+                    ++selected_clusters;
                 }
+                return !frontier_targets_.empty();
+            };
+
+            // A locally discovered frontier is a five-second local commitment,
+            // not merely a tie-breaker against ordinary own/FREE frontiers.
+            std::vector<TargetCandidate> local_reservation_candidates;
+            std::vector<TargetCandidate> ordinary_candidates;
+            for (const auto &candidate : candidates) {
+                (candidate.local_reserved ? local_reservation_candidates : ordinary_candidates)
+                    .push_back(candidate);
+            }
+
+            evaluateCandidateSet(local_reservation_candidates);
+            const bool local_target_ready = collectVisibleTargets();
+            if (!local_target_ready) {
+                reachable.clear();
+                evaluateCandidateSet(ordinary_candidates);
+                collectVisibleTargets();
             }
         }
 
         if (frontier_targets_.empty()) {
             cout << YELLOW << "[CoverageSearch] No local frontier target. clusters="
                  << ftr_count << ", no_view=" << clusters_without_view
-                 << ", no_lease=" << skipped_no_lease
+                 << ", peer_held=" << skipped_peer_lease
+                 << ", free=" << free_candidates
                  << ", not_free=" << skipped_not_free;
             if (reach_astar_tried > 0) {
                 cout << ", astar=" << reach_astar_failed << "/" << reach_astar_tried;
@@ -764,10 +811,10 @@ double CoverageSearchManager::computeFrontierCost(const Eigen::Vector3d &vp,
     return bottleneck;
 }
 
-// B样条轨迹与执行期统一使用 0.60m 硬安全距离；视点分层仅用于选点。
+// B样条轨迹与执行期统一使用 0.45m 硬安全距离；视点分层仅用于选点。
 double CoverageSearchManager::requiredTrajectoryClearance(
     const Eigen::Vector3d &, double) {
-    return std::max(0.60, coverage_map_.esdf_safe_distance_);
+    return std::max(0.45, coverage_map_.esdf_safe_distance_);
 }
 
 // ★ 执行期把 raw free 和 ESDF clearance 都当作硬安全约束。
@@ -891,8 +938,9 @@ void CoverageSearchManager::releaseCurrentGoal(const std::string &reason,
     current_goal_task_id_ = 0;
     same_goal_replan_count_ = 0;
     active_goal_frontier_valid_ = false;
+    active_goal_frontier_covered_pending_ = false;
+    active_goal_frontier_cells_.clear();
     active_goal_frontier_checked_generation_ = 0;
-    active_goal_frontier_missing_updates_ = 0;
     pending_traj_ = PendingTrajectory();
     rolling_last_attempt_time_ = ros::Time(0);
     ++rolling_generation_;

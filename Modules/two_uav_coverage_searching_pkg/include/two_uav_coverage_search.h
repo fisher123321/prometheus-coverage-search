@@ -277,6 +277,8 @@ public:
                           std::vector<Eigen::Vector3d> &points,
                           std::vector<double> &yaws);
     void publishFrontiers();
+    bool isFrontierCellsCovered(const std::vector<Eigen::Vector3d> &cells,
+                                double changed_fraction);
 
     int cluster_min_;
     double cluster_size_xy_;
@@ -319,6 +321,10 @@ public:
         uint64_t changed_generation = 0;
         bool local_discovery = false;
     };
+
+    bool isViewpointVisible(const FrontierCluster &ftr, const Eigen::Vector3d &pos,
+                            double yaw);
+    void refreshViewpoints(FrontierCluster &ftr, const Eigen::Vector3d &cur_pos);
 
     std::vector<FrontierCluster> frontiers_;
     uint64_t update_generation_ = 0;
@@ -566,9 +572,10 @@ private:
     };
     std::vector<LocalFrontierReservation> local_frontier_reservations_;
     prometheus_two_uav_coverage_search::SwarmTask active_goal_frontier_;
+    std::vector<Eigen::Vector3d> active_goal_frontier_cells_;
     bool active_goal_frontier_valid_ = false;
+    bool active_goal_frontier_covered_pending_ = false;
     uint64_t active_goal_frontier_checked_generation_ = 0;
-    int active_goal_frontier_missing_updates_ = 0;
 
     ros::Time start_time_, finish_time_;
     ros::Time coverage_25_time_, coverage_50_time_, coverage_75_time_;
@@ -688,6 +695,7 @@ private:
                      prometheus_two_uav_coverage_search::SwarmMapChunk &msg);
     uint64_t frontierTaskId(const FrontierFinder::FrontierCluster &frontier);
     bool isFrontierLeasedToSelf(const FrontierFinder::FrontierCluster &frontier);
+    bool isFrontierLeasedToPeer(const FrontierFinder::FrontierCluster &frontier);
     uint64_t leasedTaskIdForFrontier(const FrontierFinder::FrontierCluster &frontier);
     bool frontierMatchesTask(const FrontierFinder::FrontierCluster &frontier,
                              const prometheus_two_uav_coverage_search::SwarmTask &task);
@@ -696,6 +704,8 @@ private:
     bool currentGoalFrontierCovered();
     uint64_t localReservationTaskIdForFrontier(
         const FrontierFinder::FrontierCluster &frontier);
+    bool reserveLocalFrontier(const FrontierFinder::FrontierCluster &frontier);
+    bool reserveLocalFrontierForGoal(uint64_t task_id, const Eigen::Vector3d &goal);
     void markLocalReservationActive(uint64_t task_id);
     bool hasActiveLocalReservation(uint64_t task_id) const;
     void eraseLocalReservation(uint64_t task_id);
