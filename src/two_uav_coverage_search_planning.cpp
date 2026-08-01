@@ -1,5 +1,9 @@
 #include "two_uav_coverage_search.h"
 
+namespace {
+constexpr double kRollingPeriodicInterval = 1.0;
+}
+
 bool CoverageSearchManager::isStuck() {
     // ★ 如果已经非常接近目标，不算卡住（正常到达）
     if (has_goal_) {
@@ -43,7 +47,7 @@ bool CoverageSearchManager::isNearFrontier(const Eigen::Vector3d &pos) {
     return false;
 }
 
-bool CoverageSearchManager::tryPrepareRollingHandoff() {
+bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal) {
     if (!rolling_snapshot_mode_) {
         if (!rolling_worker_running_ && rolling_worker_.joinable()) {
             rolling_worker_.join();
@@ -73,19 +77,22 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
             }
         }
 
-        if (!has_traj_ || !has_goal_ || pending_traj_.ready ||
-            rolling_worker_running_ || traj_points_.size() < 3 ||
-            !active_time_spline_.valid) {
+        if (!has_traj_ || !has_goal_ || (!force_new_goal && !active_goal_frontier_valid_) ||
+            pending_traj_.ready || rolling_worker_running_ ||
+            traj_points_.size() < 3 || !active_time_spline_.valid) {
             return false;
         }
-        const double progress = std::max(0.0, std::min(1.0,
-            (ros::Time::now() - traj_start_time_).toSec() /
-            std::max(1e-3, active_time_spline_.duration)));
-        if (progress < rolling_preplan_progress_) return false;
-
+        const ros::Time now = ros::Time::now();
+        const double elapsed = std::max(0.0, (now - traj_start_time_).toSec());
+        const double remaining = active_time_spline_.duration - elapsed;
+        const double handoff_lead = std::max(0.05, replan_time_);
+        if (remaining <= handoff_lead) return false;
+        const bool periodic_due = elapsed >= kRollingPeriodicInterval &&
+            (rolling_last_attempt_time_.isZero() ||
+             (now - rolling_last_attempt_time_).toSec() >= kRollingPeriodicInterval);
+        const bool terminal_due = remaining <= 0.50;
+        if (!force_new_goal && !periodic_due && !terminal_due) return false;
         const uint64_t frontier_generation = frontier_finder_.update_generation_;
-        if (frontier_generation == 0 ||
-            frontier_generation <= rolling_last_attempt_frontier_generation_) return false;
 
         // 工作线程只接触这一时刻的地图、前沿和活动轨迹副本；主线程继续发布旧轨迹。
         std::shared_ptr<CoverageSearchManager> planner(new CoverageSearchManager());
@@ -100,6 +107,8 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
         planner->max_vel_ = max_vel_;
         planner->max_acc_ = max_acc_;
         planner->max_yaw_rate_ = max_yaw_rate_;
+        planner->max_yaw_acc_ = max_yaw_acc_;
+        planner->replan_time_ = replan_time_;
         planner->goal_reach_dist_ = goal_reach_dist_;
         planner->sim_mode_ = sim_mode_;
         planner->cooperative_mode_ = cooperative_mode_;
@@ -110,6 +119,8 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
         planner->current_goal_ = current_goal_;
         planner->current_goal_yaw_ = current_goal_yaw_;
         planner->current_goal_task_id_ = current_goal_task_id_;
+        planner->active_goal_frontier_ = active_goal_frontier_;
+        planner->active_goal_frontier_valid_ = active_goal_frontier_valid_;
         planner->has_goal_ = has_goal_;
         planner->has_traj_ = has_traj_;
         planner->committed_heading_ = committed_heading_;
@@ -141,19 +152,21 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
         planner->traj_advance_dist_ = traj_advance_dist_;
         planner->traj_point_dwell_timeout_ = traj_point_dwell_timeout_;
         planner->traj_cut_clearance_ = traj_cut_clearance_;
-        planner->rolling_preplan_progress_ = rolling_preplan_progress_;
-        planner->rolling_handoff_goal_dist_ = rolling_handoff_goal_dist_;
+        planner->rolling_terminal_speed_ratio_ = rolling_terminal_speed_ratio_;
+        planner->rolling_terminal_acc_ratio_ = rolling_terminal_acc_ratio_;
         planner->rolling_prepare_in_progress_ = false;
         planner->rolling_snapshot_mode_ = true;
 
-        rolling_last_attempt_frontier_generation_ = frontier_generation;
+        rolling_last_attempt_time_ = now;
+        ++rolling_replan_count_;
         rolling_worker_running_ = true;
         const uint64_t source_generation = rolling_generation_;
         try {
             rolling_worker_ = std::thread([this, planner, source_generation,
-                                           frontier_generation]() {
-                planner->tryPrepareRollingHandoff();
+                                           frontier_generation, force_new_goal]() {
+                planner->tryPrepareRollingHandoff(force_new_goal);
                 PendingTrajectory result = std::move(planner->pending_traj_);
+                result.result_ready_time = ros::Time::now();
                 result.source_generation = source_generation;
                 result.frontier_generation = frontier_generation;
                 {
@@ -162,10 +175,12 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
                 }
                 rolling_worker_running_ = false;
             });
-            ROS_INFO("[CoverageSearch] Rolling monitor: progress=%.1f%%, frontier_generation=%llu, "
-                     "trajectory_generation=%llu.",
-                     100.0 * progress, (unsigned long long)frontier_generation,
-                     (unsigned long long)source_generation);
+            ROS_INFO("[CoverageSearch] Rolling replan #%llu: trigger=%s, remaining=%.2fs, "
+                     "frontier_generation=%llu.",
+                     (unsigned long long)rolling_replan_count_,
+                     force_new_goal ? "frontier-cleared" :
+                         (terminal_due ? "terminal" : "periodic"), remaining,
+                     (unsigned long long)frontier_generation);
         } catch (const std::exception &e) {
             rolling_worker_running_ = false;
             ROS_ERROR("[CoverageSearch] Failed to start rolling worker: %s", e.what());
@@ -179,52 +194,30 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
     }
 
     const int n = (int)traj_points_.size();
-    const double progress = std::max(0.0, std::min(1.0,
-        (ros::Time::now() - traj_start_time_).toSec() /
-        std::max(1e-3, active_time_spline_.duration)));
-    if (progress < rolling_preplan_progress_) return false;
-
-    // 在旧轨迹85%~95%窗口内，用De Boor解析值选择已经完成观测和偏航、
-    // 但仍保留非零速度的交接状态。
-    int handoff_idx = -1;
-    double handoff_time = -1.0;
+    const double elapsed = std::max(0.0, (ros::Time::now() - traj_start_time_).toSec());
+    const double handoff_time = elapsed + std::max(0.05, replan_time_);
+    if (handoff_time > active_time_spline_.duration) return false;
+    const int handoff_idx = std::min(n - 1, std::max(0, (int)std::lround(
+        handoff_time / std::max(1e-3, active_time_spline_.duration) * (n - 1))));
     Eigen::Vector3d handoff_pos, handoff_vel, handoff_acc;
     double handoff_yaw = 0.0, handoff_yaw_rate = 0.0, handoff_yaw_acc = 0.0;
-    double best_handoff_score = 1e9;
-    for (double fraction = 0.85; fraction <= 0.9501; fraction += 0.01) {
-        if (fraction <= progress + 0.02) continue;
-        const double t = fraction * active_time_spline_.duration;
-        Eigen::Vector3d p, v, a;
-        double yaw = 0.0, yaw_rate = 0.0, yaw_acc = 0.0;
-        if (!evaluateTimeBspline(active_time_spline_, t, p, v, a,
-                                 yaw, yaw_rate, yaw_acc)) continue;
-        const double goal_dist = (p.head<2>() - current_goal_.head<2>()).norm();
-        const double yaw_error = std::fabs(std::atan2(
-            std::sin(current_goal_yaw_ - yaw), std::cos(current_goal_yaw_ - yaw)));
-        const double speed = v.head<2>().norm();
-        if (goal_dist > rolling_handoff_goal_dist_ || yaw_error > 0.15 || speed < 0.10)
-            continue;
-        const double score = goal_dist + 0.5 * yaw_error - 0.05 * speed;
-        if (score < best_handoff_score) {
-            best_handoff_score = score;
-            handoff_time = t;
-            handoff_pos = p;
-            handoff_vel = v;
-            handoff_acc = a;
-            handoff_yaw = yaw;
-            handoff_yaw_rate = yaw_rate;
-            handoff_yaw_acc = yaw_acc;
-        }
-    }
-    if (handoff_time < 0.0) {
-        ROS_INFO_THROTTLE(2.0,
-            "[CoverageSearch] No De Boor handoff in 85%%~95%% satisfying observation, "
-            "yaw and nonzero-speed constraints; wait for terminal stop.");
+    if (!evaluateTimeBspline(active_time_spline_, handoff_time,
+                             handoff_pos, handoff_vel, handoff_acc,
+                             handoff_yaw, handoff_yaw_rate, handoff_yaw_acc)) {
+        ROS_WARN("[CoverageSearch] Cannot evaluate rolling handoff state.");
         return false;
     }
-    handoff_idx = std::min(n - 2, std::max(traj_idx_ + 1,
-        (int)std::lround(handoff_time / std::max(1e-3, traj_dt_))));
 
+    const FrontierFinder::FrontierCluster *active_frontier = nullptr;
+    if (!force_new_goal) {
+        for (const auto &frontier : frontier_finder_.frontiers_) {
+            if (frontierMatchesTask(frontier, active_goal_frontier_) &&
+                !frontier.viewpoints.empty()) {
+                active_frontier = &frontier;
+                break;
+            }
+        }
+    }
     const Eigen::Vector3d old_uav_pos = uav_pos_;
     const Eigen::Vector3d old_uav_vel = uav_vel_;
     const double old_uav_yaw = uav_yaw_;
@@ -270,42 +263,41 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
     planning_start_yaw_acc_ = handoff_yaw_acc;
 
     rolling_prepare_in_progress_ = true;
-    bool selected = selectNextFrontier();
-    int next_idx = -1;
-    if (selected) {
-        for (int i = 0; i < (int)frontier_targets_.size(); ++i) {
-            // 只排除数值上等同于旧目标的点；不再排除旧目标0.8m内的新视点。
-            if ((frontier_targets_[i].head<2>() - old_goal.head<2>()).norm() >= 0.10) {
-                next_idx = i;
-                break;
-            }
-        }
-    }
-
-    if (next_idx >= 0) {
-        current_goal_ = frontier_targets_[next_idx];
+    bool successor_selected = false;
+    if (active_frontier) {
+        current_goal_ = active_frontier->viewpoints.front();
         current_goal_(2) = fly_height_;
-        current_goal_yaw_ = frontier_target_yaws_[next_idx];
-        current_goal_task_id_ = frontier_target_task_ids_[next_idx];
-        has_goal_ = true;
-        if (planPathToGoal()) {
-            generateBsplineTraj();
-            if (has_traj_ && active_time_spline_.valid) {
-                prepared.ready = true;
-                prepared.handoff_idx = handoff_idx;
-                prepared.handoff_time = handoff_time;
-                prepared.goal = current_goal_;
-                prepared.goal_yaw = current_goal_yaw_;
-                prepared.task_id = current_goal_task_id_;
-                prepared.astar_path = astar_path_;
-                prepared.points = traj_points_;
-                prepared.vels = traj_vels_;
-                prepared.accs = traj_accs_;
-                prepared.yaws = traj_yaws_;
-                prepared.time_spline = active_time_spline_;
-            }
+        current_goal_yaw_ = active_frontier->viewpoint_yaws.empty()
+            ? handoff_yaw : active_frontier->viewpoint_yaws.front();
+        current_goal_task_id_ = active_goal_frontier_.task_id;
+        successor_selected = true;
+    } else if (force_new_goal && selectNextFrontier() && !frontier_targets_.empty()) {
+        current_goal_ = frontier_targets_.front();
+        current_goal_(2) = fly_height_;
+        current_goal_yaw_ = frontier_target_yaws_.front();
+        current_goal_task_id_ = frontier_target_task_ids_.front();
+        successor_selected = true;
+    }
+    has_goal_ = successor_selected;
+    astar2d_.setSearchTimeout(50.0);
+    if (successor_selected && planPathToGoal()) {
+        generateBsplineTraj();
+        if (has_traj_ && active_time_spline_.valid) {
+            prepared.ready = true;
+            prepared.handoff_idx = handoff_idx;
+            prepared.handoff_time = handoff_time;
+            prepared.goal = current_goal_;
+            prepared.goal_yaw = current_goal_yaw_;
+            prepared.task_id = current_goal_task_id_;
+            prepared.astar_path = astar_path_;
+            prepared.points = traj_points_;
+            prepared.vels = traj_vels_;
+            prepared.accs = traj_accs_;
+            prepared.yaws = traj_yaws_;
+            prepared.time_spline = active_time_spline_;
         }
     }
+    astar2d_.setSearchTimeout(250.0);
     rolling_prepare_in_progress_ = false;
 
     // 规划过程只允许写入待交接缓冲；旧轨迹以及真实状态继续作为活动状态。
@@ -352,8 +344,8 @@ bool CoverageSearchManager::tryPrepareRollingHandoff() {
     }
 
     pending_traj_ = std::move(prepared);
-    ROS_INFO("[CoverageSearch] Rolling trajectory ready: DeBoor handoff=%.2fs (%d/%d), "
-             "next_goal=(%.2f,%.2f), next_points=%zu, planning=%.1f ms.",
+    ROS_INFO("[CoverageSearch] Rolling trajectory ready: handoff=%.2fs (%d/%d), "
+             "goal=(%.2f,%.2f), next_points=%zu, planning=%.1f ms.",
              pending_traj_.handoff_time, pending_traj_.handoff_idx, n, pending_traj_.goal(0),
              pending_traj_.goal(1), pending_traj_.points.size(), planning_ms);
     return true;
@@ -443,16 +435,22 @@ bool CoverageSearchManager::selectNextFrontier() {
         frontier_target_task_ids_.clear();
 
         struct TargetCandidate {
+            FrontierFinder::FrontierCluster *frontier;
             Eigen::Vector3d pos;
             double yaw;
             double euclid_dist;
             uint64_t task_id;
+            Eigen::Vector3d backup_pos;
+            double backup_yaw;
+            bool has_backup;
+            bool local_reserved;
         };
 
         std::vector<TargetCandidate> candidates;
         int clusters_without_view = 0;
+        int skipped_peer_lease = 0;
+        int free_candidates = 0;
         int skipped_not_free = 0;
-        int reach_direct_failed = 0;
         int reach_astar_tried = 0;
         int reach_astar_failed = 0;
         int reach_astar_timeout = 0;
@@ -467,11 +465,16 @@ bool CoverageSearchManager::selectNextFrontier() {
                 continue;
             }
             const uint64_t lease_task_id = leasedTaskIdForFrontier(ftr);
-            if (lease_task_id == 0) continue;
+            const bool local_reserved = localReservationTaskIdForFrontier(ftr) != 0;
+            if (lease_task_id == 0 && isFrontierLeasedToPeer(ftr)) {
+                skipped_peer_lease++;
+                continue;
+            }
+            const bool is_free = lease_task_id == 0;
+            if (is_free) ++free_candidates;
 
-            // Each frontier cluster contributes exactly its best observation
-            // viewpoint.  The final target is selected locally from those
-            // leased cluster representatives using the current UAV state.
+            // 竞价和成本排序只使用最佳视点；次视点仅在该最佳视点规划失败时
+            // 作为同一前沿簇的立即备选。
             const Eigen::Vector3d &vp = ftr.viewpoints.front();
             const double dist = (uav_pos_.head<2>() - vp.head<2>()).norm();
 
@@ -490,7 +493,13 @@ bool CoverageSearchManager::selectNextFrontier() {
             }
 
             const double yaw = ftr.viewpoint_yaws.empty() ? uav_yaw_ : ftr.viewpoint_yaws.front();
-            candidates.push_back({vp, yaw, dist, lease_task_id});
+            const bool has_backup = ftr.viewpoints.size() > 1;
+            const Eigen::Vector3d &backup_vp = has_backup ? ftr.viewpoints[1] : vp;
+            const double backup_yaw = ftr.viewpoint_yaws.size() > 1
+                ? ftr.viewpoint_yaws[1] : yaw;
+            candidates.push_back({&ftr, vp, yaw, dist,
+                                  is_free ? frontierTaskId(ftr) : lease_task_id,
+                                  backup_vp, backup_yaw, has_backup, local_reserved});
 
         }
 
@@ -501,6 +510,7 @@ bool CoverageSearchManager::selectNextFrontier() {
             std::sort(candidates.begin(), candidates.end(), by_euclid);
 
             struct ReachableCandidate {
+                FrontierFinder::FrontierCluster *frontier;
                 Eigen::Vector3d pos;
                 double yaw;
                 uint64_t task_id;
@@ -509,6 +519,10 @@ bool CoverageSearchManager::selectNextFrontier() {
                 double path_time;
                 double direction_time;
                 double yaw_time;
+                Eigen::Vector3d backup_pos;
+                double backup_yaw;
+                bool has_backup;
+                bool local_reserved;
             };
             std::vector<ReachableCandidate> reachable;
             std::vector<Eigen::Vector3d> astar_attempted;
@@ -532,7 +546,6 @@ bool CoverageSearchManager::selectNextFrontier() {
                     bool reachable_direct = astar2d_.isPathTraversable(
                         uav_pos_, cand.pos, &path_len);
                     if (!reachable_direct) {
-                        reach_direct_failed++;
                         auto now = std::chrono::high_resolution_clock::now();
                         double elapsed_ms = std::chrono::duration<double, std::milli>(now - t0).count();
                         if (elapsed_ms > budget_ms) {
@@ -597,6 +610,7 @@ bool CoverageSearchManager::selectNextFrontier() {
                         cand.pos, cand.yaw, path_len, initial_path_dir,
                         &path_time, &direction_time, &yaw_time);
                     reachable.push_back({
+                        cand.frontier,
                         cand.pos,
                         cand.yaw,
                         cand.task_id,
@@ -604,7 +618,11 @@ bool CoverageSearchManager::selectNextFrontier() {
                         final_cost,
                         path_time,
                         direction_time,
-                        yaw_time
+                        yaw_time,
+                        cand.backup_pos,
+                        cand.backup_yaw,
+                        cand.has_backup,
+                        cand.local_reserved
                     });
                 }
                 astar2d_.setSearchTimeout(250.0);
@@ -613,29 +631,29 @@ bool CoverageSearchManager::selectNextFrontier() {
             auto evaluateCandidateSet = [&](const std::vector<TargetCandidate> &candidate_set) {
                 if (candidate_set.empty()) return;
                 const int primary_count = std::min((int)candidate_set.size(),
-                    rolling_prepare_in_progress_ ? 24 : 48);
+                    rolling_prepare_in_progress_ ? 12 : 48);
                 std::vector<TargetCandidate> primary_pool(candidate_set.begin(),
                                                           candidate_set.begin() + primary_count);
                 evaluatePool(primary_pool, primary_count,
-                    rolling_prepare_in_progress_ ? 8 : 16,
-                    rolling_prepare_in_progress_ ? 80.0 : 150.0,
-                    rolling_prepare_in_progress_ ? 650.0 : 1800.0);
+                    rolling_prepare_in_progress_ ? 3 : 16,
+                    rolling_prepare_in_progress_ ? 35.0 : 150.0,
+                    rolling_prepare_in_progress_ ? 100.0 : 1800.0);
 
                 if (reachable.empty()) {
                     ROS_WARN_THROTTLE(2.0,
                         "[CoverageSearch] Candidate A* checks found no reachable viewpoint; "
                         "retry up to 3 nearest candidates with 250 ms.");
-                    const int rescue_count = std::min((int)candidate_set.size(), 12);
+                    const int rescue_count = std::min((int)candidate_set.size(),
+                        rolling_prepare_in_progress_ ? 4 : 12);
                     evaluatePool(candidate_set, rescue_count,
-                        rolling_prepare_in_progress_ ? 2 : 3,
-                        rolling_prepare_in_progress_ ? 150.0 : 250.0,
-                        rolling_prepare_in_progress_ ? 350.0 : 800.0, true);
+                        rolling_prepare_in_progress_ ? 1 : 3,
+                        rolling_prepare_in_progress_ ? 35.0 : 250.0,
+                        rolling_prepare_in_progress_ ? 50.0 : 800.0, true);
                 }
             };
 
-            evaluateCandidateSet(candidates);
-
-            if (!reachable.empty()) {
+            auto collectVisibleTargets = [&]() {
+                if (reachable.empty()) return false;
                 std::sort(reachable.begin(), reachable.end(),
                           [](const ReachableCandidate &a, const ReachableCandidate &b) {
                               if (fabs(a.final_cost - b.final_cost) > 1e-3)
@@ -650,28 +668,74 @@ bool CoverageSearchManager::selectNextFrontier() {
                          reachable.front().yaw_time,
                          reachable.front().path_len);
 
-                const int target_num = std::min(10, (int)reachable.size());
-                for (int i = 0; i < target_num; ++i) {
-                    frontier_targets_.push_back(reachable[i].pos);
-                    frontier_target_yaws_.push_back(reachable[i].yaw);
-                    frontier_target_task_ids_.push_back(reachable[i].task_id);
+                int selected_clusters = 0;
+                for (const auto &candidate : reachable) {
+                    if (selected_clusters >= 5) break;
+                    auto &frontier = *candidate.frontier;
+                    const bool primary_visible = frontier_finder_.isViewpointVisible(
+                        frontier, candidate.pos, candidate.yaw);
+                    const bool backup_visible = candidate.has_backup &&
+                        frontier_finder_.isViewpointVisible(
+                            frontier, candidate.backup_pos, candidate.backup_yaw);
+
+                    if (!primary_visible && !backup_visible) {
+                        frontier_finder_.refreshViewpoints(frontier, uav_pos_);
+                        ROS_WARN_THROTTLE(1.0,
+                            "[CoverageSearch] Cached viewpoints are occluded; refreshed frontier viewpoints.");
+                        continue;
+                    }
+
+                    if (primary_visible) {
+                        frontier_targets_.push_back(candidate.pos);
+                        frontier_target_yaws_.push_back(candidate.yaw);
+                        frontier_target_task_ids_.push_back(candidate.task_id);
+                    }
+                    if (backup_visible) {
+                        frontier_targets_.push_back(candidate.backup_pos);
+                        frontier_target_yaws_.push_back(candidate.backup_yaw);
+                        frontier_target_task_ids_.push_back(candidate.task_id);
+                    }
+                    ++selected_clusters;
                 }
+                return !frontier_targets_.empty();
+            };
+
+            // A locally discovered frontier is a five-second local commitment,
+            // not merely a tie-breaker against ordinary own/FREE frontiers.
+            std::vector<TargetCandidate> local_reservation_candidates;
+            std::vector<TargetCandidate> ordinary_candidates;
+            for (const auto &candidate : candidates) {
+                (candidate.local_reserved ? local_reservation_candidates : ordinary_candidates)
+                    .push_back(candidate);
+            }
+
+            evaluateCandidateSet(local_reservation_candidates);
+            const bool local_target_ready = collectVisibleTargets();
+            if (!local_target_ready) {
+                reachable.clear();
+                evaluateCandidateSet(ordinary_candidates);
+                collectVisibleTargets();
             }
         }
 
         if (frontier_targets_.empty()) {
-            cout << YELLOW << "[CoverageSearch] Frontiers exist but no usable viewpoint. clusters="
+            cout << YELLOW << "[CoverageSearch] No local frontier target. clusters="
                  << ftr_count << ", no_view=" << clusters_without_view
-                 << ", not_free=" << skipped_not_free
-                 << ", reach_direct_failed=" << reach_direct_failed
-                 << ", astar_tried=" << reach_astar_tried
-                 << ", astar_failed=" << reach_astar_failed
-                 << ", astar_timeout=" << reach_astar_timeout
-                 << ", astar_no_path=" << reach_astar_no_path
-                 << ", astar_endpoint_blocked=" << reach_astar_endpoint_blocked
-                 << ", astar_unknown_rejected=" << reach_astar_unknown_rejected
-                 << ", astar_skipped=" << reach_astar_skipped
-                 << ", budget_break=" << reach_budget_break << TAIL << endl;
+                 << ", peer_held=" << skipped_peer_lease
+                 << ", free=" << free_candidates
+                 << ", not_free=" << skipped_not_free;
+            if (reach_astar_tried > 0) {
+                cout << ", astar=" << reach_astar_failed << "/" << reach_astar_tried;
+                if (reach_astar_timeout > 0) cout << ", timeout=" << reach_astar_timeout;
+                if (reach_astar_no_path > 0) cout << ", no_path=" << reach_astar_no_path;
+                if (reach_astar_endpoint_blocked > 0)
+                    cout << ", endpoint_blocked=" << reach_astar_endpoint_blocked;
+                if (reach_astar_unknown_rejected > 0)
+                    cout << ", unknown_rejected=" << reach_astar_unknown_rejected;
+            }
+            if (reach_astar_skipped > 0) cout << ", astar_skipped=" << reach_astar_skipped;
+            if (reach_budget_break > 0) cout << ", budget_limited=1";
+            cout << TAIL << endl;
             return false;
         }
 
@@ -705,17 +769,8 @@ bool CoverageSearchManager::selectNextFrontier() {
 bool CoverageSearchManager::planPathToGoal() {
     if (!has_goal_) return false;
 
-    // 先检查直线是否可通行
-    if (astar2d_.isPathTraversable(uav_pos_, current_goal_)) {
-        astar_path_.clear();
-        // ★ 必须同时包含起点和终点，这样Hermite插值才能生成完整的平滑轨迹
-        astar_path_.push_back(uav_pos_);
-        astar_path_.push_back(current_goal_);
-        astar_path_idx_ = 0;
-        return true;
-    }
-
-    // A*搜索
+    // 所有正常任务都经过带低净空代价的 A*，不能因一条仅满足硬阈值的
+    // 直线而贴墙飞行。直线段检查仍只用于执行期安全验证。
     bool found = astar2d_.search(uav_pos_, current_goal_, astar_path_);
     if (found && !astar_path_.empty()) {
         astar_path_idx_ = 0;
@@ -756,28 +811,10 @@ double CoverageSearchManager::computeFrontierCost(const Eigen::Vector3d &vp,
     return bottleneck;
 }
 
-// 视点净空按 0.55 -> 0.50 -> 0.45 -> 0.35 m 分层。主路径仍保持请求的
-// 高净空，只在目标附近平滑下降到该视点所属层级。
+// B样条轨迹与执行期统一使用 0.45m 硬安全距离；视点分层仅用于选点。
 double CoverageSearchManager::requiredTrajectoryClearance(
-    const Eigen::Vector3d &pos, double requested_clearance) {
-    const double requested = std::max(0.35, requested_clearance);
-    if (!has_goal_) return requested;
-
-    Eigen::Vector3i goal_idx;
-    coverage_map_.posToIndex(current_goal_, goal_idx);
-    if (!coverage_map_.isInMap2D(goal_idx(0), goal_idx(1))) return requested;
-    const double goal_clearance =
-        coverage_map_.getDistance2D(goal_idx(0), goal_idx(1));
-    double goal_tier = 0.35;
-    for (double tier : {0.55, 0.50, 0.45, 0.35}) {
-        if (goal_clearance + 1e-3 >= tier) {
-            goal_tier = tier;
-            break;
-        }
-    }
-    const double goal_dist =
-        (pos.head<2>() - current_goal_.head<2>()).norm();
-    return std::max(0.35, std::min(requested, goal_tier + 0.5 * goal_dist));
+    const Eigen::Vector3d &, double) {
+    return std::max(0.45, coverage_map_.esdf_safe_distance_);
 }
 
 // ★ 执行期把 raw free 和 ESDF clearance 都当作硬安全约束。
@@ -867,9 +904,15 @@ bool CoverageSearchManager::currentGoalUnsafe(std::string &reason) {
 }
 
 void CoverageSearchManager::abortCurrentGoalForSafety(const std::string &reason) {
-    cout << YELLOW << "[CoverageSearch] Cut current goal: " << reason
+    releaseCurrentGoal(reason, true, true);
+}
+
+void CoverageSearchManager::releaseCurrentGoal(const std::string &reason,
+                                               bool mark_failed,
+                                               bool count_as_replan) {
+    cout << YELLOW << "[CoverageSearch] Release current goal: " << reason
          << ". Select next frontier viewpoint." << TAIL << endl;
-    if (has_goal_) {
+    if (mark_failed && has_goal_) {
         failed_goal_ = current_goal_;
         failed_goal_time_ = ros::Time::now();
         has_failed_goal_ = true;
@@ -891,9 +934,17 @@ void CoverageSearchManager::abortCurrentGoalForSafety(const std::string &reason)
     frontier_target_yaws_.clear();
     frontier_target_task_ids_.clear();
     frontier_target_idx_ = 0;
+    eraseLocalReservation(current_goal_task_id_);
     current_goal_task_id_ = 0;
     same_goal_replan_count_ = 0;
-    replan_count_++;
+    active_goal_frontier_valid_ = false;
+    active_goal_frontier_covered_pending_ = false;
+    active_goal_frontier_cells_.clear();
+    active_goal_frontier_checked_generation_ = 0;
+    pending_traj_ = PendingTrajectory();
+    rolling_last_attempt_time_ = ros::Time(0);
+    ++rolling_generation_;
+    if (count_as_replan) ++replan_count_;
 }
 
 // ★ 失败目标短期排除：3s 内排除距 failed_goal_ 1.0m 以内的候选，避免反复选同一个不可达目标

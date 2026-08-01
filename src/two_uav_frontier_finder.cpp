@@ -14,7 +14,7 @@ void FrontierFinder::init(ros::NodeHandle &nh, CoverageMap *map) {
     nh.param("frontier_finder/down_sample", down_sample_, 1);
     nh.param("frontier_finder/min_candidate_dist", min_candidate_dist_, 0.0);
     nh.param("frontier_finder/min_visib_num", min_visib_num_, 3);
-    nh.param("frontier_finder/min_candidate_clearance", min_candidate_clearance_, 0.2);
+    nh.param("frontier_finder/min_candidate_clearance", min_candidate_clearance_, 0.45);
     nh.param("frontier_finder/min_candidate_occupied_clearance", min_candidate_occupied_clearance_, 0.55);
     nh.param("frontier_finder/min_viewpoint_frontier_dist", min_viewpoint_frontier_dist_, 0.55);
     nh.param("frontier_finder/min_frontier_height", min_frontier_height_, 0.25);
@@ -115,8 +115,10 @@ void FrontierFinder::searchResidualFrontiers(const Eigen::Vector3d &cur_pos) {
 void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
     Eigen::Vector3d update_min, update_max;
     std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> update_boxes;
+    std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> local_update_boxes;
     if (map_->getUpdatedBox(update_min, update_max, true)) {
         update_boxes.emplace_back(update_min, update_max);
+        local_update_boxes.emplace_back(update_min, update_max);
     }
     std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> remote_boxes;
     map_->getRemoteUpdatedBoxes(remote_boxes, true);
@@ -153,7 +155,9 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
     for (auto &ftr : frontiers_) {
         bool affected = false;
         for (const auto &box : merged_boxes) {
-            if (haveOverlap(ftr.box_min_, ftr.box_max_, box.first, box.second)) {
+            if (haveOverlap(ftr.box_min_, ftr.box_max_,
+                            box.first - Eigen::Vector3d::Constant(margin),
+                            box.second + Eigen::Vector3d::Constant(margin))) {
                 affected = true;
                 break;
             }
@@ -197,6 +201,14 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
                         ftr.cells = cluster_cells;
                         ftr.changed_generation = update_generation_;
                         computeFrontierInfo(ftr);
+                        for (const auto &local_box : local_update_boxes) {
+                            if (haveOverlap(ftr.box_min_, ftr.box_max_,
+                                            local_box.first - Eigen::Vector3d::Constant(margin),
+                                            local_box.second + Eigen::Vector3d::Constant(margin))) {
+                                ftr.local_discovery = true;
+                                break;
+                            }
+                        }
                         frontiers_.push_back(ftr);
                         ++new_count;
                     }
@@ -218,16 +230,24 @@ bool FrontierFinder::haveOverlap(const Eigen::Vector3d &min1, const Eigen::Vecto
 
 bool FrontierFinder::isFrontierChanged(const FrontierCluster &ftr) {
     if (ftr.cells.empty()) return true;
-    int changed = 0;
-    const int threshold = std::max(1, (int)ceil(0.15 * (double)ftr.cells.size()));
-    const int stride = std::max(1, (int)ftr.cells.size() / 180);
-    for (int i = 0; i < (int)ftr.cells.size(); i += stride) {
+    for (const auto &cell : ftr.cells) {
         Eigen::Vector3i idx;
-        map_->posToIndex(ftr.cells[i], idx);
-        if (!isFrontierCell(idx)) {
-            changed += stride;
-            if (changed >= threshold) return true;
-        }
+        map_->posToIndex(cell, idx);
+        if (!isFrontierCell(idx)) return true;
+    }
+    return false;
+}
+
+bool FrontierFinder::isFrontierCellsCovered(const std::vector<Eigen::Vector3d> &cells,
+                                            double changed_fraction) {
+    if (cells.empty()) return false;
+    const int threshold = std::max(1, static_cast<int>(std::ceil(
+        changed_fraction * static_cast<double>(cells.size()))));
+    int changed = 0;
+    for (const auto &cell : cells) {
+        Eigen::Vector3i idx;
+        map_->posToIndex(cell, idx);
+        if (!isFrontierCell(idx) && ++changed >= threshold) return true;
     }
     return false;
 }
@@ -389,6 +409,8 @@ void FrontierFinder::splitLargeFrontiers() {
         FrontierCluster f1, f2;
         f1.changed_generation = ftr.changed_generation;
         f2.changed_generation = ftr.changed_generation;
+        f1.local_discovery = ftr.local_discovery;
+        f2.local_discovery = ftr.local_discovery;
         for (auto &cell : ftr.cells) {
             if ((cell.head<2>() - ftr.average.head<2>()).dot(pc) >= 0)
                 f1.cells.push_back(cell);
@@ -436,6 +458,20 @@ void FrontierFinder::computeViewpoints(const Eigen::Vector3d &cur_pos) {
     }
 }
 
+bool FrontierFinder::isViewpointVisible(const FrontierCluster &ftr,
+                                        const Eigen::Vector3d &pos, double yaw) {
+    const auto &cells = ftr.filtered_cells.empty() ? ftr.cells : ftr.filtered_cells;
+    return countVisibleCells(pos, yaw, cells) >= min_visib_num_;
+}
+
+void FrontierFinder::refreshViewpoints(FrontierCluster &ftr,
+                                       const Eigen::Vector3d &cur_pos) {
+    ftr.viewpoints.clear();
+    ftr.viewpoint_yaws.clear();
+    ftr.viewpoint_visib_nums.clear();
+    sampleViewpoints(ftr, cur_pos);
+}
+
 void FrontierFinder::downsample(const std::vector<Eigen::Vector3d> &cluster_in,
                                 std::vector<Eigen::Vector3d> &cluster_out) {
     cluster_out.clear();
@@ -464,11 +500,11 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
     ftr.viewpoint_visib_nums.clear();
     ftr.visib_num = 0;
 
-    std::vector<Eigen::Vector3d> viewpoint_tiers[4];
-    std::vector<double> yaw_tiers[4];
-    std::vector<int> visib_tiers[4];
-    const double clearance_levels[4] = {
-        min_candidate_occupied_clearance_, 0.50, 0.45, 0.35};
+    std::vector<Eigen::Vector3d> viewpoint_tiers[3];
+    std::vector<double> yaw_tiers[3];
+    std::vector<int> visib_tiers[3];
+    const double clearance_levels[3] = {
+        min_candidate_occupied_clearance_, 0.50, 0.45};
     int reject_not_free = 0;
     int reject_occ = 0;
     int reject_unknown = 0;
@@ -507,8 +543,10 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
             return;
         }
 
-        bool near_unknown = isNearUnknown(sample_pos);
-        if (near_unknown) reject_unknown++;
+        if (isNearUnknown(sample_pos)) {
+            reject_unknown++;
+            return;
+        }
 
         double avg_yaw = averageYawToFrontier(sample_pos, cells);
         double center_yaw = atan2(sample_center(1) - sample_pos(1),
@@ -564,10 +602,8 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
         int unknown_gain = countVisibleUnknown(sample_pos, yaw);
         int view_score = visib + unknown_gain;
         ftr.visib_num = std::max(ftr.visib_num, view_score);
-        if (near_unknown) view_score = std::max(1, view_score - 1);
-
         int clearance_tier = -1;
-        for (int tier = 0; tier < 4; ++tier) {
+        for (int tier = 0; tier < 3; ++tier) {
             if (!isNearOccupied(sample_pos, clearance_levels[tier])) {
                 clearance_tier = tier;
                 break;
@@ -592,7 +628,7 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
     }
 
     bool have_any_viewpoint = false;
-    for (int tier = 0; tier < 4; ++tier)
+    for (int tier = 0; tier < 3; ++tier)
         have_any_viewpoint = have_any_viewpoint || !viewpoint_tiers[tier].empty();
     if (!have_any_viewpoint) {
         Eigen::Vector3d to_frontier = sample_center - cur_pos;
@@ -611,7 +647,7 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
     }
 
     int selected_tier = -1;
-    for (int tier = 0; tier < 4; ++tier) {
+    for (int tier = 0; tier < 3; ++tier) {
         if (!viewpoint_tiers[tier].empty()) {
             selected_tier = tier;
             break;
@@ -619,7 +655,7 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
     }
     if (selected_tier < 0) {
         ROS_DEBUG_THROTTLE(5.0,
-            "[FrontierFinder] No viewpoint at or above 0.35m clearance: "
+            "[FrontierFinder] No viewpoint at or above 0.45m clearance: "
             "cluster=(%.2f,%.2f), rejected=%d.",
             sample_center(0), sample_center(1), reject_occ);
         return;
@@ -640,12 +676,15 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
     std::sort(order.begin(), order.end(), [&](int a, int b) {
         return visib_nums[a] > visib_nums[b];
     });
-    const int best = order.front();
-    ROS_ASSERT_MSG(visib_nums[best] >= min_visib_num_,
-                   "Stored viewpoint must directly see its frontier cluster");
-    ftr.viewpoints.push_back(viewpoints[best]);
-    ftr.viewpoint_yaws.push_back(yaws[best]);
-    ftr.viewpoint_visib_nums.push_back(visib_nums[best]);
+    const int stored_num = std::min(2, (int)order.size());
+    for (int i = 0; i < stored_num; ++i) {
+        const int candidate = order[i];
+        ROS_ASSERT_MSG(visib_nums[candidate] >= min_visib_num_,
+                       "Stored viewpoint must directly see its frontier cluster");
+        ftr.viewpoints.push_back(viewpoints[candidate]);
+        ftr.viewpoint_yaws.push_back(yaws[candidate]);
+        ftr.viewpoint_visib_nums.push_back(visib_nums[candidate]);
+    }
 
     if (ftr.viewpoints.empty()) {
         ROS_DEBUG_THROTTLE(5.0,
@@ -659,7 +698,7 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
 }
 
 bool FrontierFinder::isNearUnknown(const Eigen::Vector3d &pos) {
-    const int vox_num = floor(min_candidate_clearance_ / map_->resolution_);
+    const int vox_num = ceil(min_candidate_clearance_ / map_->resolution_);
     for (int dx = -vox_num; dx <= vox_num; ++dx) {
         for (int dy = -vox_num; dy <= vox_num; ++dy) {
             for (int dz = -1; dz <= 1; ++dz) {
@@ -667,7 +706,8 @@ bool FrontierFinder::isNearUnknown(const Eigen::Vector3d &pos) {
                                                           dy * map_->resolution_,
                                                           dz * map_->resolution_);
                 if (!map_->isInMap(p)) continue;
-                if (map_->isUnknown(p)) return true;
+                if ((p - pos).norm() <= min_candidate_clearance_ + 1e-3 &&
+                    map_->isUnknown(p)) return true;
             }
         }
     }

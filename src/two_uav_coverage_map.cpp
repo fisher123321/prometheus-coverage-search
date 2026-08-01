@@ -67,14 +67,14 @@ void CoverageMap::init(ros::NodeHandle &nh) {
     nh.param("map/map_size_y", map_size_3d_(1), 30.0);
     nh.param("map/map_size_z", map_size_3d_(2), 3.0);
     nh.param("map/queue_size", queue_size_, 5);
-    nh.param("sensor/depth_min_range", depth_min_range_, 0.3);
-    nh.param("sensor/depth_max_range", depth_max_range_, 3.0);
+    nh.param("sensor/depth_min_range", depth_min_range_, 0.2);
+    nh.param("sensor/depth_max_range", depth_max_range_, 4.5);
     nh.param("sensor/depth_height_tolerance", depth_height_tolerance_, 0.6);
     nh.param("sensor/depth_ground_ignore_height", depth_ground_ignore_height_, 0.25);
     nh.param("coverage_search/sensing_fov_h", depth_fov_h_, 1.571);
     nh.param("coverage_search/sensing_fov_v", depth_fov_v_, 1.287);
     nh.param("map/esdf_max_distance", esdf_max_distance_, 6.0);
-    nh.param("map/esdf_safe_distance", esdf_safe_distance_, 0.35);
+    nh.param("map/esdf_safe_distance", esdf_safe_distance_, 0.45);
     nh.param("map/tsdf_trunc_dist", tsdf_trunc_dist_, 1.0);
     nh.param("map/robot_clear_radius", robot_clear_radius_, 0.22);
     nh.param("map/robot_clear_half_height", robot_clear_half_height_, 0.20);
@@ -88,6 +88,7 @@ void CoverageMap::init(ros::NodeHandle &nh) {
 
     int buf_size = grid_size_(0) * grid_size_(1) * grid_size_(2);
     occupancy_buffer_.resize(buf_size, 0);
+    observed_buffer_.resize(buf_size, 0);
     occupancy_evidence_buffer_.resize(buf_size, 0);
     remote_evidence_buffer_.resize(buf_size, 0);
     occupancy_update_stamp_.resize(buf_size, 0);
@@ -137,6 +138,12 @@ void CoverageMap::init(ros::NodeHandle &nh) {
 // ★ 新增：2D索引查询（使用缓存的z层索引，避免重复计算）
 bool CoverageMap::isOccupied2D(int x, int y) {
     if (!isInMap2D(x, y)) return true;
+    if (dynamic_peer_avoidance_valid_) {
+        Eigen::Vector3d p;
+        indexToPos(Eigen::Vector3i(x, y, min_z_idx_), p);
+        if ((p.head<2>() - dynamic_peer_avoidance_pos_.head<2>()).norm() <=
+            dynamic_peer_avoidance_radius_) return true;
+    }
     for (int z = min_z_idx_; z <= max_z_idx_; z++) {
         Eigen::Vector3i idx(x, y, z);
         int adr = toAddress(idx);
@@ -251,7 +258,7 @@ void CoverageMap::updateFromScanPcl(const sensor_msgs::PointCloud2ConstPtr &msg,
         points_in_map++;
 
         // 射线投射：从传感器位置到该点，标记经过的格子为free
-        raycastFree(sensor_pos, p3d);
+        raycastFree(sensor_pos, p3d, false, false);
 
         // 标记该点为占据
         integrateHit(p3d);
@@ -297,7 +304,7 @@ void CoverageMap::updateFromDepthPcl(const sensor_msgs::PointCloud2ConstPtr &msg
         if (!isInMap(p_world)) continue;
         used_points++;
 
-        raycastFree(ray_start, p_world);
+        raycastFree(ray_start, p_world, false, false);
         if (p_world(2) < depth_ground_ignore_height_) continue;
         integrateHit(p_world);
     }
@@ -390,6 +397,7 @@ bool CoverageMap::isInMap(const Eigen::Vector3d &pos) {
 
 bool CoverageMap::isOccupied(const Eigen::Vector3d &pos) {
     if (!isInMap(pos)) return true;
+    if (isInDynamicPeerAvoidance(pos)) return true;
     Eigen::Vector3i idx;
     posToIndex(pos, idx);
     return occupancy_buffer_[toAddress(idx)] == 2;
@@ -404,6 +412,7 @@ bool CoverageMap::isUnknown(const Eigen::Vector3d &pos) {
 
 bool CoverageMap::isFree(const Eigen::Vector3d &pos) {
     if (!isInMap(pos)) return false;
+    if (isInDynamicPeerAvoidance(pos)) return false;
     Eigen::Vector3i idx;
     posToIndex(pos, idx);
     return occupancy_buffer_[toAddress(idx)] == 1;
@@ -450,7 +459,8 @@ bool CoverageMap::setOccupancy(const Eigen::Vector3d &pos, uint8_t occ,
     Eigen::Vector3i idx;
     posToIndex(pos, idx);
     int adr = toAddress(idx);
-    occupancy_evidence_buffer_[adr] = occ == 2 ? 4 : -3;
+    observed_buffer_[adr] = 1;
+    occupancy_evidence_buffer_[adr] = occ == 2 ? 6 : -5;
     return updateOccupancyFromEvidence(idx, mark_local_update);
 }
 
@@ -459,11 +469,15 @@ bool CoverageMap::updateOccupancyFromEvidence(const Eigen::Vector3i &idx,
     if (!isInMapIndex(idx)) return false;
     int adr = toAddress(idx);
     uint8_t next = 0;
-    const int fused_evidence = std::max(-3, std::min(4,
+    const int fused_evidence = std::max(-5, std::min(6,
         static_cast<int>(occupancy_evidence_buffer_[adr]) +
         static_cast<int>(remote_evidence_buffer_[adr])));
-    if (fused_evidence >= 2) next = 2;
+    if (!observed_buffer_[adr]) next = 0;
+    else if (fused_evidence >= 2) next = 2;
     else if (fused_evidence <= -1) next = 1;
+    else if (occupancy_buffer_[adr] != 0) next = occupancy_buffer_[adr];
+    else next = fused_evidence > 0 ? 2 : 1;
+    ROS_ASSERT(!observed_buffer_[adr] || next != 0);
     if (next == occupancy_buffer_[adr]) return false;
     occupancy_buffer_[adr] = next;
     if (mark_local_update) {
@@ -480,7 +494,8 @@ int8_t CoverageMap::getLocalEvidence(int address) const {
 
 bool CoverageMap::setRemoteEvidence(int address, int8_t evidence) {
     if (address < 0 || address >= static_cast<int>(remote_evidence_buffer_.size())) return false;
-    evidence = std::max<int8_t>(-3, std::min<int8_t>(4, evidence));
+    evidence = std::max<int8_t>(-5, std::min<int8_t>(6, evidence));
+    if (evidence != 0) observed_buffer_[address] = 1;
     if (remote_evidence_buffer_[address] == evidence) return false;
     remote_evidence_buffer_[address] = evidence;
     const int yz = grid_size_(1) * grid_size_(2);
@@ -497,23 +512,28 @@ void CoverageMap::integrateHit(const Eigen::Vector3d &pos) {
     Eigen::Vector3i idx;
     posToIndex(pos, idx);
     int adr = toAddress(idx);
+    observed_buffer_[adr] = 1;
     unsigned int &stamp = occupancy_update_stamp_[adr];
     if (stamp == occupancy_update_epoch_ + 1) return;
     int increment = stamp == occupancy_update_epoch_ ? 2 : 1;
     stamp = occupancy_update_epoch_ + 1;
-    occupancy_evidence_buffer_[adr] = std::min<int>(
-        4, occupancy_evidence_buffer_[adr] + increment);
+    // traceRay() has already cleared only the cells before this endpoint.
+    // The first valid endpoint observation must therefore occupy this cell.
+    occupancy_evidence_buffer_[adr] = std::max(2, std::min(
+        6, static_cast<int>(occupancy_evidence_buffer_[adr]) + increment));
+    ROS_ASSERT(occupancy_evidence_buffer_[adr] >= 2);
     updateOccupancyFromEvidence(idx);
 }
 
 void CoverageMap::integrateMiss(const Eigen::Vector3i &idx) {
     if (!isInMapIndex(idx)) return;
     int adr = toAddress(idx);
+    observed_buffer_[adr] = 1;
     unsigned int &stamp = occupancy_update_stamp_[adr];
     if (stamp == occupancy_update_epoch_ || stamp == occupancy_update_epoch_ + 1) return;
     stamp = occupancy_update_epoch_;
     occupancy_evidence_buffer_[adr] = std::max<int>(
-        -3, occupancy_evidence_buffer_[adr] - 1);
+        -5, occupancy_evidence_buffer_[adr] - 1);
     updateOccupancyFromEvidence(idx);
 }
 
@@ -531,10 +551,25 @@ void CoverageMap::setDynamicPeerVolume(const Eigen::Vector3d &body_pos, bool act
     if (dynamic_peer_valid_) dynamic_peer_pos_ = body_pos;
 }
 
+void CoverageMap::setDynamicPeerAvoidance(const Eigen::Vector3d &body_pos, bool active,
+                                          double radius) {
+    dynamic_peer_avoidance_valid_ = active && radius > 0.0 && isInMap(body_pos);
+    if (dynamic_peer_avoidance_valid_) {
+        dynamic_peer_avoidance_pos_ = body_pos;
+        dynamic_peer_avoidance_radius_ = radius;
+    }
+}
+
 bool CoverageMap::isInDynamicPeerVolume(const Eigen::Vector3d &pos) const {
     if (!dynamic_peer_valid_) return false;
     return (pos.head<2>() - dynamic_peer_pos_.head<2>()).norm() <= peer_clear_radius_ &&
            std::fabs(pos(2) - dynamic_peer_pos_(2)) <= peer_clear_half_height_;
+}
+
+bool CoverageMap::isInDynamicPeerAvoidance(const Eigen::Vector3d &pos) const {
+    return dynamic_peer_avoidance_valid_ &&
+        (pos.head<2>() - dynamic_peer_avoidance_pos_.head<2>()).norm() <=
+            dynamic_peer_avoidance_radius_;
 }
 
 void CoverageMap::clearRobotVolume(const Eigen::Vector3d &body_pos) {
@@ -953,8 +988,8 @@ int CoverageMap::getFreeCount() {
 int CoverageMap::getTotalCount() { return grid_size_(0) * grid_size_(1); }
 
 void CoverageMap::raycastFree(const Eigen::Vector3d &start, const Eigen::Vector3d &end,
-                              bool include_end) {
-    traceRay(start, end, include_end, true);
+                              bool include_end, bool stop_at_occupied) {
+    traceRay(start, end, include_end, true, nullptr, false, stop_at_occupied);
 }
 
 bool CoverageMap::isRayOccluded(const Eigen::Vector3d &start,
@@ -971,7 +1006,8 @@ void CoverageMap::collectVisibleUnknown(const Eigen::Vector3d &start,
 bool CoverageMap::traceRay(const Eigen::Vector3d &start, const Eigen::Vector3d &end,
                            bool include_end, bool integrate_free,
                            std::set<int> *unknown_addresses,
-                           bool projected_occlusion) {
+                           bool projected_occlusion,
+                           bool stop_at_occupied) {
     if (!isInMap(start)) return true;
 
     Eigen::Vector3i cell, end_cell;
@@ -1000,12 +1036,10 @@ bool CoverageMap::traceRay(const Eigen::Vector3d &start, const Eigen::Vector3d &
         const int address = toAddress(idx);
         const bool occupied = occupancy_buffer_[address] == 2 ||
             (projected_occlusion && isOccupied2D(idx(0), idx(1)));
-        if (occupied) {
+        if (stop_at_occupied && occupied) {
             if (integrate_free) {
-                // ponytail: occupied is the single hard-occlusion rule shared by
-                // mapping and viewpoint gain; add decay only with stale-map evidence.
                 ROS_WARN_THROTTLE(2.0,
-                    "[CoverageMap] Occlusion guard stopped ray at occupied voxel "
+                    "[CoverageMap] Inferred ray stopped at occupied voxel "
                     "(%d,%d,%d), evidence=%d; cells behind it were ignored.",
                     idx(0), idx(1), idx(2),
                     (int)occupancy_evidence_buffer_[address]);

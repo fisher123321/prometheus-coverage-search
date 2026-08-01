@@ -5,13 +5,14 @@
 coverage_search:
   sim_mode: true
   fly_height: 1.0
-  sensing_range: 3.0
+  sensing_range: 4.5
   sensing_fov_h: 1.5708    # 90 degrees
   sensing_fov_v: 1.287     # ~74 degrees
-  max_vel: 1.0
-  max_acc: 0.8
-  max_yaw_rate: 1.8
-  replan_time: 3.0
+  max_vel: 1.5
+  max_acc: 1.0
+  max_yaw_rate: 1.3962634  # 80 deg/s
+  max_yaw_acc: 1.5707963  # 90 deg/s^2
+  replan_time: 0.25
   goal_reach_dist: 0.25
   auto_start: true
   map_input_source: 3      # 0=global pcl, 1=local pcl, 2=scan pcl, 3=D435i depth pcl
@@ -23,25 +24,24 @@ coverage_search:
   camera_offset_z: 0.0
   camera_pitch: 0.35
   fov_vis_range: 1.5
-  rolling_preplan_progress: 0.60
-  rolling_handoff_goal_dist: 0.60
+  rolling_terminal_speed_ratio: 0.10  # capped at 0.10 in code; lower for hardware tuning
+  rolling_terminal_acc_ratio: 0.10    # capped at 0.10 in code; lower for hardware tuning
   traj_step_size: 0.35
   traj_advance_dist: 0.35
-  traj_cut_clearance: 0.55
   completion_known_ratio: 0.99
   completion_no_frontier_dwell: 8.0
   residual_scan_yaw_rate: 0.6
 
 sensor:
-  depth_min_range: 0.3
-  depth_max_range: 3.0
+  depth_min_range: 0.2
+  depth_max_range: 4.5
   depth_height_tolerance: 0.6
   depth_ground_ignore_height: 0.15
 
 # ===== 地图参数 =====
 map:
   resolution: 0.2
-  esdf_safe_distance: 0.35
+  esdf_safe_distance: 0.45
   esdf_max_distance: 6.0
   robot_clear_radius: 0.22       # P450机体自清除半径，不包含安全膨胀区
   robot_clear_half_height: 0.20  # P450机体自清除半高度
@@ -65,7 +65,7 @@ frontier_finder:
   candidate_dphi: 0.262    # 视点采样角度步长(~15度)
   down_sample: 1
   min_visib_num: 3         # 最小可见前沿数
-  min_candidate_clearance: 0.12
+  min_candidate_clearance: 0.45
   min_candidate_occupied_clearance: 0.55
   min_viewpoint_frontier_dist: 0.55
   min_frontier_height: 0.30

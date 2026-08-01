@@ -18,6 +18,8 @@ find_package(catkin REQUIRED COMPONENTS
 )
 find_package(Eigen3 REQUIRED)
 find_package(PCL 1.7 REQUIRED)
+find_path(NLOPT_INCLUDE_DIR nlopt.hpp HINTS /usr/local/include /home/wjy/nlopt/build REQUIRED)
+find_library(NLOPT_LIBRARY nlopt HINTS /usr/local/lib /home/wjy/nlopt/build REQUIRED)
 
 add_message_files(FILES
   SwarmState.msg
@@ -48,6 +50,7 @@ include_directories(
   ${catkin_INCLUDE_DIRS}
   ${Eigen3_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
+  ${NLOPT_INCLUDE_DIR}
 )
 link_directories(${PCL_LIBRARY_DIRS})
 
@@ -63,7 +66,7 @@ add_library(two_uav_coverage_lib
   src/two_uav_coverage_search_trajectory.cpp
 )
 add_dependencies(two_uav_coverage_lib ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
-target_link_libraries(two_uav_coverage_lib ${PCL_LIBRARIES} ${catkin_LIBRARIES})
+target_link_libraries(two_uav_coverage_lib ${PCL_LIBRARIES} ${catkin_LIBRARIES} ${NLOPT_LIBRARY})
 
 add_executable(two_uav_coverage_search_node src/two_uav_coverage_search_node.cpp)
 add_dependencies(two_uav_coverage_search_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})

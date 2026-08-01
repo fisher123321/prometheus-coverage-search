@@ -13,6 +13,7 @@
 #include <set>
 #include <functional>
 #include <chrono>
+#include <cassert>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -27,6 +28,7 @@
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <std_msgs/UInt64MultiArray.h>
+#include <std_msgs/Bool.h>
 
 #include <prometheus_msgs/UAVCommand.h>
 #include <prometheus_msgs/UAVState.h>
@@ -69,8 +71,11 @@ public:
                             const Eigen::Matrix3d &R_wc);
     void clearRobotVolume(const Eigen::Vector3d &body_pos);
     void setDynamicPeerVolume(const Eigen::Vector3d &body_pos, bool active);
+    void setDynamicPeerAvoidance(const Eigen::Vector3d &body_pos, bool active,
+                                 double radius);
     void clearDynamicPeerVolume(const Eigen::Vector3d &body_pos);
     bool isInDynamicPeerVolume(const Eigen::Vector3d &pos) const;
+    bool isInDynamicPeerAvoidance(const Eigen::Vector3d &pos) const;
 
     // 栅格状态查询
     bool isInMap(const Eigen::Vector3d &pos);
@@ -135,6 +140,7 @@ public:
     bool map_ready_;
 
     std::vector<uint8_t> occupancy_buffer_;
+    std::vector<uint8_t> observed_buffer_;
     std::vector<int8_t> occupancy_evidence_buffer_;
     std::vector<float> esdf_buffer_;
     std::vector<float> tsdf_buffer_;
@@ -168,11 +174,12 @@ private:
                      bool mark_local_update);
     void pubMapTimerCb(const ros::TimerEvent &e);
     void raycastFree(const Eigen::Vector3d &start, const Eigen::Vector3d &end,
-                     bool include_end = false);
+                     bool include_end = false, bool stop_at_occupied = true);
     bool traceRay(const Eigen::Vector3d &start, const Eigen::Vector3d &end,
                   bool include_end, bool integrate_free,
                   std::set<int> *unknown_addresses = nullptr,
-                  bool projected_occlusion = false);
+                  bool projected_occlusion = false,
+                  bool stop_at_occupied = true);
     void raycastCameraFovFree(const Eigen::Vector3d &camera_pos,
                               const Eigen::Matrix3d &R_wc,
                               const pcl::PointCloud<pcl::PointXYZ> &real_points);
@@ -182,6 +189,9 @@ private:
     double peer_clear_radius_, peer_clear_half_height_;
     Eigen::Vector3d dynamic_peer_pos_ = Eigen::Vector3d::Zero();
     bool dynamic_peer_valid_ = false;
+    Eigen::Vector3d dynamic_peer_avoidance_pos_ = Eigen::Vector3d::Zero();
+    double dynamic_peer_avoidance_radius_ = 0.0;
+    bool dynamic_peer_avoidance_valid_ = false;
     unsigned int occupancy_update_epoch_ = 0;
     std::vector<unsigned int> occupancy_update_stamp_;
     std::vector<int8_t> remote_evidence_buffer_;
@@ -267,6 +277,8 @@ public:
                           std::vector<Eigen::Vector3d> &points,
                           std::vector<double> &yaws);
     void publishFrontiers();
+    bool isFrontierCellsCovered(const std::vector<Eigen::Vector3d> &cells,
+                                double changed_fraction);
 
     int cluster_min_;
     double cluster_size_xy_;
@@ -307,7 +319,12 @@ public:
         std::vector<int> viewpoint_visib_nums;
         int visib_num = 0;
         uint64_t changed_generation = 0;
+        bool local_discovery = false;
     };
+
+    bool isViewpointVisible(const FrontierCluster &ftr, const Eigen::Vector3d &pos,
+                            double yaw);
+    void refreshViewpoints(FrontierCluster &ftr, const Eigen::Vector3d &cur_pos);
 
     std::vector<FrontierCluster> frontiers_;
     uint64_t update_generation_ = 0;
@@ -406,10 +423,10 @@ private:
     ros::Subscriber uav_state_sub_, uav_control_state_sub_;
     ros::Subscriber global_pcl_sub_, local_pcl_sub_, scan_pcl_sub_, depth_pcl_sub_, goal_sub_;
     ros::Subscriber remote_chunk_sub_, map_request_sub_, remote_frontier_sub_, remote_state_sub_;
-    ros::Subscriber local_task_sub_, remote_task_sub_;
-    ros::Publisher uav_cmd_pub_, path_vis_pub_, fov_vis_pub_, coverage_status_pub_, uav_label_pub_;
+    ros::Subscriber local_task_sub_, remote_task_sub_, peer_collision_replan_sub_;
+    ros::Publisher uav_cmd_pub_, path_vis_pub_, fov_vis_pub_, coverage_status_pub_, uav_label_pub_, completion_ready_pub_;
     ros::Publisher swarm_frontier_pub_, swarm_bid_pub_, swarm_traj_pub_, map_chunk_pub_, map_request_pub_;
-    ros::Timer mainloop_timer_, frontier_timer_, swarm_data_timer_;
+    ros::Timer mainloop_timer_, trajectory_timer_, frontier_timer_, swarm_data_timer_;
 
     prometheus_msgs::UAVState uav_state_;
     prometheus_msgs::UAVControlState uav_control_state_;
@@ -422,11 +439,14 @@ private:
     ros::Time peer_state_received_;
     bool peer_state_valid_ = false;
     bool last_peer_clear_valid_ = false;
+    bool peer_collision_replan_requested_ = false;
+    ros::Time peer_avoidance_until_;
     int uav_id_;
     string uav_name_;
 
     double fly_height_, sensing_range_, sensing_fov_h_, sensing_fov_v_;
     double max_vel_, max_acc_, max_yaw_rate_, max_yaw_acc_, replan_time_, goal_reach_dist_;
+    double peer_avoidance_radius_ = 0.75, peer_avoidance_duration_ = 2.0;
     bool sim_mode_, auto_start_, cooperative_mode_, external_goal_only_;
     int global_coverage_source_;
     int map_input_source_;
@@ -522,13 +542,15 @@ private:
         TimeBspline time_spline;
         uint64_t source_generation = 0;
         uint64_t frontier_generation = 0;
+        ros::Time result_ready_time;
     } pending_traj_;
     bool rolling_prepare_in_progress_;
-    double rolling_preplan_progress_;
-    double rolling_handoff_goal_dist_;
+    double rolling_terminal_speed_ratio_ = 0.10;
+    double rolling_terminal_acc_ratio_ = 0.10;
     bool rolling_snapshot_mode_ = false;
     uint64_t rolling_generation_ = 0;
-    uint64_t rolling_last_attempt_frontier_generation_ = 0;
+    ros::Time rolling_last_attempt_time_;
+    uint64_t rolling_replan_count_ = 0;
     bool planning_start_state_valid_ = false;
     Eigen::Vector3d planning_start_acc_ = Eigen::Vector3d::Zero();
     double planning_start_yaw_rate_ = 0.0;
@@ -544,15 +566,28 @@ private:
     std::vector<uint64_t> frontier_target_task_ids_;
     int frontier_target_idx_;
     uint64_t current_goal_task_id_ = 0;
+    struct LocalFrontierReservation {
+        prometheus_two_uav_coverage_search::SwarmTask task;
+        bool active = false;
+    };
+    std::vector<LocalFrontierReservation> local_frontier_reservations_;
+    prometheus_two_uav_coverage_search::SwarmTask active_goal_frontier_;
+    std::vector<Eigen::Vector3d> active_goal_frontier_cells_;
+    bool active_goal_frontier_valid_ = false;
+    bool active_goal_frontier_covered_pending_ = false;
+    uint64_t active_goal_frontier_checked_generation_ = 0;
 
     ros::Time start_time_, finish_time_;
+    ros::Time coverage_25_time_, coverage_50_time_, coverage_75_time_;
     ros::Time traj_start_time_;  // 轨迹开始时间，用于超时检测
     ros::Time hover_wait_start_; // 悬停等待开始时间
     int replan_count_;
 
-    // ★ 严格完成：固定区域已知率达标，并且持续无前沿；否则原地旋转恢复观测
+    // ★ 严格完成：固定区域已知率达标、持续无前沿，并与对机达成完成共识。
     ros::Time last_frontier_found_time_;
     bool last_frontier_found_valid_;
+    bool completion_ready_ = false;
+    bool peer_completion_ready_ = false;
     double completion_known_ratio_;
     double completion_no_frontier_dwell_;
     double residual_scan_yaw_rate_;
@@ -563,7 +598,7 @@ private:
     double traj_step_size_;          // 轨迹点间距
     double traj_advance_dist_;       // 推进到下一点所需的距离阈值
     double traj_point_dwell_timeout_; // 单点最长停留时间
-    double traj_cut_clearance_;      // 执行期提前截断重规划的ESDF距离
+    double traj_cut_clearance_;      // 与 map/esdf_safe_distance 同步的执行期阈值
 
     // 卡住检测
     Eigen::Vector3d last_pos_;
@@ -585,14 +620,18 @@ private:
     void depthPclCb(const sensor_msgs::PointCloud2ConstPtr &msg);
     void goalCb(const geometry_msgs::PoseStampedConstPtr &msg);
     void remoteStateCb(const prometheus_two_uav_coverage_search::SwarmState::ConstPtr &msg);
+    void peerCollisionReplanCb(const std_msgs::Bool::ConstPtr &msg);
     void remoteChunkCb(const prometheus_two_uav_coverage_search::SwarmMapChunkConstPtr &msg);
     void remoteFrontierCb(const prometheus_two_uav_coverage_search::SwarmFrontierArrayConstPtr &msg);
     void swarmTaskCb(const prometheus_two_uav_coverage_search::SwarmTaskArrayConstPtr &msg);
     void mapRequestCb(const prometheus_two_uav_coverage_search::SwarmMapRequestConstPtr &msg);
 
     void mainloopCb(const ros::TimerEvent &e);
+    void trajectoryCb(const ros::TimerEvent &e);
     void frontierCb(const ros::TimerEvent &e);
     void updateFrontiers();
+    void updateLocalFrontierReservations();
+    void setCompletionReady(bool ready);
 
     // ★ 核心方法
     bool selectNextFrontier();       // 选择下一个前沿簇目标
@@ -615,6 +654,8 @@ private:
     bool buildTimeParameterizedSpline(const Eigen::Vector3d &start_acc,
                                       double start_yaw_rate,
                                       double start_yaw_acceleration);
+    bool optimizeTimeBspline2D(TimeBspline &spline, bool rolling,
+                               std::string &reason);
     // 三项统一为时间并取瓶颈最大值：路径、运动方向转向、偏航。
     double computeFrontierCost(const Eigen::Vector3d &vp, double vp_yaw,
                                double path_len,
@@ -629,9 +670,11 @@ private:
                              double min_clearance = -1.0);
     bool currentGoalUnsafe(std::string &reason);
     void abortCurrentGoalForSafety(const std::string &reason);
+    void releaseCurrentGoal(const std::string &reason, bool mark_failed,
+                            bool count_as_replan);
     // ★ 目标点前沿验证：目标点附近必须有unknown区域
     bool isNearFrontier(const Eigen::Vector3d &pos);
-    bool tryPrepareRollingHandoff();
+    bool tryPrepareRollingHandoff(bool force_new_goal = false);
     bool buildContinuousBridge(const Eigen::Vector3d &start_pos,
                                const Eigen::Vector3d &start_vel,
                                const Eigen::Vector3d &start_acc,
@@ -652,10 +695,20 @@ private:
                      prometheus_two_uav_coverage_search::SwarmMapChunk &msg);
     uint64_t frontierTaskId(const FrontierFinder::FrontierCluster &frontier);
     bool isFrontierLeasedToSelf(const FrontierFinder::FrontierCluster &frontier);
+    bool isFrontierLeasedToPeer(const FrontierFinder::FrontierCluster &frontier);
     uint64_t leasedTaskIdForFrontier(const FrontierFinder::FrontierCluster &frontier);
     bool frontierMatchesTask(const FrontierFinder::FrontierCluster &frontier,
                              const prometheus_two_uav_coverage_search::SwarmTask &task);
     bool currentGoalLeaseValid() const;
+    bool captureActiveGoalFrontier();
+    bool currentGoalFrontierCovered();
+    uint64_t localReservationTaskIdForFrontier(
+        const FrontierFinder::FrontierCluster &frontier);
+    bool reserveLocalFrontier(const FrontierFinder::FrontierCluster &frontier);
+    bool reserveLocalFrontierForGoal(uint64_t task_id, const Eigen::Vector3d &goal);
+    void markLocalReservationActive(uint64_t task_id);
+    bool hasActiveLocalReservation(uint64_t task_id) const;
+    void eraseLocalReservation(uint64_t task_id);
 
 };
 

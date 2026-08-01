@@ -7,3 +7,5 @@ geometry_msgs/Point box_min
 geometry_msgs/Point box_max
 geometry_msgs/Pose viewpoint
 float32 information_gain
+uint32 reservation_owner_uav_id
+time reservation_expire_time

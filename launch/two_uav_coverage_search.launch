@@ -24,21 +24,21 @@
         <param name="coverage_search/sim_mode" value="true"/>
         <!-- 无人机飞行高度(必须与uav_control起飞高度一致) -->
         <param name="coverage_search/fly_height" value="$(arg fly_height)"/>
-        <!-- 传感器感知范围(米) - D435i深度点云只信任0.3~3.0m -->
-        <param name="coverage_search/sensing_range" value="3.0"/>
+        <!-- 传感器感知范围(米) - 深度点云只信任0.2~4.5m -->
+        <param name="coverage_search/sensing_range" value="4.5"/>
         <!-- 传感器水平FOV(弧度) - D435i深度相机约90度 -->
         <param name="coverage_search/sensing_fov_h" value="1.571"/>
         <!-- 传感器垂直FOV(弧度) -->
         <param name="coverage_search/sensing_fov_v" value="1.287"/>
         <!-- 最大速度 -->
-        <param name="coverage_search/max_vel" value="1.0"/>
-        <param name="coverage_search/max_acc" value="0.8"/>
+        <param name="coverage_search/max_vel" value="1.5"/>
+        <param name="coverage_search/max_acc" value="1.0"/>
         <!-- 最大偏航角速率 -->
-        <param name="coverage_search/max_yaw_rate" value="1.8"/>
+        <param name="coverage_search/max_yaw_rate" value="1.3962634"/>
         <!-- 最大偏航角加速度，保证转向从起点到视点全程平滑完成 -->
-        <param name="coverage_search/max_yaw_acc" value="1.8"/>
-        <!-- 重规划间隔(秒) -->
-        <param name="coverage_search/replan_time" value="3.0"/>
+        <param name="coverage_search/max_yaw_acc" value="1.5707963"/>
+        <!-- 滚动重规划交接前瞻时间(秒) -->
+        <param name="coverage_search/replan_time" value="0.25"/>
         <!-- 目标到达判定距离(米) -->
         <param name="coverage_search/goal_reach_dist" value="0.25"/>
         <!-- 前方障碍物检测距离(米) -->
@@ -51,7 +51,6 @@
         <param name="coverage_search/traj_advance_dist" value="0.35"/>
         <!-- 单点最长停留超时(秒) - 卡住超过此值停车并从实测位置重规划 -->
         <param name="coverage_search/traj_point_dwell_timeout" value="3.0"/>
-        <param name="coverage_search/traj_cut_clearance" value="0.55"/>
         <!-- 严格完成：已知率达标且持续无前沿；不达标时原地旋转恢复残余观测 -->
         <param name="coverage_search/completion_known_ratio" value="$(arg completion_known_ratio)"/>
         <param name="coverage_search/completion_no_frontier_dwell" value="8.0"/>
@@ -61,9 +60,9 @@
         <param name="coverage_search/swarm_bid_period" value="2.0"/>
         <param name="coverage_search/swarm_bid_max_tasks" value="16"/>
         <param name="coverage_search/swarm_bid_max_astar" value="6"/>
-        <!-- 滚动规划：60%起监听新前沿版本；交接点由85%~95%的De Boor状态选择 -->
-        <param name="coverage_search/rolling_preplan_progress" value="0.60"/>
-        <param name="coverage_search/rolling_handoff_goal_dist" value="0.60"/>
+        <!-- 滚动重规划保持终端状态的速度、加速度上限 -->
+        <param name="coverage_search/rolling_terminal_speed_ratio" value="0.10"/>
+        <param name="coverage_search/rolling_terminal_acc_ratio" value="0.10"/>
         <!-- 自动开始 -->
         <param name="coverage_search/auto_start" value="$(arg auto_start)"/>
         <param name="coverage_search/cooperative_mode" value="$(arg cooperative_mode)"/>
@@ -73,6 +72,8 @@
         <param name="coverage_search/swarm_chunk_size" value="2.0"/>
         <param name="coverage_search/swarm_chunk_delta_period" value="0.5"/>
         <param name="coverage_search/peer_state_timeout" value="0.6"/>
+        <param name="coverage_search/peer_avoidance_radius" value="0.75"/>
+        <param name="coverage_search/peer_avoidance_duration" value="2.0"/>
         <param name="coverage_search/swarm_tx_prefix" value="$(arg swarm_tx_prefix)"/>
         <param name="coverage_search/swarm_rx_prefix" value="$(arg swarm_rx_prefix)"/>
         <!-- 地图输入源: 0=全局点云, 1=局部点云, 2=激光雷达点云, 3=D435i深度点云 -->
@@ -87,16 +88,16 @@
         <param name="coverage_search/camera_pitch" value="0.35"/>
         <param name="coverage_search/fov_vis_range" value="1.5"/>
 
-        <param name="sensor/depth_min_range" value="0.3"/>
-        <param name="sensor/depth_max_range" value="3.0"/>
+        <param name="sensor/depth_min_range" value="0.2"/>
+        <param name="sensor/depth_max_range" value="4.5"/>
         <param name="sensor/depth_height_tolerance" value="0.6"/>
         <param name="sensor/depth_ground_ignore_height" value="0.15"/>
 
         <!-- 地图参数 -->
         <param name="map/resolution" value="0.2"/>
-        <param name="map/esdf_safe_distance" value="0.35"/>
+        <param name="map/esdf_safe_distance" value="0.45"/>
         <param name="map/esdf_max_distance" value="6.0"/>
-        <!-- 仅清除P450真实机体体积内的自反射/旧噪点，不清除0.35m安全区 -->
+        <!-- 仅清除P450真实机体体积内的自反射/旧噪点，不清除0.45m安全区 -->
         <param name="map/robot_clear_radius" value="0.22"/>
         <param name="map/robot_clear_half_height" value="0.20"/>
         <!-- 对方机体是动态目标：不写入静态地图，也不在其周围生成前沿。 -->
@@ -122,7 +123,7 @@
         <param name="frontier_finder/candidate_dphi" value="0.262"/>
         <param name="frontier_finder/down_sample" value="1"/>
         <param name="frontier_finder/min_visib_num" value="3"/>
-        <param name="frontier_finder/min_candidate_clearance" value="0.12"/>
+        <param name="frontier_finder/min_candidate_clearance" value="0.45"/>
         <param name="frontier_finder/min_candidate_occupied_clearance" value="0.55"/>
         <param name="frontier_finder/min_viewpoint_frontier_dist" value="0.55"/>
         <param name="frontier_finder/min_frontier_height" value="0.30"/>

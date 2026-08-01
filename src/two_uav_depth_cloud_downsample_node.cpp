@@ -19,7 +19,7 @@ public:
         nh.param<std::string>("octomap_output_topic", octomap_output_topic_, "");
         nh.param("leaf_size", leaf_size_, 0.10);
         nh.param("min_range", min_range_, 0.2);
-        nh.param("max_range", max_range_, 3.2);
+        nh.param("max_range", max_range_, 4.5);
         nh.param("max_rate", max_rate_, 10.0);
         nh.param("add_fov_clear_points", add_fov_clear_points_, false);
         nh.param("fov_h", fov_h_, 1.5708);
