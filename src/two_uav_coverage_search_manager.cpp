@@ -6,6 +6,8 @@
 #include <tf2_ros/transform_listener.h>
 
 CoverageSearchManager::~CoverageSearchManager() {
+    trajectory_timer_.stop();
+    if (trajectory_spinner_) trajectory_spinner_->stop();
     if (rolling_worker_.joinable()) rolling_worker_.join();
 }
 
@@ -53,7 +55,6 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     nh.param("coverage_search/traj_advance_dist", traj_advance_dist_, 0.3);
     nh.param("coverage_search/traj_point_dwell_timeout", traj_point_dwell_timeout_, 5.0);
     nh.param("coverage_search/completion_known_ratio", completion_known_ratio_, 0.99);
-    nh.param("coverage_search/completion_no_frontier_dwell", completion_no_frontier_dwell_, 8.0);
     nh.param("coverage_search/residual_scan_yaw_rate", residual_scan_yaw_rate_, 0.6);
     nh.param("coverage_search/swarm_bid_period", swarm_bid_period_, 2.0);
     nh.param("coverage_search/swarm_bid_max_tasks", swarm_bid_max_tasks_, 16);
@@ -154,8 +155,13 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     }
 
     mainloop_timer_ = nh.createTimer(ros::Duration(0.1), &CoverageSearchManager::mainloopCb, this);
-    trajectory_timer_ = nh.createTimer(ros::Duration(0.01), &CoverageSearchManager::trajectoryCb, this);
-    frontier_timer_ = nh.createTimer(ros::Duration(0.8), &CoverageSearchManager::frontierCb, this);
+    trajectory_nh_.reset(new ros::NodeHandle(nh));
+    trajectory_nh_->setCallbackQueue(&trajectory_callback_queue_);
+    trajectory_timer_ = trajectory_nh_->createTimer(
+        ros::Duration(0.01), &CoverageSearchManager::trajectoryCb, this);
+    trajectory_spinner_.reset(new ros::AsyncSpinner(1, &trajectory_callback_queue_));
+    trajectory_spinner_->start();
+    frontier_timer_ = nh.createTimer(ros::Duration(0.3), &CoverageSearchManager::frontierCb, this);
 
     exec_state_ = EXEC_STATE::INIT;
     odom_ready_ = false; drone_ready_ = false; sensor_ready_ = false;
@@ -187,8 +193,6 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     active_goal_frontier_checked_generation_ = 0;
     rolling_worker_running_ = false;
     traj_point_reach_time_ = ros::Time::now();
-    last_frontier_found_time_ = ros::Time::now();
-    last_frontier_found_valid_ = false;
     completion_ready_ = false;
     peer_completion_ready_ = false;
     completion_ready_pub_.publish(std_msgs::Bool());
@@ -203,6 +207,7 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
 }
 
 void CoverageSearchManager::uavStateCb(const prometheus_msgs::UAVState::ConstPtr &msg) {
+    std::lock_guard<std::mutex> lock(vehicle_state_mutex_);
     uav_state_ = *msg;
     if (uav_state_.connected && uav_state_.armed) drone_ready_ = true;
     else drone_ready_ = false;
@@ -359,19 +364,12 @@ void CoverageSearchManager::frontierCb(const ros::TimerEvent &e) {
 }
 
 void CoverageSearchManager::trajectoryCb(const ros::TimerEvent &) {
-    if (exec_state_ == EXEC_STATE::EXPLORING && has_traj_) executeTrajectory();
-    static ros::Time last_publish;
-    if (cooperative_mode_ && (last_publish.isZero() ||
-        (ros::Time::now() - last_publish).toSec() >= 0.1)) {
-        publishSwarmTrajectory();
-        last_publish = ros::Time::now();
-    }
+    executeRealtimeTrajectory();
 }
 
 void CoverageSearchManager::updateFrontiers() {
     if (!sensor_ready_ || !coverage_map_.map_ready_) return;
 
-    auto t0 = std::chrono::high_resolution_clock::now();
     coverage_map_.updateDistanceFields();
     frontier_finder_.searchFrontiers(uav_pos_);
     updateLocalFrontierReservations();
@@ -383,12 +381,6 @@ void CoverageSearchManager::updateFrontiers() {
         hierarchical_grid_.updateFromMap();
     }
     hierarchical_grid_.inputFrontiers(frontier_avgs);
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    if (ms > 120.0) {
-        ROS_WARN_THROTTLE(2.0, "[CoverageSearch] frontier AABB update took %.1f ms, frontiers=%d",
-                          ms, frontier_finder_.getFrontierCount());
-    }
 }
 
 void CoverageSearchManager::updateLocalFrontierReservations() {
@@ -1078,6 +1070,19 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
         return;
     }
 
+    if (consumeRealtimeTrajectoryCompletion()) {
+        has_traj_ = false;
+        has_goal_ = false;
+        pending_traj_ = PendingTrajectory();
+        ROS_INFO("[CoverageSearch] Trajectory terminal P/V/A hold converged; select next frontier.");
+    }
+    if (has_traj_) {
+        maintainActiveTrajectory();
+    } else {
+        disarmRealtimeTrajectory();
+    }
+    if (cooperative_mode_) publishSwarmTrajectory();
+
     // 机体真实占据的体积不可能同时是静态障碍；清除自反射/旧深度噪点，
     // 但不清除外部0.35m安全膨胀区。
     coverage_map_.clearRobotVolume(Eigen::Vector3d(
@@ -1141,6 +1146,51 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
     case EXEC_STATE::EXPLORING: {
         // ★★★ 核心循环：前沿簇驱动探索 ★★★
         // 简化逻辑：轨迹执行 → 完成 → 重新搜索前沿 → 选目标 → 规划 → 执行
+        const double coverage = coverage_map_.getKnownSpaceRatio();
+        const auto finish_if_complete = [&]() {
+            if (coverage <= completion_known_ratio_ || !frontier_targets_.empty()) {
+                return false;
+            }
+            setCompletionReady(true);
+            // Freeze statistics at the first successful completion condition,
+            // even if cooperative shutdown is still waiting for the peer.
+            if (finish_time_.isZero()) finish_time_ = ros::Time::now();
+            const bool peer_ready = peer_fresh && peer_completion_ready_;
+            has_traj_ = false;
+            has_goal_ = false;
+            pending_traj_ = PendingTrajectory();
+            disarmRealtimeTrajectory();
+            if (!cooperative_mode_ || peer_ready) {
+                exec_state_ = EXEC_STATE::FINISH;
+                const double total = start_time_.isZero() ? 0.0 :
+                    (finish_time_ - start_time_).toSec();
+                const auto stage_time = [&](const ros::Time &stamp) {
+                    return stamp.isZero() || start_time_.isZero() ? -1.0 :
+                        (stamp - start_time_).toSec();
+                };
+                cout << GREEN << "[CoverageSearch] FINISHED: coverage="
+                     << coverage * 100.0 << "%, total=" << total
+                     << "s, T25=" << stage_time(coverage_25_time_)
+                     << "s, T50=" << stage_time(coverage_50_time_)
+                     << "s, T75=" << stage_time(coverage_75_time_) << "s"
+                     << TAIL << endl;
+            } else {
+                uav_command_.header.stamp = ros::Time::now();
+                uav_command_.Agent_CMD = prometheus_msgs::UAVCommand::Move;
+                uav_command_.Move_mode = prometheus_msgs::UAVCommand::XYZ_POS;
+                uav_command_.position_ref[0] = uav_pos_(0);
+                uav_command_.position_ref[1] = uav_pos_(1);
+                uav_command_.position_ref[2] = fly_height_;
+                uav_command_.yaw_ref = uav_yaw_;
+                uav_command_.Command_ID++;
+                uav_cmd_pub_.publish(uav_command_);
+                ROS_INFO_THROTTLE(2.0,
+                    "[CoverageSearch] Coverage %.2f%% > 99%%; waiting for peer completion.",
+                    coverage * 100.0);
+            }
+            return true;
+        };
+        setCompletionReady(false);
 
         // 安全保护
         if (replan_count_ > 100) {
@@ -1155,7 +1205,6 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
             current_goal_task_id_ = 0;
             frontier_target_idx_ = 0;
             replan_count_ = 0;
-            last_frontier_found_valid_ = false;
         }
 
         if (peer_collision_replan_requested_) {
@@ -1164,6 +1213,7 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
                 ++rolling_generation_;  // Invalidate a successor made before the peer became blocked.
                 pending_traj_ = PendingTrajectory();
                 has_traj_ = false;
+                disarmRealtimeTrajectory();
                 ROS_WARN("[CoverageSearch] Peer trajectory conflict: replan current goal with peer exclusion %.2fm.",
                          peer_avoidance_radius_);
             }
@@ -1262,6 +1312,7 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
             ROS_WARN_THROTTLE(2.0, "[CoverageSearch] target selection took %.1f ms, frontiers=%d",
                               select_ms, frontier_finder_.getFrontierCount());
         }
+        if (!selected_frontier && finish_if_complete()) break;
         if (!selected_frontier) {
             int current_frontiers = frontier_finder_.getFrontierCount();
             if (current_frontiers > 0) {
@@ -1321,58 +1372,25 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
                 break;
             }
 
-            // 没有前沿：持续旋转补观测。只有固定区域已知率达标且稳定无前沿才完成。
-            if (!last_frontier_found_valid_) {
-                last_frontier_found_time_ = ros::Time::now();
-                last_frontier_found_valid_ = true;
-                residual_scan_yaw_ = uav_yaw_;
-            }
-            double no_ftr_elapsed = (ros::Time::now() - last_frontier_found_time_).toSec();
-            double known_ratio = coverage_map_.getKnownSpaceRatio();
-
-            if (known_ratio >= completion_known_ratio_ &&
-                no_ftr_elapsed >= completion_no_frontier_dwell_) {
-                if (!completion_ready_) {
-                    setCompletionReady(true);
-                    cout << GREEN << "[CoverageSearch] Local completion ready: Known "
-                         << known_ratio * 100.0 << "%, no-frontier "
-                         << no_ftr_elapsed << "s. Waiting for peer." << TAIL << endl;
-                }
-                const bool peer_ready = peer_fresh && peer_completion_ready_;
-                if (!cooperative_mode_ || peer_ready) {
-                    assert(!cooperative_mode_ || (completion_ready_ && peer_ready));
-                    exec_state_ = EXEC_STATE::FINISH;
-                    finish_time_ = ros::Time::now();
-                    double duration = (finish_time_ - start_time_).toSec();
-                    cout << GREEN << "[CoverageSearch] CONSENSUS FINISHED! Duration: " << duration
-                         << "s, Known: " << known_ratio * 100.0
-                         << "%" << TAIL << endl;
-                }
-            } else {
-                setCompletionReady(false);
-                residual_scan_yaw_ = atan2(
-                    sin(residual_scan_yaw_ + residual_scan_yaw_rate_ * 0.1),
-                    cos(residual_scan_yaw_ + residual_scan_yaw_rate_ * 0.1));
-                uav_command_.header.stamp = ros::Time::now();
-                uav_command_.Agent_CMD = prometheus_msgs::UAVCommand::Move;
-                uav_command_.Move_mode = prometheus_msgs::UAVCommand::XYZ_POS;
-                uav_command_.position_ref[0] = uav_pos_(0);
-                uav_command_.position_ref[1] = uav_pos_(1);
-                uav_command_.position_ref[2] = fly_height_;
-                uav_command_.yaw_ref = residual_scan_yaw_;
-                uav_command_.Command_ID++;
-                uav_cmd_pub_.publish(uav_command_);
-                ROS_WARN_THROTTLE(2.0,
-                    "[CoverageSearch] Residual recovery scan: known=%.2f%%/%.2f%%, "
-                    "no-frontier=%.1fs/%.1fs.",
-                    known_ratio * 100.0, completion_known_ratio_ * 100.0,
-                    no_ftr_elapsed, completion_no_frontier_dwell_);
-            }
+            // No frontier and coverage is still at or below 99%: keep observing.
+            residual_scan_yaw_ = std::atan2(
+                std::sin(residual_scan_yaw_ + residual_scan_yaw_rate_ * 0.1),
+                std::cos(residual_scan_yaw_ + residual_scan_yaw_rate_ * 0.1));
+            uav_command_.header.stamp = ros::Time::now();
+            uav_command_.Agent_CMD = prometheus_msgs::UAVCommand::Move;
+            uav_command_.Move_mode = prometheus_msgs::UAVCommand::XYZ_POS;
+            uav_command_.position_ref[0] = uav_pos_(0);
+            uav_command_.position_ref[1] = uav_pos_(1);
+            uav_command_.position_ref[2] = fly_height_;
+            uav_command_.yaw_ref = residual_scan_yaw_;
+            uav_command_.Command_ID++;
+            uav_cmd_pub_.publish(uav_command_);
+            ROS_WARN_THROTTLE(2.0,
+                "[CoverageSearch] Residual recovery scan: coverage=%.2f%%, completion > %.2f%%.",
+                coverage * 100.0, completion_known_ratio_ * 100.0);
             break;
         }
-        // ★ 选到了前沿，重置无前沿计时
-        setCompletionReady(false);
-        last_frontier_found_valid_ = false;
+        // Coverage has not reached 99%, so keep normal frontier planning.
 
         // 3. 选到了前沿目标，逐个尝试规划，直到成功
         while (frontier_target_idx_ < (int)frontier_targets_.size()) {
@@ -1656,7 +1674,7 @@ void CoverageSearchManager::publishCoverageStatus() {
     if (coverage >= 0.50 && coverage_50_time_.isZero()) coverage_50_time_ = now;
     if (coverage >= 0.75 && coverage_75_time_.isZero()) coverage_75_time_ = now;
     const ros::Time end_time = finish_time_.isZero() ? now : finish_time_;
-    double duration = (end_time - start_time_).toSec();
+    const double duration = (end_time - start_time_).toSec();
     int frontier_count = frontier_finder_.getFrontierCount();
 
     static int print_cnt = 0;

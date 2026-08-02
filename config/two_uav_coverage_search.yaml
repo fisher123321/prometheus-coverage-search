@@ -29,7 +29,6 @@ coverage_search:
   traj_step_size: 0.35
   traj_advance_dist: 0.35
   completion_known_ratio: 0.99
-  completion_no_frontier_dwell: 8.0
   residual_scan_yaw_rate: 0.6
 
 sensor:
@@ -58,16 +57,9 @@ map:
 frontier_finder:
   cluster_min: 5           # 最小前沿簇体素数
   cluster_size_xy: 2.5     # 最大前沿簇尺寸
-  min_candidate_dist: 1.0
-  candidate_rmin: 1.2      # 视点采样最小半径
-  candidate_rmax: 1.6      # 视点采样最大半径
-  candidate_rnum: 4
-  candidate_dphi: 0.262    # 视点采样角度步长(~15度)
-  down_sample: 1
-  min_visib_num: 3         # 最小可见前沿数
-  min_candidate_clearance: 0.45
-  min_candidate_occupied_clearance: 0.55
-  min_viewpoint_frontier_dist: 0.55
+  candidate_radius: 1.4    # 固定环形候选半径；每簇固定36个候选
+  candidate_clearance: 0.45 # 三维ESDF到占据体素的最小净空
+  down_sample: 2           # 视点代表前沿的降采样倍率
   min_frontier_height: 0.30
   max_frontier_height: 1.85
   max_frontier_above_flight: 0.35

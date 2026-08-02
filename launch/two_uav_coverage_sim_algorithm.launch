@@ -32,7 +32,7 @@
     <param name="temporal_hit_confirmation" value="true"/><param name="temporal_hit_voxel" value="0.10"/><param name="temporal_hit_min_frames" value="3"/>
     <param name="max_mapping_angular_rate" value="0.60"/>
   </node>
-  <node pkg="octomap_server" type="octomap_server_node" name="octomap_server_uav1" output="screen">
+  <node pkg="prometheus_two_uav_coverage_search" type="two_uav_octomap_server_node" name="octomap_server_uav1" output="screen">
     <remap from="/octomap_point_cloud_centers" to="/uav$(arg uav1_id)/octomap_point_cloud_centers"/><remap from="/octomap_full" to="/uav$(arg uav1_id)/octomap_full"/><remap from="/octomap_binary" to="/uav$(arg uav1_id)/octomap_binary"/><remap from="/projected_map" to="/uav$(arg uav1_id)/projected_map"/>
     <remap from="cloud_in" to="/uav$(arg uav1_id)/camera/depth/color/points_octomap"/>
     <param name="resolution" value="0.1"/><param name="frame_id" value="world"/><param name="base_frame_id" value="world"/><param name="sensor_model/max_range" value="4.5"/>
@@ -44,7 +44,7 @@
     <param name="pointcloud_min_z" value="0.20"/><param name="pointcloud_max_z" value="2.8"/>
     <param name="occupancy_min_z" value="0.20"/><param name="filter_ground" value="false"/><param name="filter_speckles" value="true"/>
   </node>
-  <node pkg="octomap_server" type="octomap_server_node" name="octomap_server_uav2" output="screen">
+  <node pkg="prometheus_two_uav_coverage_search" type="two_uav_octomap_server_node" name="octomap_server_uav2" output="screen">
     <remap from="/octomap_point_cloud_centers" to="/uav$(arg uav2_id)/octomap_point_cloud_centers"/><remap from="/octomap_full" to="/uav$(arg uav2_id)/octomap_full"/><remap from="/octomap_binary" to="/uav$(arg uav2_id)/octomap_binary"/><remap from="/projected_map" to="/uav$(arg uav2_id)/projected_map"/>
     <remap from="cloud_in" to="/uav$(arg uav2_id)/camera/depth/color/points_octomap"/>
     <param name="resolution" value="0.1"/><param name="frame_id" value="world"/><param name="base_frame_id" value="world"/><param name="sensor_model/max_range" value="4.5"/>
