@@ -398,15 +398,11 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
     const Eigen::Vector3d start_pos = traj_points_.front();
     Eigen::Vector3d start_vel = uav_vel_;
     Eigen::Vector3d desired_start_acc = start_acc;
-    Eigen::Vector3d terminal_tangent = sampleGuide(total_length) -
-        sampleGuide(std::max(0.0, total_length - std::min(0.50, total_length)));
-    terminal_tangent(2) = 0.0;
-    if (terminal_tangent.norm() > 1e-3) terminal_tangent.normalize();
-    else terminal_tangent.setZero();
-    const double terminal_speed_ratio = std::max(0.0, std::min(0.10, rolling_terminal_speed_ratio_));
-    const double terminal_acc_ratio = std::max(0.0, std::min(0.10, rolling_terminal_acc_ratio_));
-    const Eigen::Vector3d terminal_vel = terminal_speed_ratio * max_vel_ * terminal_tangent;
-    const Eigen::Vector3d terminal_acc = terminal_acc_ratio * max_acc_ * terminal_tangent;
+    // Only a true trajectory endpoint is rest-to-rest.  Rolling handoffs use
+    // their sampled in-trajectory state below and therefore retain P/V/A/yaw
+    // derivatives instead of inheriting this zero terminal state.
+    const Eigen::Vector3d terminal_vel = Eigen::Vector3d::Zero();
+    const Eigen::Vector3d terminal_acc = Eigen::Vector3d::Zero();
     start_vel(2) = 0.0;
     desired_start_acc(2) = 0.0;
     if (!planning_start_state_valid_) {
@@ -539,8 +535,7 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
             else candidate.knots[i] = (i - candidate.degree) * knot_span;
         }
 
-        // 钳制三次B样条的首、末三个控制点直接编码 P/V/A。终端仅保留
-        // 最大值 10% 的切向速度和加速度，供成功的终端交接连续接入。
+        // 钳制三次B样条的首、末三个控制点直接编码 P/V/A；最终终点完整静止。
         candidate.position_ctrl[0] = start_pos;
         const Eigen::Vector3d start_d1 = start_vel;
         const Eigen::Vector3d next_d1 = start_d1 +
@@ -1540,7 +1535,8 @@ void CoverageSearchManager::generateBsplineTraj() {
 
 bool CoverageSearchManager::buildContinuousBridge(
     const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel,
-    const Eigen::Vector3d &start_acc, double start_yaw, double start_yaw_rate) {
+    const Eigen::Vector3d &start_acc, double start_yaw, double start_yaw_rate,
+    double start_yaw_acceleration) {
     if (traj_points_.size() < 3 || traj_vels_.size() != traj_points_.size() ||
         traj_accs_.size() != traj_points_.size() ||
         traj_yaws_.size() != traj_points_.size()) {
@@ -1568,15 +1564,28 @@ bool CoverageSearchManager::buildContinuousBridge(
 
     double end_yaw_rate = 0.0;
     if (join_idx + 1 < (int)traj_yaws_.size()) {
-        const double ds = (traj_points_[join_idx + 1] - traj_points_[join_idx]).head<2>().norm();
-        const double avg_speed = 0.5 * (traj_vels_[join_idx + 1].norm() + end_vel.norm());
-        const double dt = std::max(0.1, ds / std::max(0.15, avg_speed));
+        const double dt = std::max(1e-3, traj_dt_);
         end_yaw_rate = std::atan2(
             std::sin(traj_yaws_[join_idx + 1] - traj_yaws_[join_idx]),
             std::cos(traj_yaws_[join_idx + 1] - traj_yaws_[join_idx])) / dt;
     }
+    double end_yaw_acceleration = 0.0;
+    if (join_idx > 0 && join_idx + 1 < (int)traj_yaws_.size()) {
+        const double dt = std::max(1e-3, traj_dt_);
+        const double yaw_rate_before = std::atan2(
+            std::sin(traj_yaws_[join_idx] - traj_yaws_[join_idx - 1]),
+            std::cos(traj_yaws_[join_idx] - traj_yaws_[join_idx - 1])) / dt;
+        const double yaw_rate_after = std::atan2(
+            std::sin(traj_yaws_[join_idx + 1] - traj_yaws_[join_idx]),
+            std::cos(traj_yaws_[join_idx + 1] - traj_yaws_[join_idx])) / dt;
+        end_yaw_acceleration = (yaw_rate_after - yaw_rate_before) / dt;
+    }
     start_yaw_rate = std::max(-max_yaw_rate_, std::min(max_yaw_rate_, start_yaw_rate));
     end_yaw_rate = std::max(-max_yaw_rate_, std::min(max_yaw_rate_, end_yaw_rate));
+    start_yaw_acceleration = std::max(-max_yaw_acc_,
+                                      std::min(max_yaw_acc_, start_yaw_acceleration));
+    end_yaw_acceleration = std::max(-max_yaw_acc_,
+                                    std::min(max_yaw_acc_, end_yaw_acceleration));
 
     const double distance = (end_pos - start_pos).head<2>().norm();
     const double initial_duration = std::max(
@@ -1610,13 +1619,19 @@ bool CoverageSearchManager::buildContinuousBridge(
 
         const double y0 = start_yaw;
         const double y1 = start_yaw_rate;
-        const double y2 = 0.0;
+        const double y2 = 0.5 * start_yaw_acceleration;
         const double y3 = (20.0 * (end_yaw - start_yaw) -
-            (8.0 * end_yaw_rate + 12.0 * start_yaw_rate) * T) / (2.0 * T3);
+            (8.0 * end_yaw_rate + 12.0 * start_yaw_rate) * T -
+            (3.0 * start_yaw_acceleration - end_yaw_acceleration) * T2) /
+            (2.0 * T3);
         const double y4 = (30.0 * (start_yaw - end_yaw) +
-            (14.0 * end_yaw_rate + 16.0 * start_yaw_rate) * T) / (2.0 * T4);
+            (14.0 * end_yaw_rate + 16.0 * start_yaw_rate) * T +
+            (3.0 * start_yaw_acceleration - 2.0 * end_yaw_acceleration) * T2) /
+            (2.0 * T4);
         const double y5 = (12.0 * (end_yaw - start_yaw) -
-            (6.0 * end_yaw_rate + 6.0 * start_yaw_rate) * T) / (2.0 * T5);
+            (6.0 * end_yaw_rate + 6.0 * start_yaw_rate) * T -
+            (start_yaw_acceleration - end_yaw_acceleration) * T2) /
+            (2.0 * T5);
 
         const int samples = std::max(4, (int)std::ceil(T / traj_dt_));
         const double sample_dt = T / samples;
@@ -1643,6 +1658,8 @@ bool CoverageSearchManager::buildContinuousBridge(
                 y3 * t3 + y4 * t4 + y5 * t5;
             const double yaw_rate = y1 + 2.0 * y2 * t + 3.0 * y3 * t2 +
                 4.0 * y4 * t3 + 5.0 * y5 * t4;
+            const double yaw_acceleration = 2.0 * y2 + 6.0 * y3 * t +
+                12.0 * y4 * t2 + 20.0 * y5 * t3;
             p(2) = fly_height_;
             v(2) = 0.0;
             a(2) = 0.0;
@@ -1656,6 +1673,7 @@ bool CoverageSearchManager::buildContinuousBridge(
             if (!point_safe || v.head<2>().norm() > 1.05 * max_vel_ ||
                 a.head<2>().norm() > 1.05 * max_acc_ ||
                 std::fabs(yaw_rate) > 1.05 * max_yaw_rate_ ||
+                std::fabs(yaw_acceleration) > 1.05 * max_yaw_acc_ ||
                 (i > 0 && pathToTargetBlocked(p, previous, traj_cut_clearance_))) {
                 safe = false;
                 break;
@@ -1797,7 +1815,8 @@ bool CoverageSearchManager::activatePendingTrajectory() {
         active_time_spline_ = TimeBspline();
         traj_dt_ = 0.01;
         if (buildContinuousBridge(uav_pos_, uav_vel_, successor_acc,
-                                  uav_yaw_, successor_yaw_rate)) {
+                                  uav_yaw_, successor_yaw_rate,
+                                  successor_yaw_acc)) {
             planning_start_state_valid_ = true;
             planning_start_acc_ = successor_acc;
             planning_start_yaw_rate_ = successor_yaw_rate;

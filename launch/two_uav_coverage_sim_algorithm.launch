@@ -12,6 +12,11 @@
     <param name="local_state_topic" value="/uav$(arg uav1_id)/prometheus/state"/><param name="peer_state_topic" value="/uav$(arg uav1_id)/two_uav/rx/state"/>
     <param name="peer_clear_radius" value="0.40"/><param name="peer_clear_half_height" value="0.30"/><param name="peer_state_timeout" value="0.60"/>
     <param name="camera_offset_x" value="0.095"/><param name="camera_offset_y" value="0.0"/><param name="camera_offset_z" value="0.0"/><param name="camera_pitch" value="0.35"/>
+    <!-- Bind every OctoMap cloud to the interpolated body pose at its own capture stamp. -->
+    <param name="pose_topic" value="/uav$(arg uav1_id)/prometheus/ground_truth"/><param name="sync_frame" value="uav$(arg uav1_id)/octomap_camera_sync"/>
+    <param name="world_frame" value="world"/><param name="pose_history_sec" value="2.0"/><param name="max_pose_interp_gap" value="0.04"/><param name="cloud_sync_queue_size" value="4"/>
+    <param name="temporal_hit_confirmation" value="true"/><param name="temporal_hit_voxel" value="0.10"/><param name="temporal_hit_min_frames" value="3"/>
+    <param name="max_mapping_angular_rate" value="0.60"/>
   </node>
   <node pkg="prometheus_two_uav_coverage_search" type="two_uav_depth_cloud_downsample_node" name="depth_downsample_uav2" output="screen">
     <param name="input_topic" value="/uav$(arg uav2_id)/camera/depth/color/points"/><param name="output_topic" value="/uav$(arg uav2_id)/camera/depth/color/points_downsampled"/>
@@ -22,6 +27,10 @@
     <param name="local_state_topic" value="/uav$(arg uav2_id)/prometheus/state"/><param name="peer_state_topic" value="/uav$(arg uav2_id)/two_uav/rx/state"/>
     <param name="peer_clear_radius" value="0.40"/><param name="peer_clear_half_height" value="0.30"/><param name="peer_state_timeout" value="0.60"/>
     <param name="camera_offset_x" value="0.095"/><param name="camera_offset_y" value="0.0"/><param name="camera_offset_z" value="0.0"/><param name="camera_pitch" value="0.35"/>
+    <param name="pose_topic" value="/uav$(arg uav2_id)/prometheus/ground_truth"/><param name="sync_frame" value="uav$(arg uav2_id)/octomap_camera_sync"/>
+    <param name="world_frame" value="world"/><param name="pose_history_sec" value="2.0"/><param name="max_pose_interp_gap" value="0.04"/><param name="cloud_sync_queue_size" value="4"/>
+    <param name="temporal_hit_confirmation" value="true"/><param name="temporal_hit_voxel" value="0.10"/><param name="temporal_hit_min_frames" value="3"/>
+    <param name="max_mapping_angular_rate" value="0.60"/>
   </node>
   <node pkg="octomap_server" type="octomap_server_node" name="octomap_server_uav1" output="screen">
     <remap from="/octomap_point_cloud_centers" to="/uav$(arg uav1_id)/octomap_point_cloud_centers"/><remap from="/octomap_full" to="/uav$(arg uav1_id)/octomap_full"/><remap from="/octomap_binary" to="/uav$(arg uav1_id)/octomap_binary"/><remap from="/projected_map" to="/uav$(arg uav1_id)/projected_map"/>
@@ -33,14 +42,14 @@
          out of octomap_binary/full, unlike occupancy_min_z which only filters
          marker and 2D-projection output. -->
     <param name="pointcloud_min_z" value="0.20"/><param name="pointcloud_max_z" value="2.8"/>
-    <param name="occupancy_min_z" value="0.20"/><param name="filter_ground" value="false"/>
+    <param name="occupancy_min_z" value="0.20"/><param name="filter_ground" value="false"/><param name="filter_speckles" value="true"/>
   </node>
   <node pkg="octomap_server" type="octomap_server_node" name="octomap_server_uav2" output="screen">
     <remap from="/octomap_point_cloud_centers" to="/uav$(arg uav2_id)/octomap_point_cloud_centers"/><remap from="/octomap_full" to="/uav$(arg uav2_id)/octomap_full"/><remap from="/octomap_binary" to="/uav$(arg uav2_id)/octomap_binary"/><remap from="/projected_map" to="/uav$(arg uav2_id)/projected_map"/>
     <remap from="cloud_in" to="/uav$(arg uav2_id)/camera/depth/color/points_octomap"/>
     <param name="resolution" value="0.1"/><param name="frame_id" value="world"/><param name="base_frame_id" value="world"/><param name="sensor_model/max_range" value="4.5"/>
     <param name="pointcloud_min_z" value="0.20"/><param name="pointcloud_max_z" value="2.8"/>
-    <param name="occupancy_min_z" value="0.20"/><param name="filter_ground" value="false"/>
+    <param name="occupancy_min_z" value="0.20"/><param name="filter_ground" value="false"/><param name="filter_speckles" value="true"/>
   </node>
   <include file="$(find prometheus_two_uav_coverage_search)/launch/two_uav_onboard.launch">
     <arg name="uav_id" value="$(arg uav1_id)"/><arg name="peer_uav_id" value="$(arg uav2_id)"/><arg name="fly_height" value="$(arg fly_height)"/>

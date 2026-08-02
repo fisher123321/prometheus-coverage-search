@@ -332,11 +332,12 @@ void CoverageMap::raycastCameraFovFree(const Eigen::Vector3d &camera_pos,
         (int)std::ceil(2.0 * depth_max_range_ * std::tan(half_h) / resolution_) + 1));
     const int pitch_samples = std::min(31, std::max(9,
         (int)std::ceil(2.0 * depth_max_range_ * std::tan(half_v) / resolution_) + 1));
-    std::vector<double> stop_range(yaw_samples, depth_max_range_);
-    std::vector<uint8_t> occluded(yaw_samples, 0);
+    const int ray_count = yaw_samples * pitch_samples;
+    std::vector<double> stop_range(ray_count, depth_max_range_);
+    std::vector<uint8_t> has_return(ray_count, 0);
 
-    // 覆盖规划按 XY 可达性工作：同一水平视线只清到最近的非地面回波，
-    // 防止补充射线从墙体点云的竖直采样间隙穿到障碍物后方。
+    // 每个 yaw/pitch 方向独立保存最近回波。不能让某一高度的墙面回波
+    // 截断整个竖直视场，否则墙前其它高度的 free 体素会长期保留 unknown。
     for (const auto &pt : real_points.points) {
         if (!std::isfinite(pt.x) || !std::isfinite(pt.y) ||
             !std::isfinite(pt.z) || pt.z <= 1e-3) continue;
@@ -348,20 +349,17 @@ void CoverageMap::raycastCameraFovFree(const Eigen::Vector3d &camera_pos,
         double pitch = std::atan2(pt.y, pt.z);
         if (std::abs(yaw) > half_h || std::abs(pitch) > half_v) continue;
         int iy = (int)std::round((yaw + half_h) / (2.0 * half_h) * (yaw_samples - 1));
-        for (int dy = -1; dy <= 1; ++dy) {
-            int y = iy + dy;
-            if (y < 0 || y >= yaw_samples) continue;
-            occluded[y] = 1;
-            stop_range[y] = std::min(stop_range[y], range);
-        }
+        int ip = (int)std::round((pitch + half_v) / (2.0 * half_v) * (pitch_samples - 1));
+        const int ray = iy * pitch_samples + ip;
+        has_return[ray] = 1;
+        stop_range[ray] = std::min(stop_range[ray], range);
     }
 
     for (int iy = 0; iy < yaw_samples; ++iy) {
         double ay = -half_h + 2.0 * half_h * iy / std::max(1, yaw_samples - 1);
-        double clear_range = occluded[iy]
-                                 ? std::max(depth_min_range_, stop_range[iy] - resolution_)
-                                 : depth_max_range_;
         for (int ip = 0; ip < pitch_samples; ++ip) {
+            const int ray = iy * pitch_samples + ip;
+            const double clear_range = has_return[ray] ? stop_range[ray] : depth_max_range_;
             double ap = -half_v + 2.0 * half_v * ip / std::max(1, pitch_samples - 1);
             Eigen::Vector3d dir_cam(tan(ay), tan(ap), 1.0);
             dir_cam.normalize();
@@ -379,8 +377,9 @@ void CoverageMap::raycastCameraFovFree(const Eigen::Vector3d &camera_pos,
                 }
                 end = clipped;
             }
-            // 补充射线与实测射线共用硬遮挡规则，遇到 occupied 必须终止。
-            raycastFree(camera_pos, end, true);
+            // 排除终点格：回波所在格仍由实测 hit 保持 occupied；其之前
+            // 的自由空间不再额外退回一个完整体素。已有 occupied 仍是硬遮挡。
+            raycastFree(camera_pos, end, false);
         }
     }
 }

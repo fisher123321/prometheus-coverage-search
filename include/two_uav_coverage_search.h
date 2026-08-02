@@ -20,6 +20,8 @@
 #include <cstdint>
 #include <memory>
 #include <limits>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 #include <sensor_msgs/PointCloud2.h>
 #include <nav_msgs/Odometry.h>
@@ -235,6 +237,9 @@ public:
                            double *path_len = nullptr,
                            int *unknown_cells = nullptr,
                            double *unknown_ratio = nullptr);
+    bool findReachableApproach(const Eigen::Vector3d &start, const Eigen::Vector3d &target,
+                               Eigen::Vector3d &approach,
+                               std::vector<Eigen::Vector3d> &path);
 
     int toAddress2D(int x, int y);
     void setSearchTimeout(double timeout_ms) { search_timeout_ms_ = timeout_ms; }
@@ -419,6 +424,8 @@ private:
     FrontierFinder frontier_finder_;
     HierarchicalGrid hierarchical_grid_;
     Astar2D astar2d_;
+    std::unique_ptr<tf2_ros::Buffer> planning_tf_buffer_;
+    std::unique_ptr<tf2_ros::TransformListener> planning_tf_listener_;
 
     ros::Subscriber uav_state_sub_, uav_control_state_sub_;
     ros::Subscriber global_pcl_sub_, local_pcl_sub_, scan_pcl_sub_, depth_pcl_sub_, goal_sub_;
@@ -545,8 +552,6 @@ private:
         ros::Time result_ready_time;
     } pending_traj_;
     bool rolling_prepare_in_progress_;
-    double rolling_terminal_speed_ratio_ = 0.10;
-    double rolling_terminal_acc_ratio_ = 0.10;
     bool rolling_snapshot_mode_ = false;
     uint64_t rolling_generation_ = 0;
     ros::Time rolling_last_attempt_time_;
@@ -678,7 +683,8 @@ private:
     bool buildContinuousBridge(const Eigen::Vector3d &start_pos,
                                const Eigen::Vector3d &start_vel,
                                const Eigen::Vector3d &start_acc,
-                               double start_yaw, double start_yaw_rate);
+                               double start_yaw, double start_yaw_rate,
+                               double start_yaw_acceleration);
     bool activatePendingTrajectory();
     // ★ 失败目标短期排除：移除距 failed_goal_ 1.0m 内、且在 3s 内的候选
     void filterFailedGoal();

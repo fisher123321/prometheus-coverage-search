@@ -412,3 +412,78 @@ bool Astar2D::isPathTraversable(const Eigen::Vector3d &start,
     if (unknown_ratio) *unknown_ratio = ratio;
     return unknown == 0;
 }
+
+bool Astar2D::findReachableApproach(const Eigen::Vector3d &start,
+                                    const Eigen::Vector3d &target,
+                                    Eigen::Vector3d &approach,
+                                    std::vector<Eigen::Vector3d> &path) {
+    path.clear();
+    map_->updateDistanceFields();
+    Eigen::Vector3i start_idx, target_idx;
+    map_->posToIndex(start, start_idx);
+    map_->posToIndex(target, target_idx);
+    const int nx = map_->grid_size_(0), ny = map_->grid_size_(1);
+    const int total = nx * ny;
+    const double hard_clearance = std::max(0.45, map_->esdf_safe_distance_);
+    auto walkable = [&](int x, int y) {
+        return x >= 0 && x < nx && y >= 0 && y < ny &&
+               map_->isFree2D(x, y) && !map_->isOccupied2D(x, y) &&
+               map_->getDistance2D(x, y) >= hard_clearance;
+    };
+
+    int sx = start_idx(0), sy = start_idx(1);
+    if (!walkable(sx, sy)) {
+        int best_dist2 = std::numeric_limits<int>::max();
+        for (int dx = -5; dx <= 5; ++dx) for (int dy = -5; dy <= 5; ++dy) {
+            if (!walkable(sx + dx, sy + dy)) continue;
+            const int dist2 = dx * dx + dy * dy;
+            if (dist2 < best_dist2) {
+                best_dist2 = dist2;
+                sx = start_idx(0) + dx;
+                sy = start_idx(1) + dy;
+            }
+        }
+        if (best_dist2 == std::numeric_limits<int>::max()) return false;
+    }
+
+    const auto key = [ny](int x, int y) { return x * ny + y; };
+    std::vector<int> steps(total, -1);
+    std::queue<Eigen::Vector2i> open;
+    steps[key(sx, sy)] = 0;
+    open.emplace(sx, sy);
+    const double start_distance = std::hypot((sx - target_idx(0)) * map_->resolution_,
+                                             (sy - target_idx(1)) * map_->resolution_);
+    int best_key = -1;
+    double best_distance = start_distance;
+    int best_steps = std::numeric_limits<int>::max();
+
+    while (!open.empty()) {
+        const Eigen::Vector2i cell = open.front();
+        open.pop();
+        const int current_steps = steps[key(cell(0), cell(1))];
+        const double target_distance = std::hypot((cell(0) - target_idx(0)) * map_->resolution_,
+                                                  (cell(1) - target_idx(1)) * map_->resolution_);
+        if (current_steps >= 2 && target_distance + map_->resolution_ <= best_distance + 1e-6) {
+            best_key = key(cell(0), cell(1));
+            best_distance = target_distance;
+            best_steps = current_steps;
+        }
+        for (int d = 0; d < 8; ++d) {
+            const int nx_ = cell(0) + dx_[d], ny_ = cell(1) + dy_[d];
+            const int next_key = key(nx_, ny_);
+            if (!walkable(nx_, ny_) || steps[next_key] >= 0) continue;
+            if ((d == 0 || d == 2 || d == 5 || d == 7) &&
+                (!walkable(cell(0) + dx_[d], cell(1)) ||
+                 !walkable(cell(0), cell(1) + dy_[d]))) continue;
+            steps[next_key] = current_steps + 1;
+            open.emplace(nx_, ny_);
+        }
+    }
+    if (best_key < 0 || best_distance + map_->resolution_ > start_distance ||
+        best_steps == std::numeric_limits<int>::max()) return false;
+
+    const int bx = best_key / ny, by = best_key % ny;
+    map_->indexToPos(Eigen::Vector3i(bx, by, map_->fly_z_idx_), approach);
+    approach(2) = map_->fly_height_;
+    return search(start, approach, path);
+}

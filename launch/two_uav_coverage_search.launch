@@ -5,6 +5,8 @@
     <arg name="cooperative_mode" default="false"/>
     <arg name="external_goal_only" default="false"/>
     <arg name="global_coverage_source" default="0"/>
+    <arg name="max_yaw_rate" default="1.3962634"/>
+    <arg name="max_yaw_acc" default="1.5707963"/>
     <arg name="swarm_tx_prefix" default="/two_uav/tx"/>
     <arg name="swarm_rx_prefix" default="/two_uav/rx"/>
     <!-- 探索矩形也是已知空间比率的固定分母；换世界时只覆盖这些 launch 参数。 -->
@@ -34,9 +36,9 @@
         <param name="coverage_search/max_vel" value="1.5"/>
         <param name="coverage_search/max_acc" value="1.0"/>
         <!-- 最大偏航角速率 -->
-        <param name="coverage_search/max_yaw_rate" value="1.3962634"/>
+        <param name="coverage_search/max_yaw_rate" value="$(arg max_yaw_rate)"/>
         <!-- 最大偏航角加速度，保证转向从起点到视点全程平滑完成 -->
-        <param name="coverage_search/max_yaw_acc" value="1.5707963"/>
+        <param name="coverage_search/max_yaw_acc" value="$(arg max_yaw_acc)"/>
         <!-- 滚动重规划交接前瞻时间(秒) -->
         <param name="coverage_search/replan_time" value="0.25"/>
         <!-- 目标到达判定距离(米) -->
@@ -60,9 +62,6 @@
         <param name="coverage_search/swarm_bid_period" value="2.0"/>
         <param name="coverage_search/swarm_bid_max_tasks" value="16"/>
         <param name="coverage_search/swarm_bid_max_astar" value="6"/>
-        <!-- 滚动重规划保持终端状态的速度、加速度上限 -->
-        <param name="coverage_search/rolling_terminal_speed_ratio" value="0.10"/>
-        <param name="coverage_search/rolling_terminal_acc_ratio" value="0.10"/>
         <!-- 自动开始 -->
         <param name="coverage_search/auto_start" value="$(arg auto_start)"/>
         <param name="coverage_search/cooperative_mode" value="$(arg cooperative_mode)"/>

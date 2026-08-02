@@ -13,6 +13,8 @@ find_package(catkin REQUIRED COMPONENTS
   laser_geometry
   pcl_ros
   visualization_msgs
+  tf2
+  tf2_ros
   prometheus_msgs
   message_generation
 )
@@ -39,7 +41,7 @@ generate_messages(DEPENDENCIES std_msgs geometry_msgs)
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES two_uav_coverage_lib
-  CATKIN_DEPENDS roscpp rospy std_msgs sensor_msgs geometry_msgs nav_msgs laser_geometry pcl_ros visualization_msgs prometheus_msgs message_runtime
+  CATKIN_DEPENDS roscpp rospy std_msgs sensor_msgs geometry_msgs nav_msgs laser_geometry pcl_ros visualization_msgs tf2 tf2_ros prometheus_msgs message_runtime
   DEPENDS PCL
 )
 

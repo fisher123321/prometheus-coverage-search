@@ -152,8 +152,6 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal) {
         planner->traj_advance_dist_ = traj_advance_dist_;
         planner->traj_point_dwell_timeout_ = traj_point_dwell_timeout_;
         planner->traj_cut_clearance_ = traj_cut_clearance_;
-        planner->rolling_terminal_speed_ratio_ = rolling_terminal_speed_ratio_;
-        planner->rolling_terminal_acc_ratio_ = rolling_terminal_acc_ratio_;
         planner->rolling_prepare_in_progress_ = false;
         planner->rolling_snapshot_mode_ = true;
 

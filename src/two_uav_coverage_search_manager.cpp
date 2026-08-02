@@ -1,6 +1,9 @@
 #include "two_uav_coverage_search.h"
 
 #include <map>
+#include <tf2/exceptions.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 CoverageSearchManager::~CoverageSearchManager() {
     if (rolling_worker_.joinable()) rolling_worker_.join();
@@ -49,8 +52,6 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     nh.param("coverage_search/traj_step_size", traj_step_size_, 0.5);
     nh.param("coverage_search/traj_advance_dist", traj_advance_dist_, 0.3);
     nh.param("coverage_search/traj_point_dwell_timeout", traj_point_dwell_timeout_, 5.0);
-    nh.param("coverage_search/rolling_terminal_speed_ratio", rolling_terminal_speed_ratio_, 0.10);
-    nh.param("coverage_search/rolling_terminal_acc_ratio", rolling_terminal_acc_ratio_, 0.10);
     nh.param("coverage_search/completion_known_ratio", completion_known_ratio_, 0.99);
     nh.param("coverage_search/completion_no_frontier_dwell", completion_no_frontier_dwell_, 8.0);
     nh.param("coverage_search/residual_scan_yaw_rate", residual_scan_yaw_rate_, 0.6);
@@ -62,6 +63,8 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     uav_name_ = "/uav" + std::to_string(uav_id_);
 
     coverage_map_.init(nh);
+    planning_tf_buffer_.reset(new tf2_ros::Buffer);
+    planning_tf_listener_.reset(new tf2_ros::TransformListener(*planning_tf_buffer_));
     // 轨迹安全阈值与 ESDF 保持同一个值，不单独提供配置项。
     traj_cut_clearance_ = coverage_map_.esdf_safe_distance_;
     frontier_finder_.init(nh, &coverage_map_);
@@ -244,31 +247,57 @@ void CoverageSearchManager::depthPclCb(const sensor_msgs::PointCloud2ConstPtr &m
     if (!odom_ready_) return;
     sensor_ready_ = true;
 
-    Eigen::Quaterniond q_wb(uav_state_.attitude_q.w,
-                            uav_state_.attitude_q.x,
-                            uav_state_.attitude_q.y,
-                            uav_state_.attitude_q.z);
-    Eigen::Matrix3d R_wb;
-    if (q_wb.norm() > 1e-3) {
-        q_wb.normalize();
-        R_wb = q_wb.toRotationMatrix();
-    } else {
-        double cy = cos(uav_yaw_), sy = sin(uav_yaw_);
-        R_wb << cy, -sy, 0,
-                sy,  cy, 0,
-                 0,   0, 1;
+    Eigen::Matrix3d R_wc;
+    Eigen::Vector3d camera_pos;
+    bool capture_pose_used = false;
+    if (planning_tf_buffer_ && !msg->header.stamp.isZero() &&
+        !msg->header.frame_id.empty() && msg->header.frame_id != "world") {
+        try {
+            const geometry_msgs::TransformStamped tf = planning_tf_buffer_->lookupTransform(
+                "world", msg->header.frame_id, msg->header.stamp, ros::Duration(0.02));
+            Eigen::Quaterniond q(tf.transform.rotation.w, tf.transform.rotation.x,
+                                 tf.transform.rotation.y, tf.transform.rotation.z);
+            if (q.norm() > 1e-3) {
+                q.normalize();
+                R_wc = q.toRotationMatrix();
+                camera_pos = Eigen::Vector3d(tf.transform.translation.x,
+                                              tf.transform.translation.y,
+                                              tf.transform.translation.z);
+                capture_pose_used = true;
+                ROS_INFO_ONCE("[CoverageSearch] CoverageMap uses capture-time camera TF for depth integration.");
+            }
+        } catch (const tf2::TransformException &) {
+            ROS_WARN_THROTTLE(1.0,
+                "[CoverageSearch] No capture-time TF world -> %s at %.3f; using latest state.",
+                msg->header.frame_id.c_str(), msg->header.stamp.toSec());
+        }
     }
-
-    Eigen::Matrix3d R_opt_to_body;
-    R_opt_to_body << 0,  0, 1,
-                    -1,  0, 0,
-                     0, -1, 0;
-    Eigen::Matrix3d R_mount =
-        Eigen::AngleAxisd(camera_pitch_, Eigen::Vector3d::UnitY()).toRotationMatrix();
-    Eigen::Matrix3d R_wc = R_wb * R_mount * R_opt_to_body;
-
-    Eigen::Vector3d body_pos(uav_state_.position[0], uav_state_.position[1], uav_state_.position[2]);
-    Eigen::Vector3d camera_pos = body_pos + R_wb * camera_offset_;
+    if (!capture_pose_used) {
+        Eigen::Quaterniond q_wb(uav_state_.attitude_q.w,
+                                uav_state_.attitude_q.x,
+                                uav_state_.attitude_q.y,
+                                uav_state_.attitude_q.z);
+        Eigen::Matrix3d R_wb;
+        if (q_wb.norm() > 1e-3) {
+            q_wb.normalize();
+            R_wb = q_wb.toRotationMatrix();
+        } else {
+            double cy = cos(uav_yaw_), sy = sin(uav_yaw_);
+            R_wb << cy, -sy, 0,
+                    sy,  cy, 0,
+                     0,   0, 1;
+        }
+        Eigen::Matrix3d R_opt_to_body;
+        R_opt_to_body << 0,  0, 1,
+                        -1,  0, 0,
+                         0, -1, 0;
+        R_wc = R_wb *
+            Eigen::AngleAxisd(camera_pitch_, Eigen::Vector3d::UnitY()).toRotationMatrix() *
+            R_opt_to_body;
+        const Eigen::Vector3d body_pos(uav_state_.position[0], uav_state_.position[1],
+                                       uav_state_.position[2]);
+        camera_pos = body_pos + R_wb * camera_offset_;
+    }
     coverage_map_.updateFromDepthPcl(msg, camera_pos, R_wc);
 }
 
@@ -1239,14 +1268,38 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
                 setCompletionReady(false);
                 double observe_yaw = uav_yaw_;
                 double best_dist = 1e9;
+                Eigen::Vector3d recovery_target = Eigen::Vector3d::Zero();
                 for (const auto &frontier : frontier_finder_.frontiers_) {
                     if (!isFrontierLeasedToSelf(frontier)) continue;
                     const Eigen::Vector3d &avg = frontier.average;
                     double dist = (avg.head<2>() - uav_pos_.head<2>()).norm();
                     if (dist < best_dist && dist > 1e-3) {
                         best_dist = dist;
+                        recovery_target = avg;
                         observe_yaw = atan2(avg(1) - uav_pos_(1), avg(0) - uav_pos_(0));
                     }
+                }
+
+                Eigen::Vector3d recovery_goal;
+                std::vector<Eigen::Vector3d> recovery_path;
+                if (best_dist < 1e9 && astar2d_.findReachableApproach(
+                        uav_pos_, recovery_target, recovery_goal, recovery_path)) {
+                    current_goal_ = recovery_goal;
+                    current_goal_yaw_ = observe_yaw;
+                    current_goal_task_id_ = 0;
+                    astar_path_ = recovery_path;
+                    has_goal_ = true;
+                    same_goal_replan_count_ = 0;
+                    goal_commit_time_ = ros::Time::now();
+                    generateBsplineTraj();
+                    if (has_traj_) {
+                        ROS_INFO("[CoverageSearch] Recovery approach: safe goal=(%.2f,%.2f), "
+                                 "toward frontier=(%.2f,%.2f), path=%zu.",
+                                 recovery_goal(0), recovery_goal(1), recovery_target(0),
+                                 recovery_target(1), recovery_path.size());
+                        break;
+                    }
+                    has_goal_ = false;
                 }
 
                 uav_command_.header.stamp = ros::Time::now();
