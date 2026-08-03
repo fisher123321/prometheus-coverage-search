@@ -4,6 +4,8 @@
   <arg name="peer_uav_id"/>
   <arg name="fly_height" default="1.5"/>
   <arg name="global_coverage_source" default="0"/>
+  <arg name="max_yaw_rate" default="1.3962634"/>
+  <arg name="max_yaw_acc" default="1.5707963"/>
   <arg name="tx_prefix" default="/two_uav/tx"/>
   <arg name="rx_prefix" default="/two_uav/rx"/>
   <arg name="map_origin_x" default="-9.6"/>
@@ -22,6 +24,8 @@
          its own final viewpoint locally. -->
     <arg name="external_goal_only" value="false"/>
     <arg name="global_coverage_source" value="$(arg global_coverage_source)"/>
+    <arg name="max_yaw_rate" value="$(arg max_yaw_rate)"/>
+    <arg name="max_yaw_acc" value="$(arg max_yaw_acc)"/>
     <arg name="swarm_tx_prefix" value="$(arg tx_prefix)"/>
     <arg name="swarm_rx_prefix" value="$(arg rx_prefix)"/>
     <arg name="map_origin_x" value="$(arg map_origin_x)"/>
@@ -38,6 +42,8 @@
     <param name="peer_uav_id" value="$(arg peer_uav_id)"/>
     <param name="map_epoch" value="1"/>
     <param name="fly_height" value="$(arg fly_height)"/>
+    <param name="yaw_max_rate" value="$(arg max_yaw_rate)"/>
+    <param name="yaw_max_acc" value="$(arg max_yaw_acc)"/>
     <param name="tx_prefix" value="$(arg tx_prefix)"/>
     <param name="rx_prefix" value="$(arg rx_prefix)"/>
     <param name="min_start_separation" value="1.0"/>

@@ -1622,9 +1622,7 @@ bundle 中但未被本机选为最终目标
 覆盖率继续使用 `CoverageMap::getKnownSpaceRatio()` 的二维体素统计。任务的**本地完成就绪**条件为：
 
 ```text
-二维已知比例 >= 99%
-且
-连续无前沿 >= completion_no_frontier_dwell（默认 8 s）
+二维已知比例 > 99%
 ```
 
 达到条件的 UAV 不会单独结束，而是发布 latched 主题：

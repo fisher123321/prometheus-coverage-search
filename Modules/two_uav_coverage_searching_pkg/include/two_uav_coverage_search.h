@@ -2,6 +2,7 @@
 #define TWO_UAV_COVERAGE_SEARCH_H
 
 #include <ros/ros.h>
+#include <ros/callback_queue.h>
 #include <Eigen/Eigen>
 #include <iostream>
 #include <algorithm>
@@ -20,6 +21,8 @@
 #include <cstdint>
 #include <memory>
 #include <limits>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 #include <sensor_msgs/PointCloud2.h>
 #include <nav_msgs/Odometry.h>
@@ -235,6 +238,9 @@ public:
                            double *path_len = nullptr,
                            int *unknown_cells = nullptr,
                            double *unknown_ratio = nullptr);
+    bool findReachableApproach(const Eigen::Vector3d &start, const Eigen::Vector3d &target,
+                               Eigen::Vector3d &approach,
+                               std::vector<Eigen::Vector3d> &path);
 
     int toAddress2D(int x, int y);
     void setSearchTimeout(double timeout_ms) { search_timeout_ms_ = timeout_ms; }
@@ -279,21 +285,21 @@ public:
     void publishFrontiers();
     bool isFrontierCellsCovered(const std::vector<Eigen::Vector3d> &cells,
                                 double changed_fraction);
+    double lastAabbSearchMs() const { return last_aabb_search_ms_; }
+    double lastViewpointMs() const { return last_viewpoint_ms_; }
+    int lastLocalUpdateBoxCount() const { return last_local_update_box_count_; }
+    int lastRemoteUpdateBoxCount() const { return last_remote_update_box_count_; }
+    int lastMergedBoxCount() const { return last_merged_box_count_; }
 
     int cluster_min_;
     double cluster_size_xy_;
-    double candidate_rmin_, candidate_rmax_, candidate_dphi_;
-    int min_visib_num_;
-    int candidate_rnum_;
+    double candidate_radius_;
+    double candidate_clearance_;
     int down_sample_;
     double sensing_range_;
     double sensing_fov_h_;
     double sensing_fov_v_;
     double sensing_pitch_;
-    double min_candidate_dist_;
-    double min_candidate_clearance_;        // 视点unknown安全距离
-    double min_candidate_occupied_clearance_; // 视点occupied安全距离
-    double min_viewpoint_frontier_dist_;    // 视点与本前沿簇的最小水平距离
     double min_frontier_height_;
     double max_frontier_height_;
     double max_frontier_above_flight_;
@@ -344,19 +350,19 @@ private:
     void downsample(const std::vector<Eigen::Vector3d> &cluster_in,
                     std::vector<Eigen::Vector3d> &cluster_out);
     void sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3d &cur_pos);
-    int countVisibleCells(const Eigen::Vector3d &pos, double yaw, const std::vector<Eigen::Vector3d> &cells);
     int countVisibleUnknown(const Eigen::Vector3d &pos, double yaw);
-    bool isNearUnknown(const Eigen::Vector3d &pos);
-    bool isNearOccupied(const Eigen::Vector3d &pos, double clearance);
-    bool isTooCloseToFrontierCells(const Eigen::Vector3d &pos,
-                                   const std::vector<Eigen::Vector3d> &cells);
-    double averageYawToFrontier(const Eigen::Vector3d &pos, const std::vector<Eigen::Vector3d> &cells);
-    void wrapYaw(double &yaw);
+    bool getRepresentativeFrontierCell(const FrontierCluster &ftr,
+                                       Eigen::Vector3d &target);
     bool isFrontierCell(const Eigen::Vector3i &idx);
     std::vector<bool> frontier_flag_;
     ros::Publisher frontier_vis_pub_;
     int last_frontier_marker_count_ = 0;
     int last_viewpoint_marker_count_ = 0;
+    double last_aabb_search_ms_ = 0.0;
+    double last_viewpoint_ms_ = 0.0;
+    int last_local_update_box_count_ = 0;
+    int last_remote_update_box_count_ = 0;
+    int last_merged_box_count_ = 0;
 };
 
 // ============================================================
@@ -419,6 +425,8 @@ private:
     FrontierFinder frontier_finder_;
     HierarchicalGrid hierarchical_grid_;
     Astar2D astar2d_;
+    std::unique_ptr<tf2_ros::Buffer> planning_tf_buffer_;
+    std::unique_ptr<tf2_ros::TransformListener> planning_tf_listener_;
 
     ros::Subscriber uav_state_sub_, uav_control_state_sub_;
     ros::Subscriber global_pcl_sub_, local_pcl_sub_, scan_pcl_sub_, depth_pcl_sub_, goal_sub_;
@@ -426,6 +434,12 @@ private:
     ros::Subscriber local_task_sub_, remote_task_sub_, peer_collision_replan_sub_;
     ros::Publisher uav_cmd_pub_, path_vis_pub_, fov_vis_pub_, coverage_status_pub_, uav_label_pub_, completion_ready_pub_;
     ros::Publisher swarm_frontier_pub_, swarm_bid_pub_, swarm_traj_pub_, map_chunk_pub_, map_request_pub_;
+    // The command timer must never wait behind depth integration or frontier
+    // extraction.  It has its own callback queue and emits only immutable
+    // trajectory samples; map/planning state remains single-threaded.
+    ros::CallbackQueue trajectory_callback_queue_;
+    std::unique_ptr<ros::NodeHandle> trajectory_nh_;
+    std::unique_ptr<ros::AsyncSpinner> trajectory_spinner_;
     ros::Timer mainloop_timer_, trajectory_timer_, frontier_timer_, swarm_data_timer_;
 
     prometheus_msgs::UAVState uav_state_;
@@ -520,11 +534,37 @@ private:
     struct TimeBspline {
         bool valid = false;
         int degree = 3;
+        // duration is the position-trajectory duration. Position and yaw use
+        // independent time axes; yaw completes before the terminal P/V/A=0
+        // position boundary.
         double duration = 0.0;
-        std::vector<double> knots;
+        double position_duration = 0.0;
+        double yaw_duration = 0.0;
+        std::vector<double> knots;      // position knots
+        std::vector<double> yaw_knots;  // yaw knots
         std::vector<Eigen::Vector3d> position_ctrl;
         std::vector<Eigen::Vector3d> yaw_ctrl;
     } active_time_spline_;
+
+    struct RealtimeTrajectory {
+        uint64_t generation = 0;
+        TimeBspline time_spline;
+        std::vector<Eigen::Vector3d> points;
+        std::vector<Eigen::Vector3d> velocities;
+        std::vector<Eigen::Vector3d> accelerations;
+        std::vector<double> yaws;
+        ros::Time start_time;
+        Eigen::Vector3d goal = Eigen::Vector3d::Zero();
+        double goal_yaw = 0.0;
+        double sample_dt = 0.1;
+    };
+    std::mutex realtime_trajectory_mutex_;
+    std::shared_ptr<const RealtimeTrajectory> realtime_trajectory_;
+    std::mutex vehicle_state_mutex_;
+    std::atomic<uint64_t> realtime_trajectory_generation_{0};
+    std::atomic<uint64_t> realtime_completed_generation_{0};
+    std::atomic<uint32_t> realtime_command_id_{0};
+    std::atomic<float> realtime_yaw_rate_ref_{0.0f};
 
     // 旧轨迹执行期间预先生成，抵达交接点后一次性切换。
     struct PendingTrajectory {
@@ -545,8 +585,6 @@ private:
         ros::Time result_ready_time;
     } pending_traj_;
     bool rolling_prepare_in_progress_;
-    double rolling_terminal_speed_ratio_ = 0.10;
-    double rolling_terminal_acc_ratio_ = 0.10;
     bool rolling_snapshot_mode_ = false;
     uint64_t rolling_generation_ = 0;
     ros::Time rolling_last_attempt_time_;
@@ -583,13 +621,10 @@ private:
     ros::Time hover_wait_start_; // 悬停等待开始时间
     int replan_count_;
 
-    // ★ 严格完成：固定区域已知率达标、持续无前沿，并与对机达成完成共识。
-    ros::Time last_frontier_found_time_;
-    bool last_frontier_found_valid_;
+    // 完成仅由固定区域覆盖率决定；协同模式仍等待对机完成共识。
     bool completion_ready_ = false;
     bool peer_completion_ready_ = false;
     double completion_known_ratio_;
-    double completion_no_frontier_dwell_;
     double residual_scan_yaw_rate_;
     double residual_scan_yaw_;
     ros::Time last_residual_search_time_;
@@ -638,6 +673,11 @@ private:
     bool planPathToGoal();           // A*规划到目标的路径
     void generateBsplineTraj();      // 从A*路径生成B样条轨迹
     void executeTrajectory();        // 执行B样条轨迹
+    void executeRealtimeTrajectory();
+    void armRealtimeTrajectory();
+    void disarmRealtimeTrajectory();
+    bool consumeRealtimeTrajectoryCompletion();
+    void maintainActiveTrajectory();
     double terminalBrakingDistance() const;
     bool reachedGoal();
     // ★ 三次均匀B样条评估（仅用于几何候选生成）
@@ -678,7 +718,8 @@ private:
     bool buildContinuousBridge(const Eigen::Vector3d &start_pos,
                                const Eigen::Vector3d &start_vel,
                                const Eigen::Vector3d &start_acc,
-                               double start_yaw, double start_yaw_rate);
+                               double start_yaw, double start_yaw_rate,
+                               double start_yaw_acceleration);
     bool activatePendingTrajectory();
     // ★ 失败目标短期排除：移除距 failed_goal_ 1.0m 内、且在 3s 内的候选
     void filterFailedGoal();

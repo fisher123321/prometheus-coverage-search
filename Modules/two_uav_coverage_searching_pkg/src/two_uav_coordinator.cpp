@@ -27,6 +27,37 @@ double distance2d(const geometry_msgs::Point& a, const geometry_msgs::Point& b) 
   return std::hypot(a.x - b.x, a.y - b.y);
 }
 
+double wrapYaw(double yaw) { return std::atan2(std::sin(yaw), std::cos(yaw)); }
+
+void advanceYawReference(double target, double dt, double max_rate, double max_acc,
+                         double* yaw, double* yaw_rate) {
+  dt = std::max(0.002, std::min(0.05, dt));
+  const double error = wrapYaw(target - *yaw);
+  const double braking_rate = std::sqrt(2.0 * std::max(1e-3, max_acc) * std::fabs(error));
+  const double target_rate = std::copysign(std::min(max_rate, braking_rate), error);
+  const double rate_step = std::max(-max_acc * dt,
+                                    std::min(max_acc * dt, target_rate - *yaw_rate));
+  *yaw_rate = std::max(-max_rate, std::min(max_rate, *yaw_rate + rate_step));
+  const double yaw_step = *yaw_rate * dt;
+  if (std::fabs(yaw_step) >= std::fabs(error)) {
+    *yaw = wrapYaw(target);
+    *yaw_rate = 0.0;
+  } else {
+    *yaw = wrapYaw(*yaw + yaw_step);
+  }
+}
+
+bool yawRelaySelfTest() {
+  double yaw = 0.0, yaw_rate = 0.0, previous_yaw = yaw;
+  for (int i = 0; i < 400; ++i) {
+    advanceYawReference(M_PI_2, 0.01, 1.0, 1.0, &yaw, &yaw_rate);
+    if (std::fabs(yaw_rate) > 1.001 ||
+        std::fabs(wrapYaw(yaw - previous_yaw)) > 0.0101) return false;
+    previous_yaw = yaw;
+  }
+  return std::fabs(wrapYaw(M_PI_2 - yaw)) < 1e-3 && std::fabs(yaw_rate) < 1e-3;
+}
+
 }  // namespace
 
 class TwoUavCoordinator {
@@ -44,6 +75,8 @@ class TwoUavCoordinator {
     nh_.param("peer_timeout", peer_timeout_, 0.6);
     nh_.param("trajectory_timeout", trajectory_timeout_, 0.6);
     nh_.param("max_vel", max_vel_, 1.0);
+    nh_.param("yaw_max_rate", yaw_max_rate_, 1.3962634);
+    nh_.param("yaw_max_acc", yaw_max_acc_, 1.5707963);
     nh_.param("task_bundle_size", task_bundle_size_, 16);
     nh_.param("task_reach_dist", task_reach_dist_, 0.35);
     nh_.param("task_commit_timeout", task_commit_timeout_, 15.0);
@@ -58,7 +91,7 @@ class TwoUavCoordinator {
     state_sub_ = nh_.subscribe(uav + "/prometheus/state", 10, &TwoUavCoordinator::stateCb, this);
     control_sub_ = nh_.subscribe(uav + "/prometheus/control_state", 10,
                                  &TwoUavCoordinator::controlCb, this);
-    raw_command_sub_ = nh_.subscribe(uav + "/prometheus/coverage_search/raw_command", 10,
+    raw_command_sub_ = nh_.subscribe(uav + "/prometheus/coverage_search/raw_command", 1,
                                       &TwoUavCoordinator::rawCommandCb, this);
     local_frontier_sub_ = nh_.subscribe(uav + "/prometheus/coverage_search/swarm_frontiers", 2,
                                          &TwoUavCoordinator::localFrontierCb, this);
@@ -84,10 +117,12 @@ class TwoUavCoordinator {
     trajectory_pub_ = nh_.advertise<prometheus_two_uav_coverage_search::SwarmTrajectory>(tx_prefix_ + "/trajectory", 2);
     peer_collision_replan_pub_ = nh_.advertise<std_msgs::Bool>(
         uav + "/prometheus/coverage_search/peer_collision_replan", 1);
-    command_pub_ = nh_.advertise<prometheus_msgs::UAVCommand>(uav + "/prometheus/command", 10);
+    command_pub_ = nh_.advertise<prometheus_msgs::UAVCommand>(uav + "/prometheus/command", 1);
     task_label_pub_ = nh_.advertise<visualization_msgs::Marker>(
         uav + "/prometheus/coverage_search/task_labels", 10);
     timer_ = nh_.createTimer(ros::Duration(0.05), &TwoUavCoordinator::timerCb, this);
+    command_timer_ = nh_.createTimer(ros::Duration(0.01),
+                                     &TwoUavCoordinator::commandTimerCb, this);
     phase_ = WAIT_PEER;
     ROS_INFO("[two_uav_coordinator] UAV %d waits for UAV %d", uav_id_, peer_uav_id_);
   }
@@ -129,6 +164,25 @@ class TwoUavCoordinator {
   void rawCommandCb(const prometheus_msgs::UAVCommand::ConstPtr& msg) {
     raw_command_ = *msg;
     have_raw_command_ = true;
+  }
+
+  void commandTimerCb(const ros::TimerEvent& event) {
+    if (!ownReady() || phase_ != ACTIVE || !have_raw_command_) return;
+    if (!relay_yaw_inited_) {
+      relay_yaw_ = state_.attitude[2];
+      relay_yaw_rate_ = 0.0;
+      relay_yaw_inited_ = true;
+    }
+    const double dt = event.current_real.isZero() || event.last_real.isZero()
+        ? 0.01 : (event.current_real - event.last_real).toSec();
+    advanceYawReference(raw_command_.yaw_ref, dt, yaw_max_rate_, yaw_max_acc_,
+                        &relay_yaw_, &relay_yaw_rate_);
+    prometheus_msgs::UAVCommand command = raw_command_;
+    command.header.stamp = ros::Time::now();
+    command.yaw_ref = relay_yaw_;
+    command.yaw_rate_ref = relay_yaw_rate_;
+    command.Command_ID = ++command_id_;
+    command_pub_.publish(command);
   }
   void localFrontierCb(const prometheus_two_uav_coverage_search::SwarmFrontierArray::ConstPtr& msg) {
     local_frontiers_ = *msg;
@@ -274,10 +328,8 @@ class TwoUavCoordinator {
     hold.position_ref[0] = state_.position[0];
     hold.position_ref[1] = state_.position[1];
     hold.position_ref[2] = fly_height_;
-    // A safety hold may stop translation, but it must not erase the coverage
-    // node's camera-facing yaw target.  Otherwise the 20 Hz coordinator wins
-    // over the 10 Hz planner and pins the aircraft at its initial heading.
-    hold.yaw_ref = have_raw_command_ ? raw_command_.yaw_ref : state_.attitude[2];
+    hold.yaw_ref = relay_yaw_inited_ ? relay_yaw_ : state_.attitude[2];
+    hold.yaw_rate_ref = 0.0;
     hold.Command_ID = ++command_id_;
     command_pub_.publish(hold);
   }
@@ -560,9 +612,6 @@ class TwoUavCoordinator {
       return;
     }
     trajectory_pub_.publish(local_trajectory_);
-    raw_command_.header.stamp = ros::Time::now();
-    raw_command_.Command_ID = ++command_id_;
-    command_pub_.publish(raw_command_);
     publishTaskLabels();
   }
 
@@ -631,12 +680,15 @@ class TwoUavCoordinator {
   int uav_id_ = 1, peer_uav_id_ = 2, map_epoch_ = 1, task_bundle_size_ = 16;
   double fly_height_ = 1.5, min_start_separation_ = 1.0, safe_separation_ = 1.2;
   double peer_timeout_ = 0.6, trajectory_timeout_ = 0.6, max_vel_ = 1.0;
+  double yaw_max_rate_ = 1.3962634, yaw_max_acc_ = 1.5707963;
   double auction_period_ = 2.0, task_reach_dist_ = 0.35;
   double task_commit_timeout_ = 15.0, task_retry_cooldown_ = 12.0, task_goal_separation_ = 3.0;
   double task_lease_duration_ = 8.0;
   std::string tx_prefix_, rx_prefix_;
   Phase phase_ = WAIT_PEER;
   bool have_state_ = false, have_peer_ = false, have_raw_command_ = false, completion_ready_ = false;
+  bool relay_yaw_inited_ = false;
+  double relay_yaw_ = 0.0, relay_yaw_rate_ = 0.0;
   prometheus_msgs::UAVState state_;
   prometheus_msgs::UAVControlState control_;
   prometheus_msgs::UAVCommand raw_command_;
@@ -656,10 +708,13 @@ class TwoUavCoordinator {
   ros::Subscriber peer_state_sub_, peer_frontier_sub_, peer_bid_sub_, peer_task_sub_, peer_trajectory_sub_;
   ros::Publisher state_pub_, frontier_pub_, bid_pub_, task_pub_, trajectory_pub_, peer_collision_replan_pub_, command_pub_, task_label_pub_;
   int last_task_label_count_ = 0;
-  ros::Timer timer_;
+  ros::Timer timer_, command_timer_;
 };
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string(argv[1]) == "--self-test") {
+    return yawRelaySelfTest() ? 0 : 1;
+  }
   ros::init(argc, argv, "two_uav_coordinator");
   ros::NodeHandle nh("~");
   TwoUavCoordinator coordinator;

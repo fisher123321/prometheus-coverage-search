@@ -50,7 +50,7 @@ Visualization Manager:
     - Class: octomap_rviz_plugin/OccupancyGrid
       Enabled: true
       Max. Height Display: 3.4028234663852886e+38
-      Max. Octree Depth: 15
+      Max. Octree Depth: 16
       Min. Height Display: 0.5
       Name: OccupancyGrid
       Octomap Topic: /uav1/octomap_binary
@@ -62,7 +62,7 @@ Visualization Manager:
     - Class: octomap_rviz_plugin/OccupancyGrid
       Enabled: true
       Max. Height Display: 3.4028234663852886e+38
-      Max. Octree Depth: 15
+      Max. Octree Depth: 16
       Min. Height Display: 0.5
       Name: OccupancyGrid
       Octomap Topic: /uav2/octomap_binary

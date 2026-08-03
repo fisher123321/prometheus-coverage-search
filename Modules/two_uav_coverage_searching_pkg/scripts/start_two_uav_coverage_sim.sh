@@ -10,6 +10,13 @@ source /opt/ros/noetic/setup.bash
 source "$mavros_ws/devel/setup.bash"
 source "$workspace/devel/setup.bash" --extend
 
+coverage_node="$workspace/devel/lib/prometheus_two_uav_coverage_search/two_uav_coverage_search_node"
+[[ -x "$coverage_node" ]] || {
+  echo "Missing coverage executable: $coverage_node" >&2
+  echo "Build the package first: cmake --build $workspace/build/two_uav_coverage_searching_pkg -j1" >&2
+  exit 1
+}
+
 uav1_id=${1:-1}
 uav2_id=${2:-2}
 fly_height=${3:-1.5}

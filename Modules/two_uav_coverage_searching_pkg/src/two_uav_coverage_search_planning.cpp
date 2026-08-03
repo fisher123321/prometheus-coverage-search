@@ -1,7 +1,8 @@
 #include "two_uav_coverage_search.h"
 
 namespace {
-constexpr double kRollingPeriodicInterval = 1.0;
+constexpr double kRollingPeriodicInterval = 0.30;
+constexpr double kRollingHandoffSec = 0.25;
 }
 
 bool CoverageSearchManager::isStuck() {
@@ -85,7 +86,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal) {
         const ros::Time now = ros::Time::now();
         const double elapsed = std::max(0.0, (now - traj_start_time_).toSec());
         const double remaining = active_time_spline_.duration - elapsed;
-        const double handoff_lead = std::max(0.05, replan_time_);
+        const double handoff_lead = kRollingHandoffSec;
         if (remaining <= handoff_lead) return false;
         const bool periodic_due = elapsed >= kRollingPeriodicInterval &&
             (rolling_last_attempt_time_.isZero() ||
@@ -152,8 +153,6 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal) {
         planner->traj_advance_dist_ = traj_advance_dist_;
         planner->traj_point_dwell_timeout_ = traj_point_dwell_timeout_;
         planner->traj_cut_clearance_ = traj_cut_clearance_;
-        planner->rolling_terminal_speed_ratio_ = rolling_terminal_speed_ratio_;
-        planner->rolling_terminal_acc_ratio_ = rolling_terminal_acc_ratio_;
         planner->rolling_prepare_in_progress_ = false;
         planner->rolling_snapshot_mode_ = true;
 
@@ -175,12 +174,6 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal) {
                 }
                 rolling_worker_running_ = false;
             });
-            ROS_INFO("[CoverageSearch] Rolling replan #%llu: trigger=%s, remaining=%.2fs, "
-                     "frontier_generation=%llu.",
-                     (unsigned long long)rolling_replan_count_,
-                     force_new_goal ? "frontier-cleared" :
-                         (terminal_due ? "terminal" : "periodic"), remaining,
-                     (unsigned long long)frontier_generation);
         } catch (const std::exception &e) {
             rolling_worker_running_ = false;
             ROS_ERROR("[CoverageSearch] Failed to start rolling worker: %s", e.what());
@@ -195,7 +188,10 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal) {
 
     const int n = (int)traj_points_.size();
     const double elapsed = std::max(0.0, (ros::Time::now() - traj_start_time_).toSec());
-    const double handoff_time = elapsed + std::max(0.05, replan_time_);
+    // The rolling state is sampled exactly 0.25 s ahead.  It intentionally
+    // preserves the old trajectory's nonzero P/V/A/yaw derivatives; only the
+    // new trajectory's own terminal boundary is constrained to rest.
+    const double handoff_time = elapsed + kRollingHandoffSec;
     if (handoff_time > active_time_spline_.duration) return false;
     const int handoff_idx = std::min(n - 1, std::max(0, (int)std::lround(
         handoff_time / std::max(1e-3, active_time_spline_.duration) * (n - 1))));
@@ -428,12 +424,13 @@ bool CoverageSearchManager::checkObstacleAhead(Eigen::Vector3d &avoid_dir) {
 // ============================================================
 bool CoverageSearchManager::selectNextFrontier() {
     int ftr_count = frontier_finder_.getFrontierCount();
+    // This is the current planning task list, not a history of old targets.
+    frontier_targets_.clear();
+    frontier_target_yaws_.clear();
+    frontier_target_task_ids_.clear();
+    frontier_target_idx_ = 0;
 
     if (ftr_count > 0) {
-        frontier_targets_.clear();
-        frontier_target_yaws_.clear();
-        frontier_target_task_ids_.clear();
-
         struct TargetCandidate {
             FrontierFinder::FrontierCluster *frontier;
             Eigen::Vector3d pos;
@@ -927,6 +924,8 @@ void CoverageSearchManager::releaseCurrentGoal(const std::string &reason,
     uav_command_.yaw_ref = uav_yaw_;
     uav_command_.Command_ID++;
     uav_cmd_pub_.publish(uav_command_);
+
+    disarmRealtimeTrajectory();
 
     has_traj_ = false;
     has_goal_ = false;

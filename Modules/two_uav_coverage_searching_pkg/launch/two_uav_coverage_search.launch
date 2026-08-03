@@ -5,6 +5,8 @@
     <arg name="cooperative_mode" default="false"/>
     <arg name="external_goal_only" default="false"/>
     <arg name="global_coverage_source" default="0"/>
+    <arg name="max_yaw_rate" default="1.3962634"/>
+    <arg name="max_yaw_acc" default="1.5707963"/>
     <arg name="swarm_tx_prefix" default="/two_uav/tx"/>
     <arg name="swarm_rx_prefix" default="/two_uav/rx"/>
     <!-- 探索矩形也是已知空间比率的固定分母；换世界时只覆盖这些 launch 参数。 -->
@@ -34,9 +36,9 @@
         <param name="coverage_search/max_vel" value="1.5"/>
         <param name="coverage_search/max_acc" value="1.0"/>
         <!-- 最大偏航角速率 -->
-        <param name="coverage_search/max_yaw_rate" value="1.3962634"/>
+        <param name="coverage_search/max_yaw_rate" value="$(arg max_yaw_rate)"/>
         <!-- 最大偏航角加速度，保证转向从起点到视点全程平滑完成 -->
-        <param name="coverage_search/max_yaw_acc" value="1.5707963"/>
+        <param name="coverage_search/max_yaw_acc" value="$(arg max_yaw_acc)"/>
         <!-- 滚动重规划交接前瞻时间(秒) -->
         <param name="coverage_search/replan_time" value="0.25"/>
         <!-- 目标到达判定距离(米) -->
@@ -51,18 +53,14 @@
         <param name="coverage_search/traj_advance_dist" value="0.35"/>
         <!-- 单点最长停留超时(秒) - 卡住超过此值停车并从实测位置重规划 -->
         <param name="coverage_search/traj_point_dwell_timeout" value="3.0"/>
-        <!-- 严格完成：已知率达标且持续无前沿；不达标时原地旋转恢复残余观测 -->
+        <!-- 完成条件：固定区域覆盖率严格大于 99%。 -->
         <param name="coverage_search/completion_known_ratio" value="$(arg completion_known_ratio)"/>
-        <param name="coverage_search/completion_no_frontier_dwell" value="8.0"/>
         <param name="coverage_search/residual_scan_yaw_rate" value="0.6"/>
         <!-- Bids use A* path length.  Bound their rate/work so bid generation
              never competes with the real-time command loop. -->
         <param name="coverage_search/swarm_bid_period" value="2.0"/>
         <param name="coverage_search/swarm_bid_max_tasks" value="16"/>
         <param name="coverage_search/swarm_bid_max_astar" value="6"/>
-        <!-- 滚动重规划保持终端状态的速度、加速度上限 -->
-        <param name="coverage_search/rolling_terminal_speed_ratio" value="0.10"/>
-        <param name="coverage_search/rolling_terminal_acc_ratio" value="0.10"/>
         <!-- 自动开始 -->
         <param name="coverage_search/auto_start" value="$(arg auto_start)"/>
         <param name="coverage_search/cooperative_mode" value="$(arg cooperative_mode)"/>
@@ -116,16 +114,9 @@
         <!-- 前沿查找器参数 -->
         <param name="frontier_finder/cluster_min" value="5"/>
         <param name="frontier_finder/cluster_size_xy" value="2.2"/>
-        <param name="frontier_finder/min_candidate_dist" value="0.0"/>
-        <param name="frontier_finder/candidate_rmin" value="1.2"/>
-        <param name="frontier_finder/candidate_rmax" value="1.6"/>
-        <param name="frontier_finder/candidate_rnum" value="4"/>
-        <param name="frontier_finder/candidate_dphi" value="0.262"/>
-        <param name="frontier_finder/down_sample" value="1"/>
-        <param name="frontier_finder/min_visib_num" value="3"/>
-        <param name="frontier_finder/min_candidate_clearance" value="0.45"/>
-        <param name="frontier_finder/min_candidate_occupied_clearance" value="0.55"/>
-        <param name="frontier_finder/min_viewpoint_frontier_dist" value="0.55"/>
+        <param name="frontier_finder/candidate_radius" value="1.4"/>
+        <param name="frontier_finder/candidate_clearance" value="0.45"/>
+        <param name="frontier_finder/down_sample" value="2"/>
         <param name="frontier_finder/min_frontier_height" value="0.30"/>
         <param name="frontier_finder/max_frontier_height" value="1.85"/>
         <param name="frontier_finder/max_frontier_above_flight" value="0.35"/>
