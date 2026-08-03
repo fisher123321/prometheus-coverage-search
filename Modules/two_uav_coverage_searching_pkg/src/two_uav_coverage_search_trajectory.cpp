@@ -1729,15 +1729,28 @@ bool CoverageSearchManager::activatePendingTrajectory() {
     // A frontier can be re-clustered between planning and handoff.  Its exact
     // task ID is then stale, but the already planned route remains reusable if
     // the target is still free and no peer owns the nearby frontier.
-    const bool goal_reusable = !peer_owns_goal &&
-        (frontier_still_present || goal_still_free);
+    bool atsp_tour_valid = true;
+    if (pending_traj_.atsp_tour_active) {
+        for (int index = pending_traj_.frontier_target_idx;
+             index < static_cast<int>(pending_traj_.frontier_targets.size()); ++index) {
+            if (!isAtspTargetValid(pending_traj_.frontier_targets[index],
+                                   pending_traj_.frontier_target_yaws[index],
+                                   pending_traj_.frontier_target_task_ids[index])) {
+                atsp_tour_valid = false;
+                break;
+            }
+        }
+    }
+    const bool goal_reusable = pending_traj_.atsp_tour_active ? atsp_tour_valid :
+        !peer_owns_goal && (frontier_still_present || goal_still_free);
     if (!successor_state_valid || !goal_reusable) {
         ROS_WARN("[CoverageSearch] Rolling successor discarded: valid=%s, frontier=%s, "
-                 "goal_free=%s, peer_owned=%s.",
+                 "goal_free=%s, peer_owned=%s, atsp_tour=%s.",
                  successor_state_valid ? "yes" : "no",
                  frontier_still_present ? "fresh" : "stale",
                  goal_still_free ? "yes" : "no",
-                 peer_owns_goal ? "yes" : "no");
+                 peer_owns_goal ? "yes" : "no",
+                 atsp_tour_valid ? "valid" : "invalid");
         pending_traj_ = PendingTrajectory();
         return false;
     }
@@ -1762,6 +1775,11 @@ bool CoverageSearchManager::activatePendingTrajectory() {
     current_goal_ = pending_traj_.goal;
     current_goal_yaw_ = pending_traj_.goal_yaw;
     current_goal_task_id_ = pending_traj_.task_id;
+    frontier_targets_ = pending_traj_.frontier_targets;
+    frontier_target_yaws_ = pending_traj_.frontier_target_yaws;
+    frontier_target_task_ids_ = pending_traj_.frontier_target_task_ids;
+    frontier_target_idx_ = pending_traj_.frontier_target_idx;
+    atsp_tour_active_ = pending_traj_.atsp_tour_active;
     astar_path_ = pending_traj_.astar_path;
     traj_points_ = pending_traj_.points;
     traj_vels_ = pending_traj_.vels;
@@ -2011,7 +2029,11 @@ void CoverageSearchManager::maintainActiveTrajectory() {
     if (active_time_spline_.valid) {
         const double elapsed = std::max(0.0, (ros::Time::now() - traj_start_time_).toSec());
         const bool successor_due = active_time_spline_.duration - elapsed <= 0.50;
-        if (currentGoalFrontierCovered() || successor_due) {
+        const bool final_atsp_target = atsp_tour_active_ && !frontier_targets_.empty() &&
+            frontier_target_idx_ == static_cast<int>(frontier_targets_.size()) - 1;
+        if (final_atsp_target) {
+            tryPrepareRollingHandoff(true, true);
+        } else if (currentGoalFrontierCovered() || successor_due) {
             tryPrepareRollingHandoff(true);
         }
         if (pending_traj_.ready && pending_traj_.handoff_time >= 0.0 &&

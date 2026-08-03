@@ -30,6 +30,11 @@ coverage_search:
   traj_advance_dist: 0.35
   completion_known_ratio: 0.99
   residual_scan_yaw_rate: 0.6
+  atsp_enabled: true
+  atsp_max_clusters: 5           # hard-capped at 5; exact open ATSP
+  atsp_refine_clusters: 3        # refine only the first 3 tour clusters
+  atsp_viewpoints_per_cluster: 3 # retain the top 3 viewpoints per refined cluster
+  atsp_edge_timeout_ms: 100.0
 
 sensor:
   depth_min_range: 0.2

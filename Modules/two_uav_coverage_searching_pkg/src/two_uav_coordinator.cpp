@@ -187,6 +187,7 @@ class TwoUavCoordinator {
   void localFrontierCb(const prometheus_two_uav_coverage_search::SwarmFrontierArray::ConstPtr& msg) {
     local_frontiers_ = *msg;
     local_frontier_received_ = ros::Time::now();
+    claimLocalFrontierReservations();
   }
   void localBidCb(const prometheus_two_uav_coverage_search::SwarmBidArray::ConstPtr& msg) {
     if (static_cast<int>(msg->source_uav_id) != uav_id_) return;
@@ -349,6 +350,73 @@ class TwoUavCoordinator {
       hold.velocities.push_back(velocity);
     }
     trajectory_pub_.publish(hold);
+  }
+
+  void publishOwnLeases(const ros::Time& now) {
+    prometheus_two_uav_coverage_search::SwarmTaskArray out;
+    out.header.stamp = now;
+    out.source_uav_id = uav_id_;
+    out.map_epoch = map_epoch_;
+    out.revision = ++task_revision_;
+    for (const auto& entry : own_leases_) {
+      if (entry.second.lease_expire_time > now) out.tasks.push_back(entry.second);
+    }
+    local_tasks_ = out;
+    local_task_published_ = now;
+    task_pub_.publish(out);
+  }
+
+  void claimLocalFrontierReservations() {
+    const ros::Time now = ros::Time::now();
+    int claimed = 0;
+    int updated = 0;
+    for (const auto& frontier : local_frontiers_.frontiers) {
+      if (frontier.reservation_owner_uav_id != static_cast<uint32_t>(uav_id_) ||
+          frontier.reservation_expire_time <= now) continue;
+      const auto existing = own_leases_.find(frontier.task_id);
+      if (existing != own_leases_.end() && existing->second.lease_expire_time > now) {
+        const auto& previous = existing->second;
+        const bool changed = previous.cluster_version != frontier.cluster_version ||
+            previous.frontier_cell_count != frontier.frontier_cell_count ||
+            distance2d(previous.goal.position, frontier.viewpoint.position) > 1e-3 ||
+            std::fabs(previous.goal.position.z - frontier.viewpoint.position.z) > 1e-3 ||
+            std::fabs(previous.goal.orientation.z - frontier.viewpoint.orientation.z) > 1e-4 ||
+            std::fabs(previous.goal.orientation.w - frontier.viewpoint.orientation.w) > 1e-4;
+        if (!changed) continue;
+        auto task = previous;
+        task.task_version = std::max(task.task_version, local_frontiers_.revision);
+        task.cluster_version = frontier.cluster_version;
+        task.frontier_cell_count = frontier.frontier_cell_count;
+        task.centroid = frontier.centroid;
+        task.box_min = frontier.box_min;
+        task.box_max = frontier.box_max;
+        task.goal = frontier.viewpoint;
+        own_leases_[task.task_id] = task;
+        ++updated;
+        continue;
+      }
+      if (existing != own_leases_.end()) own_leases_.erase(existing);
+      prometheus_two_uav_coverage_search::SwarmTask task;
+      task.task_id = frontier.task_id;
+      task.task_version = std::max(1u, local_frontiers_.revision);
+      task.cluster_version = frontier.cluster_version;
+      task.frontier_cell_count = frontier.frontier_cell_count;
+      task.winner_uav_id = uav_id_;
+      task.cost = 0.0;
+      task.centroid = frontier.centroid;
+      task.box_min = frontier.box_min;
+      task.box_max = frontier.box_max;
+      task.goal = frontier.viewpoint;
+      task.lease_expire_time = now + ros::Duration(task_lease_duration_);
+      own_leases_[task.task_id] = task;
+      ++claimed;
+    }
+    if (claimed > 0 || updated > 0) {
+      publishOwnLeases(now);
+      ROS_INFO("[two_uav_coordinator] UAV %d directly claimed %d and updated %d "
+               "local frontier task(s); new leases are %.1fs.", uav_id_, claimed, updated,
+               task_lease_duration_);
+    }
   }
 
   void runAuction() {
@@ -545,15 +613,7 @@ class TwoUavCoordinator {
       own_leases_[task.task_id] = task;
     }
 
-    prometheus_two_uav_coverage_search::SwarmTaskArray out;
-    out.header.stamp = now;
-    out.source_uav_id = uav_id_;
-    out.map_epoch = map_epoch_;
-    out.revision = ++task_revision_;
-    out.tasks = own;
-    local_tasks_ = out;
-    local_task_published_ = now;
-    task_pub_.publish(out);
+    publishOwnLeases(now);
     ROS_INFO_THROTTLE(2.0, "[two_uav_coordinator] UAV %d holds %zu leases.",
                       uav_id_, own.size());
   }
