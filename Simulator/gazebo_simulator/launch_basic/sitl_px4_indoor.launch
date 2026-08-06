@@ -22,6 +22,7 @@
     <arg name="uav_init_y" default="0.0"/>
 	<arg name="uav_init_z" default="0.15"/>
 	<arg name="uav_init_yaw" default="0.0"/>
+	<arg name="spawn_delay" default="0.0"/>
 
 	<!-- 无人机编号说明 -->
 	<!-- uav_id为Prometheus系统中对无人机编号的定义，从1开始 -->
@@ -56,6 +57,7 @@
 		</node>
 		<!-- 启动Gazebo模型 -->
 		<node name="$(arg vehicle)_$(arg uav_id)_spawn" pkg="gazebo_ros" type="spawn_model" output="screen"
+			launch-prefix="bash -c 'sleep $(arg spawn_delay); exec &quot;$@&quot;' --"
 			args="-sdf -param sdf_$(arg vehicle)_$(arg ID) -model $(arg vehicle)_$(arg ID) -x $(arg uav_init_x) -y $(arg uav_init_y) -z $(arg uav_init_z) -Y $(arg uav_init_yaw)">
 		</node>
 		<!-- 启动MAVROS -->

@@ -13,6 +13,9 @@ coverage_search:
   max_yaw_rate: 1.3962634  # 80 deg/s
   max_yaw_acc: 1.5707963  # 90 deg/s^2
   replan_time: 0.25
+  replan_min_execute_time: 0.5
+  replan_periodic_time: 1.5
+  replan_remaining_time: 0.5
   goal_reach_dist: 0.25
   auto_start: true
   map_input_source: 3      # 0=global pcl, 1=local pcl, 2=scan pcl, 3=D435i depth pcl
@@ -35,6 +38,7 @@ coverage_search:
   atsp_refine_clusters: 3        # refine only the first 3 tour clusters
   atsp_viewpoints_per_cluster: 3 # retain the top 3 viewpoints per refined cluster
   atsp_edge_timeout_ms: 100.0
+  swarm_chunk_delta_period: 0.25 # 4 Hz fused-map evidence exchange
 
 sensor:
   depth_min_range: 0.2

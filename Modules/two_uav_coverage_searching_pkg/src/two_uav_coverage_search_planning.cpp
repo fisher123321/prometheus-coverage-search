@@ -3,7 +3,7 @@
 
 namespace {
 constexpr double kRollingPeriodicInterval = 0.30;
-constexpr double kRollingHandoffSec = 0.25;
+constexpr double kRollingTimingLogThresholdMs = 250.0;
 }
 
 bool CoverageSearchManager::isStuck() {
@@ -71,10 +71,12 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
                     ROS_WARN("[CoverageSearch] Discard stale rolling result: source=%llu, active=%llu.",
                              (unsigned long long)completed_pending_traj_.source_generation,
                              (unsigned long long)rolling_generation_);
+                    rolling_replan_requested_ = true;
                 } else {
-                    ROS_INFO("[CoverageSearch] No safe successor in frontier generation %llu; "
-                             "continue old trajectory and wait for a newer generation.",
+                    ROS_INFO("[CoverageSearch] No safe rolling successor in frontier generation %llu; "
+                             "retain old trajectory and retry from a later handoff state.",
                              (unsigned long long)completed_pending_traj_.frontier_generation);
+                    rolling_replan_requested_ = true;
                 }
                 completed_pending_traj_ = PendingTrajectory();
             }
@@ -88,7 +90,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
         const ros::Time now = ros::Time::now();
         const double elapsed = std::max(0.0, (now - traj_start_time_).toSec());
         const double remaining = active_time_spline_.duration - elapsed;
-        const double handoff_lead = kRollingHandoffSec;
+        const double handoff_lead = std::max(0.01, replan_time_);
         if (remaining <= handoff_lead) return false;
         const bool periodic_due = elapsed >= kRollingPeriodicInterval &&
             (rolling_last_attempt_time_.isZero() ||
@@ -102,6 +104,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
         std::shared_ptr<CoverageSearchManager> planner(new CoverageSearchManager());
         planner->coverage_map_ = coverage_map_;
         planner->frontier_finder_ = frontier_finder_;
+        planner->frontier_finder_.setMap(&planner->coverage_map_);
         planner->astar2d_.init(&planner->coverage_map_);
         planner->uav_id_ = uav_id_;
         planner->uav_pos_ = uav_pos_;
@@ -124,8 +127,12 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
         planner->atsp_edge_timeout_ms_ = atsp_edge_timeout_ms_;
         planner->local_swarm_tasks_ = local_swarm_tasks_;
         planner->remote_swarm_tasks_ = remote_swarm_tasks_;
+        planner->local_swarm_frontiers_ = local_swarm_frontiers_;
+        planner->remote_swarm_frontiers_ = remote_swarm_frontiers_;
+        planner->local_frontier_reservations_ = local_frontier_reservations_;
         planner->local_swarm_task_received_ = local_swarm_task_received_;
         planner->remote_swarm_task_received_ = remote_swarm_task_received_;
+        planner->remote_swarm_frontier_received_ = remote_swarm_frontier_received_;
         planner->current_goal_ = current_goal_;
         planner->current_goal_yaw_ = current_goal_yaw_;
         planner->current_goal_task_id_ = current_goal_task_id_;
@@ -166,7 +173,6 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
         planner->traj_cut_clearance_ = traj_cut_clearance_;
         planner->rolling_prepare_in_progress_ = false;
         planner->rolling_snapshot_mode_ = true;
-
         rolling_last_attempt_time_ = now;
         ++rolling_replan_count_;
         rolling_worker_running_ = true;
@@ -175,14 +181,30 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
             rolling_worker_ = std::thread([this, planner, source_generation,
                                            frontier_generation, force_new_goal,
                                            handoff_at_terminal]() {
+                const auto replan_start = std::chrono::steady_clock::now();
                 planner->tryPrepareRollingHandoff(force_new_goal, handoff_at_terminal);
                 PendingTrajectory result = std::move(planner->pending_traj_);
+                const bool ready = result.ready;
+                const double replan_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - replan_start).count();
                 result.result_ready_time = ros::Time::now();
                 result.source_generation = source_generation;
                 result.frontier_generation = frontier_generation;
                 {
                     std::lock_guard<std::mutex> lock(rolling_result_mutex_);
                     completed_pending_traj_ = std::move(result);
+                }
+                if (replan_ms >= kRollingTimingLogThresholdMs) {
+                    const AtspTiming &atsp = planner->rolling_atsp_timing_;
+                    if (atsp.valid) {
+                        ROS_INFO(GREEN "[ReplanTiming] ATSP mode=rolling total=%.1f ms order_dp=%.3f ms "
+                                 "clusters=%zu result=%s (%s)." TAIL,
+                                 atsp.total_ms, atsp.order_dp_ms, atsp.cluster_count,
+                                 atsp.solved ? "ready" : "failed", atsp.reason);
+                    }
+                    ROS_INFO(GREEN "[ReplanTiming] rolling total=%.1f ms ready=%s generation=%llu." TAIL,
+                             replan_ms, ready ? "yes" : "no",
+                             static_cast<unsigned long long>(frontier_generation));
                 }
                 rolling_worker_running_ = false;
             });
@@ -198,13 +220,14 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
         return false;
     }
 
+    const auto rolling_start = std::chrono::steady_clock::now();
     const int n = (int)traj_points_.size();
     const double elapsed = std::max(0.0, (ros::Time::now() - traj_start_time_).toSec());
     // While the final ATSP target is still being executed, prepare the next
     // tour from its terminal state so that the observation is not cut short.
     // Ordinary rolling handoffs retain the 0.25 s look-ahead.
     const double handoff_time = handoff_at_terminal ? active_time_spline_.duration :
-        elapsed + kRollingHandoffSec;
+        elapsed + std::max(0.01, replan_time_);
     if (handoff_time > active_time_spline_.duration) return false;
     const int handoff_idx = std::min(n - 1, std::max(0, (int)std::lround(
         handoff_time / std::max(1e-3, active_time_spline_.duration) * (n - 1))));
@@ -216,6 +239,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
         ROS_WARN("[CoverageSearch] Cannot evaluate rolling handoff state.");
         return false;
     }
+    const auto handoff_end = std::chrono::steady_clock::now();
 
     const FrontierFinder::FrontierCluster *active_frontier = nullptr;
     if (!force_new_goal) {
@@ -260,9 +284,9 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
     const Eigen::Vector3d old_planning_start_acc = planning_start_acc_;
     const double old_planning_start_yaw_rate = planning_start_yaw_rate_;
     const double old_planning_start_yaw_acc = planning_start_yaw_acc_;
+    const auto snapshot_end = std::chrono::steady_clock::now();
 
     PendingTrajectory prepared;
-    const auto planning_start = std::chrono::steady_clock::now();
     uav_pos_ = handoff_pos;
     uav_vel_ = handoff_vel;
     uav_yaw_ = handoff_yaw;
@@ -272,7 +296,9 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
     planning_start_yaw_acc_ = handoff_yaw_acc;
 
     rolling_prepare_in_progress_ = true;
+    rolling_atsp_timing_ = AtspTiming();
     bool successor_selected = false;
+    const auto selection_start = std::chrono::steady_clock::now();
     if (active_frontier) {
         current_goal_ = active_frontier->viewpoints.front();
         current_goal_(2) = fly_height_;
@@ -281,11 +307,15 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
         current_goal_task_id_ = active_goal_frontier_.task_id;
         successor_selected = true;
     } else if (force_new_goal) {
-        if (atsp_enabled_) {
-            if (!selectAtspSuccessor()) selectNextFrontier();
-        } else {
-            selectNextFrontier();
-        }
+        // FUEL recomputes the tour from the current frontier snapshot on every
+        // execution-triggered replan.  Do not consume a suffix ordered for an
+        // already changed map.
+        atsp_tour_active_ = false;
+        frontier_targets_.clear();
+        frontier_target_yaws_.clear();
+        frontier_target_task_ids_.clear();
+        frontier_target_idx_ = 0;
+        selectNextFrontier();
         if (!frontier_targets_.empty()) {
             current_goal_ = frontier_targets_[frontier_target_idx_];
             current_goal_(2) = fly_height_;
@@ -294,9 +324,14 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
             successor_selected = true;
         }
     }
+    const auto selection_end = std::chrono::steady_clock::now();
     has_goal_ = successor_selected;
     astar2d_.setSearchTimeout(50.0);
-    if (successor_selected && planPathToGoal()) {
+    const auto path_start = std::chrono::steady_clock::now();
+    const bool path_found = successor_selected && planPathToGoal();
+    const auto path_end = std::chrono::steady_clock::now();
+    const auto trajectory_start = path_end;
+    if (path_found) {
         generateBsplineTraj();
         if (has_traj_ && active_time_spline_.valid) {
             prepared.ready = true;
@@ -318,6 +353,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
             prepared.atsp_tour_active = atsp_tour_active_;
         }
     }
+    const auto trajectory_end = std::chrono::steady_clock::now();
     astar2d_.setSearchTimeout(250.0);
     rolling_prepare_in_progress_ = false;
 
@@ -355,9 +391,24 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
     planning_start_acc_ = old_planning_start_acc;
     planning_start_yaw_rate_ = old_planning_start_yaw_rate;
     planning_start_yaw_acc_ = old_planning_start_yaw_acc;
+    const auto restore_end = std::chrono::steady_clock::now();
 
     const double planning_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - planning_start).count();
+        restore_end - rolling_start).count();
+    const double traj_ms = std::chrono::duration<double, std::milli>(trajectory_end - trajectory_start).count();
+    if (planning_ms >= kRollingTimingLogThresholdMs) {
+        ROS_INFO(GREEN "[ReplanTiming] rolling stages handoff=%.1f snapshot=%.1f select=%.1f "
+                 "path=%.1f trajectory=%.1f (esdf=%.1f geometry=%.1f profile=%.1f) restore=%.1f total=%.1f ms "
+                 "selected=%s path_found=%s ready=%s." TAIL,
+                 std::chrono::duration<double, std::milli>(handoff_end - rolling_start).count(),
+                 std::chrono::duration<double, std::milli>(snapshot_end - handoff_end).count(),
+                 std::chrono::duration<double, std::milli>(selection_end - selection_start).count(),
+                 std::chrono::duration<double, std::milli>(path_end - path_start).count(),
+                 traj_ms, traj_esdf_ms_, traj_geometry_ms_, traj_profile_ms_,
+                 std::chrono::duration<double, std::milli>(restore_end - trajectory_end).count(),
+                 planning_ms, successor_selected ? "yes" : "no", path_found ? "yes" : "no",
+                 prepared.ready ? "yes" : "no");
+    }
     if (!prepared.ready) {
         ROS_WARN("[CoverageSearch] Rolling preplan failed after %.1f ms; retain old trajectory.",
                  planning_ms);
@@ -365,10 +416,12 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
     }
 
     pending_traj_ = std::move(prepared);
-    ROS_INFO("[CoverageSearch] Rolling trajectory ready: handoff=%.2fs (%d/%d), "
-             "goal=(%.2f,%.2f), next_points=%zu, planning=%.1f ms.",
-             pending_traj_.handoff_time, pending_traj_.handoff_idx, n, pending_traj_.goal(0),
-             pending_traj_.goal(1), pending_traj_.points.size(), planning_ms);
+    if (planning_ms >= kRollingTimingLogThresholdMs) {
+        ROS_INFO("[CoverageSearch] Rolling trajectory ready: handoff=%.2fs (%d/%d), "
+                 "goal=(%.2f,%.2f), next_points=%zu, planning=%.1f ms.",
+                 pending_traj_.handoff_time, pending_traj_.handoff_idx, n, pending_traj_.goal(0),
+                 pending_traj_.goal(1), pending_traj_.points.size(), planning_ms);
+    }
     return true;
 }
 
@@ -448,16 +501,28 @@ bool CoverageSearchManager::checkObstacleAhead(Eigen::Vector3d &avoid_dir) {
 // ★ 核心方法1：选择下一个前沿簇目标
 // ============================================================
 bool CoverageSearchManager::selectAtspTour() {
-    struct Cluster {
-        FrontierFinder::FrontierCluster *frontier;
-        Eigen::Vector3d point;
-        double yaw;
-        uint64_t task_id;
-        double distance;
+    const auto atsp_start = std::chrono::steady_clock::now();
+    double order_dp_ms = 0.0;
+    const auto log_atsp = [&](bool solved, const char *reason, size_t cluster_count) {
+        const double total_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - atsp_start).count();
+        if (rolling_snapshot_mode_) {
+            rolling_atsp_timing_ = {true, solved, total_ms, order_dp_ms, cluster_count, reason};
+            return;
+        }
+        ROS_INFO(GREEN "[ReplanTiming] ATSP mode=%s total=%.1f ms order_dp=%.3f ms "
+                 "clusters=%zu result=%s (%s)." TAIL,
+                 rolling_snapshot_mode_ ? "rolling" : "normal", total_ms, order_dp_ms,
+                 cluster_count, solved ? "ready" : "failed", reason);
     };
     struct Viewpoint {
         Eigen::Vector3d point;
         double yaw;
+    };
+    struct Cluster {
+        std::vector<Viewpoint> viewpoints;
+        uint64_t task_id;
+        double distance;
     };
 
     frontier_targets_.clear();
@@ -470,19 +535,58 @@ bool CoverageSearchManager::selectAtspTour() {
     for (auto &frontier : frontier_finder_.frontiers_) {
         if (!hasConfirmedSelfLease(frontier) || isFrontierLeasedToPeer(frontier) ||
             frontier.viewpoints.empty()) continue;
-        const Eigen::Vector3d &point = frontier.viewpoints.front();
-        Eigen::Vector3i index;
-        coverage_map_.posToIndex(point, index);
-        if (!coverage_map_.isInMap2D(index(0), index(1)) ||
-            !coverage_map_.isFree2D(index(0), index(1)) ||
-            coverage_map_.getDistance2D(index(0), index(1)) + 1e-3 <
-                requiredTrajectoryClearance(point, traj_cut_clearance_)) continue;
-        const double yaw = frontier.viewpoint_yaws.empty() ? uav_yaw_ :
-                           frontier.viewpoint_yaws.front();
-        if (!frontier_finder_.isViewpointVisible(frontier, point, yaw)) continue;
-        clusters.push_back({&frontier, point, yaw, frontierTaskId(frontier),
-                            (point.head<2>() - uav_pos_.head<2>()).norm()});
+        std::vector<Viewpoint> viewpoints;
+        for (size_t view = 0; view < frontier.viewpoints.size() && view < 3; ++view) {
+            const Eigen::Vector3d &point = frontier.viewpoints[view];
+            Eigen::Vector3i index;
+            coverage_map_.posToIndex(point, index);
+            const double yaw = view < frontier.viewpoint_yaws.size()
+                ? frontier.viewpoint_yaws[view] : uav_yaw_;
+            if (coverage_map_.isInMap2D(index(0), index(1)) &&
+                coverage_map_.isFree2D(index(0), index(1)) &&
+                coverage_map_.getDistance2D(index(0), index(1)) + 1e-3 >=
+                    requiredTrajectoryClearance(point, traj_cut_clearance_) &&
+                frontier_finder_.isViewpointVisible(frontier, point, yaw)) {
+                viewpoints.push_back({point, yaw});
+            }
+        }
+        if (viewpoints.empty()) continue;
+        clusters.push_back({viewpoints, frontierTaskId(frontier),
+                            (viewpoints.front().point.head<2>() - uav_pos_.head<2>()).norm()});
     }
+
+    // A remote source frontier is never recreated in frontier_finder_.  Once
+    // this UAV owns its lease, its three transmitted candidates enter the same
+    // local ATSP refinement as a locally sensed frontier.
+    std::set<uint64_t> remote_added;
+    const auto add_remote = [&](const prometheus_two_uav_coverage_search::SwarmTaskArray &tasks,
+                                const ros::Time &received) {
+        const ros::Time now = ros::Time::now();
+        if (received.isZero() || (now - received).toSec() > 5.0) return;
+        for (const auto &task : tasks.tasks) {
+            if (task.frontier_source_uav_id == static_cast<uint32_t>(uav_id_) ||
+                task.winner_uav_id != static_cast<uint32_t>(uav_id_) ||
+                task.lease_expire_time <= now || task.candidate_viewpoints.empty() ||
+                !remote_added.insert(task.task_id).second) continue;
+            std::vector<Viewpoint> viewpoints;
+            for (size_t view = 0; view < task.candidate_viewpoints.size() && view < 3; ++view) {
+                const auto &pose = task.candidate_viewpoints[view];
+                const double yaw = std::atan2(2.0 * (pose.orientation.w * pose.orientation.z +
+                                                     pose.orientation.x * pose.orientation.y),
+                                               1.0 - 2.0 * (pose.orientation.y * pose.orientation.y +
+                                                            pose.orientation.z * pose.orientation.z));
+                Eigen::Vector3d point(pose.position.x, pose.position.y, fly_height_);
+                if (isRemoteTaskViewpointValid(task, point, yaw)) viewpoints.push_back({point, yaw});
+            }
+            if (!viewpoints.empty()) {
+                clusters.push_back({viewpoints, task.task_id,
+                    (viewpoints.front().point.head<2>() - uav_pos_.head<2>()).norm()});
+            }
+        }
+    };
+    add_remote(local_swarm_tasks_, local_swarm_task_received_);
+    add_remote(remote_swarm_tasks_, remote_swarm_task_received_);
+
     std::sort(clusters.begin(), clusters.end(),
               [](const Cluster &lhs, const Cluster &rhs) { return lhs.distance < rhs.distance; });
     std::set<uint64_t> selected_task_ids;
@@ -501,7 +605,10 @@ bool CoverageSearchManager::selectAtspTour() {
     }
     if (static_cast<int>(clusters.size()) > atsp_max_clusters_)
         clusters.resize(atsp_max_clusters_);
-    if (clusters.empty()) return false;
+    if (clusters.empty()) {
+        log_atsp(false, "no leased viewpoints", 0);
+        return false;
+    }
 
     const auto edge_cost = [&](const Eigen::Vector3d &from_pos,
                                const Eigen::Vector3d &from_vel, double from_yaw,
@@ -523,13 +630,16 @@ bool CoverageSearchManager::selectAtspTour() {
     astar2d_.setSearchTimeout(atsp_edge_timeout_ms_);
     std::vector<Cluster> reachable;
     for (const auto &cluster : clusters) {
-        if (std::isfinite(edge_cost(uav_pos_, uav_vel_, uav_yaw_, cluster.point, cluster.yaw)))
+        if (std::isfinite(edge_cost(uav_pos_, uav_vel_, uav_yaw_,
+                                    cluster.viewpoints.front().point,
+                                    cluster.viewpoints.front().yaw)))
             reachable.push_back(cluster);
     }
     clusters.swap(reachable);
     const int count = static_cast<int>(clusters.size());
     if (count == 0) {
         astar2d_.setSearchTimeout(250.0);
+        log_atsp(false, "no reachable cluster", 0);
         return false;
     }
 
@@ -537,19 +647,26 @@ bool CoverageSearchManager::selectAtspTour() {
         count + 1, std::vector<double>(count + 1, 0.0));
     for (int i = 0; i < count; ++i) {
         matrix[0][i + 1] = edge_cost(uav_pos_, uav_vel_, uav_yaw_,
-                                     clusters[i].point, clusters[i].yaw);
+                                     clusters[i].viewpoints.front().point,
+                                     clusters[i].viewpoints.front().yaw);
         for (int j = 0; j < count; ++j) {
             if (i == j) continue;
             matrix[i + 1][j + 1] = edge_cost(
-                clusters[i].point, Eigen::Vector3d::Zero(), clusters[i].yaw,
-                clusters[j].point, clusters[j].yaw);
+                clusters[i].viewpoints.front().point, Eigen::Vector3d::Zero(),
+                clusters[i].viewpoints.front().yaw,
+                clusters[j].viewpoints.front().point, clusters[j].viewpoints.front().yaw);
         }
     }
     astar2d_.setSearchTimeout(250.0);
 
     std::vector<int> order;
-    if (!solveOpenAtsp(matrix, order)) {
+    const auto order_start = std::chrono::steady_clock::now();
+    const bool atsp_solved = solveOpenAtsp(matrix, order);
+    order_dp_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - order_start).count();
+    if (!atsp_solved) {
         ROS_WARN_THROTTLE(2.0, "[CoverageSearch] No safe open ATSP route for current leased tasks.");
+        log_atsp(false, "open tour unavailable", clusters.size());
         return false;
     }
     if (local_discovery_priority_task_id_ != 0) {
@@ -567,21 +684,10 @@ bool CoverageSearchManager::selectAtspTour() {
     const int refine_count = std::min(atsp_refine_clusters_, static_cast<int>(tour.size()));
     std::vector<std::vector<Viewpoint>> layers(refine_count);
     for (int i = 0; i < refine_count; ++i) {
-        const auto &frontier = *tour[i].frontier;
-        for (int view = 0; view < static_cast<int>(frontier.viewpoints.size()) &&
-                           view < atsp_viewpoints_per_cluster_; ++view) {
-            const Eigen::Vector3d &point = frontier.viewpoints[view];
-            Eigen::Vector3i index;
-            coverage_map_.posToIndex(point, index);
-            const double yaw = view < static_cast<int>(frontier.viewpoint_yaws.size())
-                ? frontier.viewpoint_yaws[view] : tour[i].yaw;
-            if (coverage_map_.isInMap2D(index(0), index(1)) &&
-                coverage_map_.isFree2D(index(0), index(1)) &&
-                frontier_finder_.isViewpointVisible(frontier, point, yaw)) {
-                layers[i].push_back({point, yaw});
-            }
-        }
-        if (layers[i].empty()) layers[i].push_back({tour[i].point, tour[i].yaw});
+        const int views = std::min(atsp_viewpoints_per_cluster_,
+                                   static_cast<int>(tour[i].viewpoints.size()));
+        layers[i].insert(layers[i].end(), tour[i].viewpoints.begin(),
+                         tour[i].viewpoints.begin() + views);
     }
 
     if (refine_count > 0) {
@@ -619,45 +725,25 @@ bool CoverageSearchManager::selectAtspTour() {
         }
         if (view >= 0 && std::isfinite(costs.back()[view])) {
             for (int layer = refine_count - 1; layer >= 0; --layer) {
-                tour[layer].point = layers[layer][view].point;
-                tour[layer].yaw = layers[layer][view].yaw;
+                tour[layer].viewpoints.front() = layers[layer][view];
                 view = parents[layer][view];
             }
         }
     }
 
-    std::set<uint64_t> unique_tasks;
-    for (const auto &target : tour) {
-        ROS_ASSERT(unique_tasks.insert(target.task_id).second);
-        frontier_targets_.push_back(target.point);
-        frontier_target_yaws_.push_back(target.yaw);
-        frontier_target_task_ids_.push_back(target.task_id);
-    }
+    ROS_ASSERT(!tour.empty());
+    // FUEL semantics: ATSP only ranks the present frontier snapshot.  The
+    // executable plan contains its first refined target; every replan solves
+    // a new tour instead of consuming an old B/C/D suffix.
+    const auto &next_target = tour.front();
+    frontier_targets_.push_back(next_target.viewpoints.front().point);
+    frontier_target_yaws_.push_back(next_target.viewpoints.front().yaw);
+    frontier_target_task_ids_.push_back(next_target.task_id);
     atsp_tour_active_ = true;
-    ROS_INFO("[CoverageSearch] Open ATSP tour: %zu leased clusters, refine=%d x %d viewpoints.",
-             tour.size(), refine_count, atsp_viewpoints_per_cluster_);
+    log_atsp(true, "first task selected", tour.size());
+    ROS_INFO("[CoverageSearch] Open ATSP solved %zu leased clusters, refine=%d x %d viewpoints; "
+             "execute first task only.", tour.size(), refine_count, atsp_viewpoints_per_cluster_);
     return true;
-}
-
-bool CoverageSearchManager::selectAtspSuccessor() {
-    if (!atsp_tour_active_) {
-        atsp_tour_active_ = false;
-        return false;
-    }
-    const int next = frontier_target_idx_ + 1;
-    for (int index = next; index < static_cast<int>(frontier_targets_.size()); ++index) {
-        if (!isAtspTargetValid(frontier_targets_[index], frontier_target_yaws_[index],
-                               frontier_target_task_ids_[index])) {
-            atsp_tour_active_ = false;
-            return false;
-        }
-    }
-    if (next < static_cast<int>(frontier_targets_.size())) {
-        frontier_target_idx_ = next;
-        return true;
-    }
-    atsp_tour_active_ = false;
-    return false;
 }
 
 bool CoverageSearchManager::selectNextFrontier() {
@@ -1207,6 +1293,7 @@ void CoverageSearchManager::releaseCurrentGoal(const std::string &reason,
     active_goal_frontier_checked_generation_ = 0;
     pending_traj_ = PendingTrajectory();
     rolling_last_attempt_time_ = ros::Time(0);
+    rolling_replan_requested_ = false;
     ++rolling_generation_;
     if (count_as_replan) ++replan_count_;
 }

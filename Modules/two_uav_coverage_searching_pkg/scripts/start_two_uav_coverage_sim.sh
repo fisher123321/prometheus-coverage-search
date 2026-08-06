@@ -1,7 +1,42 @@
 #!/usr/bin/env bash
-# Usage: start_two_uav_coverage_sim.sh [uav1-id] [uav2-id] [fly-height-m]
+# Usage: start_two_uav_coverage_sim.sh [uav1-id] [uav2-id] [fly-height-m] [capture-logs]
 set -euo pipefail
-[[ $# -le 3 ]] || { echo "usage: $0 [uav1-id] [uav2-id] [fly-height-m]" >&2; exit 2; }
+[[ $# -le 4 ]] || { echo "usage: $0 [uav1-id] [uav2-id] [fly-height-m] [capture-logs]" >&2; exit 2; }
+
+capture_logs=${4:-false}
+[[ "$capture_logs" == true || "$capture_logs" == false ]] || {
+  echo "capture-logs must be true or false" >&2
+  exit 2
+}
+if [[ "$capture_logs" == true ]]; then
+  desktop_dir="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
+  [[ -n "$desktop_dir" && "$desktop_dir" != "$HOME" ]] || desktop_dir="$HOME/Desktop"
+  log_dir="$desktop_dir/日志记录"
+  mkdir -p "$log_dir"
+  uav1_id=${1:-1}
+  uav2_id=${2:-2}
+  fly_height=${3:-1.5}
+  run_id="coverage_uav${uav1_id}-${uav2_id}_h${fly_height}_$(date +%Y%m%d_%H%M%S)_pid$$"
+  info_log="$log_dir/${run_id}_info.log"
+  warn_log="$log_dir/${run_id}_warn.log"
+  touch "$info_log" "$warn_log"
+  echo "Normal log: $info_log"
+  echo "Warning log: $warn_log"
+  exec 3>>"$info_log"
+  exec 4>>"$warn_log"
+  set +e
+  "$0" "${@:1:3}" false 2>&1 | tee /dev/tty |
+      sed -E $'s/\x1B\\[[0-9;]*m//g' |
+      while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == *"[WARN]"* || "$line" == *"[ERROR]"* || "$line" == *"[FATAL]"* ]]; then
+      printf '%s\n' "$line" >&4
+    else
+      printf '%s\n' "$line" >&3
+    fi
+  done
+  launcher_status=${PIPESTATUS[0]}
+  exit "$launcher_status"
+fi
 
 workspace=${PROMETHEUS_WS:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"}
 mavros_ws=${PROMETHEUS_MAVROS:-"${HOME}/prometheus_mavros"}

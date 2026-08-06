@@ -51,6 +51,9 @@ void FrontierFinder::init(ros::NodeHandle &nh, CoverageMap *map) {
     string uav_name;
     int uav_id;
     nh.param("uav_id", uav_id, 1);
+    source_uav_id_ = std::max(1, uav_id);
+    next_task_sequence_ = ros::WallTime::now().toNSec() & 0x0000ffffffffffffULL;
+    if (next_task_sequence_ == 0) next_task_sequence_ = 1;
     uav_name = "/uav" + std::to_string(uav_id);
 
     frontier_vis_pub_ = nh.advertise<visualization_msgs::MarkerArray>(
@@ -64,6 +67,7 @@ void FrontierFinder::init(ros::NodeHandle &nh, CoverageMap *map) {
 }
 
 void FrontierFinder::searchFrontiersFull(const Eigen::Vector3d &cur_pos, bool relaxed) {
+    const std::vector<FrontierCluster> previous = frontiers_;
     frontiers_.clear();
     fill(frontier_flag_.begin(), frontier_flag_.end(), false);
 
@@ -94,7 +98,9 @@ void FrontierFinder::searchFrontiersFull(const Eigen::Vector3d &cur_pos, bool re
     }
 
     splitLargeFrontiers();
+    assignNewTaskIdentities(previous);
     computeViewpoints(cur_pos);
+    // [FrontierTiming] full-scan log intentionally disabled during replan profiling.
 }
 
 void FrontierFinder::searchResidualFrontiers(const Eigen::Vector3d &cur_pos) {
@@ -105,6 +111,7 @@ void FrontierFinder::searchResidualFrontiers(const Eigen::Vector3d &cur_pos) {
 }
 
 void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
+    const std::vector<FrontierCluster> previous = frontiers_;
     last_aabb_search_ms_ = 0.0;
     last_viewpoint_ms_ = 0.0;
     last_local_update_box_count_ = 0;
@@ -122,8 +129,46 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
     std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> remote_boxes;
     map_->getRemoteUpdatedBoxes(remote_boxes, true);
     last_remote_update_box_count_ = static_cast<int>(remote_boxes.size());
-    update_boxes.insert(update_boxes.end(), remote_boxes.begin(), remote_boxes.end());
-    if (update_boxes.empty()) return;
+
+    // A source UAV is still the only publisher of its frontier entities: a
+    // peer can never create one here.  It must, however, retire its own task
+    // as soon as the fused map says every stored frontier cell is gone.  This
+    // keeps a removed cluster, its viewpoints, and its task advertisement in
+    // one lifecycle instead of leaving an orphaned viewpoint behind.
+    bool retired_frontier = false;
+    std::vector<FrontierCluster> live_frontiers;
+    live_frontiers.reserve(frontiers_.size());
+    for (auto &ftr : frontiers_) {
+        if (isFrontierCellsCovered(ftr.cells, 1.0)) {
+            resetFrontierFlag(ftr);
+            retired_frontier = true;
+            continue;
+        }
+
+        bool has_live_viewpoint = false;
+        for (size_t view = 0; view < ftr.viewpoints.size(); ++view) {
+            const double yaw = view < ftr.viewpoint_yaws.size()
+                ? ftr.viewpoint_yaws[view] : 0.0;
+            if (isViewpointVisible(ftr, ftr.viewpoints[view], yaw)) {
+                has_live_viewpoint = true;
+                break;
+            }
+        }
+        if (!ftr.viewpoints.empty() && !has_live_viewpoint) {
+            refreshViewpoints(ftr, cur_pos);
+        }
+        live_frontiers.push_back(ftr);
+    }
+    if (retired_frontier) {
+        frontiers_.swap(live_frontiers);
+        ++update_generation_;
+    }
+
+    // Remote evidence may retire the source's existing entity as above, but
+    // it is never used to create a new source frontier entity.
+    if (update_boxes.empty()) {
+        return;
+    }
 
     const double margin = std::max(2.0 * map_->resolution_,
                                    map_->esdf_safe_distance_ + map_->resolution_);
@@ -218,11 +263,57 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
         }
     }
     if (new_count > 0) splitLargeFrontiers();
-    const auto search_end = std::chrono::steady_clock::now();
+    assignNewTaskIdentities(previous);
+    const auto cluster_end = std::chrono::steady_clock::now();
     computeViewpoints(cur_pos);
     const auto viewpoints_end = std::chrono::steady_clock::now();
-    last_aabb_search_ms_ = std::chrono::duration<double, std::milli>(search_end - search_start).count();
-    last_viewpoint_ms_ = std::chrono::duration<double, std::milli>(viewpoints_end - search_end).count();
+    last_aabb_search_ms_ = std::chrono::duration<double, std::milli>(cluster_end - search_start).count();
+    last_viewpoint_ms_ = std::chrono::duration<double, std::milli>(viewpoints_end - cluster_end).count();
+    // [FrontierTiming] incremental log intentionally disabled during replan profiling.
+}
+
+void FrontierFinder::assignNewTaskIdentities(const std::vector<FrontierCluster> &previous) {
+    std::set<uint64_t> retained;
+    for (const auto &frontier : frontiers_) {
+        if (frontier.task_id != 0) retained.insert(frontier.task_id);
+    }
+
+    for (auto &frontier : frontiers_) {
+        if (frontier.task_id != 0) continue;
+        int best = -1;
+        double best_overlap = 0.0;
+        for (int i = 0; i < static_cast<int>(previous.size()); ++i) {
+            const auto &old = previous[i];
+            if (old.task_id == 0 || retained.count(old.task_id) != 0) continue;
+            const double overlap_x = std::max(0.0, std::min(frontier.box_max_(0), old.box_max_(0)) -
+                                               std::max(frontier.box_min_(0), old.box_min_(0)));
+            const double overlap_y = std::max(0.0, std::min(frontier.box_max_(1), old.box_max_(1)) -
+                                               std::max(frontier.box_min_(1), old.box_min_(1)));
+            const double smaller_area = std::min(
+                (frontier.box_max_(0) - frontier.box_min_(0)) *
+                    (frontier.box_max_(1) - frontier.box_min_(1)),
+                (old.box_max_(0) - old.box_min_(0)) *
+                    (old.box_max_(1) - old.box_min_(1)));
+            const double overlap = smaller_area > 1e-6 ? overlap_x * overlap_y / smaller_area : 0.0;
+            if (overlap > best_overlap) {
+                best_overlap = overlap;
+                best = i;
+            }
+        }
+        if (best >= 0 && best_overlap >= 0.75) {
+            frontier.task_id = previous[best].task_id;
+            frontier.source_revision = previous[best].source_revision + 1;
+            frontier.local_discovery = false;
+        } else {
+            // task_id contains the source identity; the low 48 bits are local
+            // monotonic sequence numbers and are never spatially quantized.
+            frontier.task_id = (static_cast<uint64_t>(source_uav_id_ & 0xffff) << 48) |
+                               (next_task_sequence_++ & 0x0000ffffffffffffULL);
+            frontier.source_revision = 1;
+            frontier.local_discovery = true;
+        }
+        retained.insert(frontier.task_id);
+    }
 }
 
 bool FrontierFinder::haveOverlap(const Eigen::Vector3d &min1, const Eigen::Vector3d &max1,
@@ -517,10 +608,27 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
         return;
     }
 
+    // The frontier normal points from known free space toward its adjacent
+    // unknown voxels.  Unlike a PCA normal, its sign is therefore fixed.
+    Eigen::Vector2d unknown_normal = Eigen::Vector2d::Zero();
+    const auto &normal_cells = ftr.filtered_cells.empty() ? ftr.cells : ftr.filtered_cells;
+    static const int normal_dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    for (const auto &cell : normal_cells) {
+        Eigen::Vector3i idx;
+        map_->posToIndex(cell, idx);
+        for (const auto &dir : normal_dirs) {
+            const Eigen::Vector3i nbr = idx + Eigen::Vector3i(dir[0], dir[1], 0);
+            if (map_->isUnknownIndex(nbr)) unknown_normal += Eigen::Vector2d(dir[0], dir[1]);
+        }
+    }
+    const bool has_unknown_normal = unknown_normal.squaredNorm() > 1e-6;
+    if (has_unknown_normal) unknown_normal.normalize();
+
     struct ViewpointCandidate {
         Eigen::Vector3d position;
         double yaw = 0.0;
         double clearance = 0.0;
+        double normal_alignment = 0.0;
         int information_gain = 0;
     };
     std::vector<ViewpointCandidate> safe_candidates;
@@ -567,6 +675,14 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
         candidate.position = pos;
         candidate.yaw = std::atan2(target(1) - pos(1), target(0) - pos(0));
         candidate.clearance = clearance;
+        if (has_unknown_normal) {
+            candidate.normal_alignment = Eigen::Vector2d(
+                std::cos(candidate.yaw), std::sin(candidate.yaw)).dot(unknown_normal);
+            ROS_ASSERT_MSG(std::isfinite(candidate.normal_alignment) &&
+                               candidate.normal_alignment >= -1.001 &&
+                               candidate.normal_alignment <= 1.001,
+                           "Frontier-normal alignment must be a valid cosine");
+        }
         safe_candidates.push_back(candidate);
     }
 
@@ -583,6 +699,9 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
 
     std::sort(visible_candidates.begin(), visible_candidates.end(),
               [&](const ViewpointCandidate &a, const ViewpointCandidate &b) {
+                  if (has_unknown_normal &&
+                      std::fabs(a.normal_alignment - b.normal_alignment) > 1e-3)
+                      return a.normal_alignment > b.normal_alignment;
                   if (std::fabs(a.clearance - b.clearance) > 1e-3)
                       return a.clearance > b.clearance;
                   return (a.position - cur_pos).squaredNorm() <
@@ -597,6 +716,9 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
 
     std::sort(visible_candidates.begin(), visible_candidates.end(),
               [&](const ViewpointCandidate &a, const ViewpointCandidate &b) {
+                  if (has_unknown_normal &&
+                      std::fabs(a.normal_alignment - b.normal_alignment) > 1e-3)
+                      return a.normal_alignment > b.normal_alignment;
                   if (a.information_gain != b.information_gain)
                       return a.information_gain > b.information_gain;
                   if (std::fabs(a.clearance - b.clearance) > 1e-3)
@@ -605,7 +727,7 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
                          (b.position - cur_pos).squaredNorm();
               });
 
-    const size_t stored_num = std::min<size_t>(2, visible_candidates.size());
+    const size_t stored_num = std::min<size_t>(3, visible_candidates.size());
     for (size_t i = 0; i < stored_num; ++i) {
         const auto &candidate = visible_candidates[i];
         ROS_ASSERT_MSG(map_->isFree(candidate.position) &&
@@ -637,6 +759,7 @@ bool FrontierFinder::getRepresentativeFrontierCell(const FrontierCluster &ftr,
             Eigen::Vector3i idx;
             map_->posToIndex(cell, idx);
             if (idx(2) != map_->fly_z_idx_) continue;
+            if (!isFrontierCell(idx)) continue;
             Eigen::Vector3d projected = cell;
             projected(2) = map_->fly_height_;
             if (!map_->isFree(projected)) continue;
@@ -779,7 +902,9 @@ void FrontierFinder::publishFrontiers() {
             markers.markers.push_back(cell_marker);
         }
 
-        if (!frontiers_[i].viewpoints.empty()) {
+        Eigen::Vector3d live_target;
+        if (!frontiers_[i].viewpoints.empty() &&
+            getRepresentativeFrontierCell(frontiers_[i], live_target)) {
             int best_idx = 0;
             if (!frontiers_[i].viewpoint_visib_nums.empty()) {
                 best_idx = (int)(std::max_element(frontiers_[i].viewpoint_visib_nums.begin(),

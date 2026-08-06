@@ -308,13 +308,15 @@ Visualization Manager:
           Queue Size: 100
           Value: true
         - Class: rviz/MarkerArray
-          Enabled: false
+          Enabled: true
           Marker Topic: /uav2/prometheus/coverage_search/frontier_vis
-          Name: 统一前沿簇（UAV2 融合地图）
+          Name: UAV2 源前沿簇与视点
           Namespaces:
-            {}
+            frontier_best_view_yaw: true
+            frontier_best_viewpoint: true
+            frontier_cells: true
           Queue Size: 100
-          Value: false
+          Value: true
         - Class: rviz/Marker
           Enabled: true
           Marker Topic: /uav2/prometheus/coverage_search/fov_vis
