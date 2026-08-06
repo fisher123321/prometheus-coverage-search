@@ -144,6 +144,10 @@ public:
 private:
     void cloudCb(const sensor_msgs::PointCloud2ConstPtr &msg) {
         if (!sync_frame_.empty()) {
+            // Coverage planning can fall back to the latest vehicle state, so
+            // never make it wait for the later pose needed by OctoMap's
+            // capture-time transform.
+            if (!processCloud(msg, true, false)) return;
             pending_clouds_.push_back(msg);
             while (pending_clouds_.size() > static_cast<size_t>(std::max(1, cloud_sync_queue_size_))) {
                 ROS_WARN_THROTTLE(1.0,
@@ -154,15 +158,16 @@ private:
             processPendingClouds();
             return;
         }
-        processCloud(msg);
+        processCloud(msg, true, true);
     }
 
-    void processCloud(const sensor_msgs::PointCloud2ConstPtr &msg) {
+    bool processCloud(const sensor_msgs::PointCloud2ConstPtr &msg,
+                      bool publish_planning, bool publish_octomap) {
         const ros::Time stamp = msg->header.stamp.isZero() ? ros::Time::now() : msg->header.stamp;
-        if (!last_pub_time_.isZero() && max_rate_ > 0.0 &&
+        if (publish_planning && !last_pub_time_.isZero() && max_rate_ > 0.0 &&
             stamp >= last_pub_time_ &&
             (stamp - last_pub_time_).toSec() < 1.0 / max_rate_) {
-            return;
+            return false;
         }
 
         pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
@@ -188,43 +193,43 @@ private:
         sensor_msgs::PointCloud2 out;
         pcl::toROSMsg(*filtered, out);
         out.header = msg->header;
+        if (publish_planning) {
+            pub_.publish(out);
+            last_pub_time_ = stamp;
+        }
+        if (!publish_octomap || !octomap_pub_) return true;
+
         if (!sync_frame_.empty()) {
             if (!publishSynchronizedCameraTf(msg->header.stamp)) {
                 ROS_WARN_THROTTLE(1.0,
-                    "[DepthCloudDownsample] Dropped planning cloud: no capture-time pose at %.3f.",
+                    "[DepthCloudDownsample] Dropped OctoMap cloud: no capture-time pose at %.3f.",
                     msg->header.stamp.toSec());
-                last_pub_time_ = stamp;
-                return;
+                return false;
             }
-            out.header.frame_id = sync_frame_;
         }
-        pub_.publish(out);
 
-        if (octomap_pub_) {
-            if (!mappingPoseStable(msg->header.stamp)) {
-                ROS_WARN_THROTTLE(1.0,
-                    "[DepthCloudDownsample] Skipped OctoMap cloud during fast body rotation.");
-                last_pub_time_ = stamp;
-                return;
-            }
-            pcl::PointCloud<pcl::PointXYZ>::Ptr raw_octomap_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-            pcl::PointCloud<pcl::PointXYZ>::Ptr octomap_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-            const int suppressed = removePeerPoints(*filtered, *raw_octomap_cloud);
-            filterTemporalHits(*raw_octomap_cloud, msg->header.stamp, *octomap_cloud);
-            if (add_fov_clear_points_) addFovClearPoints(*raw_octomap_cloud, *octomap_cloud);
-            if (suppressed > 0) {
-                ROS_INFO_THROTTLE(1.0,
-                    "[DepthCloudDownsample] suppressed %d peer-body points from OctoMap input.",
-                    suppressed);
-            }
-
-            sensor_msgs::PointCloud2 octomap_out;
-            pcl::toROSMsg(*octomap_cloud, octomap_out);
-            octomap_out.header = msg->header;
-            if (!sync_frame_.empty()) octomap_out.header.frame_id = sync_frame_;
-            octomap_pub_.publish(octomap_out);
+        if (!mappingPoseStable(msg->header.stamp)) {
+            ROS_WARN_THROTTLE(1.0,
+                "[DepthCloudDownsample] Skipped OctoMap cloud during fast body rotation.");
+            return false;
         }
-        last_pub_time_ = stamp;
+        pcl::PointCloud<pcl::PointXYZ>::Ptr raw_octomap_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        pcl::PointCloud<pcl::PointXYZ>::Ptr octomap_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        const int suppressed = removePeerPoints(*filtered, *raw_octomap_cloud);
+        filterTemporalHits(*raw_octomap_cloud, msg->header.stamp, *octomap_cloud);
+        if (add_fov_clear_points_) addFovClearPoints(*raw_octomap_cloud, *octomap_cloud);
+        if (suppressed > 0) {
+            ROS_INFO_THROTTLE(1.0,
+                "[DepthCloudDownsample] suppressed %d peer-body points from OctoMap input.",
+                suppressed);
+        }
+
+        sensor_msgs::PointCloud2 octomap_out;
+        pcl::toROSMsg(*octomap_cloud, octomap_out);
+        octomap_out.header = msg->header;
+        if (!sync_frame_.empty()) octomap_out.header.frame_id = sync_frame_;
+        octomap_pub_.publish(octomap_out);
+        return true;
     }
 
     void localStateCb(const prometheus_msgs::UAVState::ConstPtr &msg) {
@@ -272,7 +277,7 @@ private:
                 pending_clouds_.pop_front();
                 continue;
             }
-            processCloud(cloud);
+            processCloud(cloud, false, true);
             pending_clouds_.pop_front();
         }
     }

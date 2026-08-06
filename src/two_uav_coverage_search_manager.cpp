@@ -27,6 +27,9 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     nh.param("coverage_search/max_yaw_rate", max_yaw_rate_, 0.5);
     nh.param("coverage_search/max_yaw_acc", max_yaw_acc_, 1.8);
     nh.param("coverage_search/replan_time", replan_time_, 0.25);
+    nh.param("coverage_search/replan_min_execute_time", replan_min_execute_time_, 0.5);
+    nh.param("coverage_search/replan_periodic_time", replan_periodic_time_, 1.5);
+    nh.param("coverage_search/replan_remaining_time", replan_remaining_time_, 0.5);
     nh.param("coverage_search/goal_reach_dist", goal_reach_dist_, 0.25);
     nh.param("coverage_search/auto_start", auto_start_, true);
     nh.param("coverage_search/cooperative_mode", cooperative_mode_, false);
@@ -59,6 +62,18 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     nh.param("coverage_search/swarm_bid_period", swarm_bid_period_, 2.0);
     nh.param("coverage_search/swarm_bid_max_tasks", swarm_bid_max_tasks_, 16);
     nh.param("coverage_search/swarm_bid_max_astar", swarm_bid_max_astar_, 6);
+    nh.param("coverage_search/atsp_enabled", atsp_enabled_, true);
+    nh.param("coverage_search/atsp_max_clusters", atsp_max_clusters_, 5);
+    nh.param("coverage_search/atsp_refine_clusters", atsp_refine_clusters_, 3);
+    nh.param("coverage_search/atsp_viewpoints_per_cluster", atsp_viewpoints_per_cluster_, 3);
+    nh.param("coverage_search/atsp_edge_timeout_ms", atsp_edge_timeout_ms_, 100.0);
+    atsp_max_clusters_ = std::max(1, std::min(5, atsp_max_clusters_));
+    atsp_refine_clusters_ = std::max(1, std::min(atsp_max_clusters_, atsp_refine_clusters_));
+    atsp_viewpoints_per_cluster_ = std::max(1, atsp_viewpoints_per_cluster_);
+    atsp_edge_timeout_ms_ = std::max(20.0, atsp_edge_timeout_ms_);
+    replan_min_execute_time_ = std::max(0.0, replan_min_execute_time_);
+    replan_periodic_time_ = std::max(replan_min_execute_time_, replan_periodic_time_);
+    replan_remaining_time_ = std::max(replan_time_, replan_remaining_time_);
     nh.param("coverage_search/peer_avoidance_radius", peer_avoidance_radius_, 0.75);
     nh.param("coverage_search/peer_avoidance_duration", peer_avoidance_duration_, 2.0);
     uav_name_ = "/uav" + std::to_string(uav_id_);
@@ -154,7 +169,8 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
             &CoverageSearchManager::swarmDataCb, this);
     }
 
-    mainloop_timer_ = nh.createTimer(ros::Duration(0.1), &CoverageSearchManager::mainloopCb, this);
+    // Match FUEL's 20 Hz safety/replan monitor while keeping command publication at 100 Hz.
+    mainloop_timer_ = nh.createTimer(ros::Duration(0.05), &CoverageSearchManager::mainloopCb, this);
     trajectory_nh_.reset(new ros::NodeHandle(nh));
     trajectory_nh_->setCallbackQueue(&trajectory_callback_queue_);
     trajectory_timer_ = trajectory_nh_->createTimer(
@@ -186,6 +202,7 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     pending_traj_ = PendingTrajectory();
     completed_pending_traj_ = PendingTrajectory();
     rolling_generation_ = 0;
+    rolling_replan_requested_ = false;
     rolling_last_attempt_time_ = ros::Time(0);
     rolling_replan_count_ = 0;
     active_goal_frontier_valid_ = false;
@@ -381,6 +398,7 @@ void CoverageSearchManager::updateFrontiers() {
         hierarchical_grid_.updateFromMap();
     }
     hierarchical_grid_.inputFrontiers(frontier_avgs);
+    // [FrontierTiming] outer update log intentionally disabled during replan profiling.
 }
 
 void CoverageSearchManager::updateLocalFrontierReservations() {
@@ -388,18 +406,38 @@ void CoverageSearchManager::updateLocalFrontierReservations() {
     local_frontier_reservations_.erase(
         std::remove_if(local_frontier_reservations_.begin(), local_frontier_reservations_.end(),
             [&](const LocalFrontierReservation &reservation) {
-                return !reservation.active && reservation.task.lease_expire_time <= now;
+                return reservation.task.lease_expire_time <= now;
             }),
         local_frontier_reservations_.end());
 
+    int discovered = 0;
     int created = 0;
+    double priority_distance = std::numeric_limits<double>::infinity();
+    uint64_t priority_task_id = 0;
     for (auto &frontier : frontier_finder_.frontiers_) {
         if (!frontier.local_discovery) continue;
         frontier.local_discovery = false;
+        ++discovered;
         if (reserveLocalFrontier(frontier)) ++created;
+        const double distance = (frontier.average.head<2>() - uav_pos_.head<2>()).norm();
+        if (distance < priority_distance) {
+            priority_distance = distance;
+            priority_task_id = frontierTaskId(frontier);
+        }
     }
-    if (created > 0) {
-        ROS_INFO("[CoverageSearch] Locally reserved %d new frontier(s) for 5.0s.", created);
+    if (discovered > 0) {
+        local_discovery_priority_task_id_ = priority_task_id;
+        // Keep executing the old trajectory while a fresh ATSP is solved
+        // from its future handoff state.  A new local frontier invalidates a
+        // prepared successor, never the active trajectory.
+        pending_traj_ = PendingTrajectory();
+        ++rolling_generation_;
+        rolling_replan_requested_ = true;
+        if (cooperative_mode_) publishSwarmFrontiers();
+        ROS_INFO("[CoverageSearch] Directly assigned %d local frontier update(s) "
+                 "(%d new 8.0s lease(s)); task %llu is next-tour priority.",
+                 discovered, created,
+                 static_cast<unsigned long long>(priority_task_id));
     }
 }
 
@@ -489,8 +527,18 @@ void CoverageSearchManager::publishSwarmFrontiers() {
         }
         return false;
     };
+    const auto is_leased = [&](const FrontierFinder::FrontierCluster &frontier) {
+        const auto contains = [&](const prometheus_two_uav_coverage_search::SwarmTaskArray &tasks) {
+            for (const auto &task : tasks.tasks) {
+                if (task.lease_expire_time > now && frontierMatchesTask(frontier, task)) return true;
+            }
+            return false;
+        };
+        return contains(local_swarm_tasks_) || contains(remote_swarm_tasks_);
+    };
     for (size_t i = 0; i < frontier_finder_.frontiers_.size(); ++i) {
-        if (!is_active(frontier_finder_.frontiers_[i])) continue;
+        if (!is_active(frontier_finder_.frontiers_[i]) &&
+            !is_leased(frontier_finder_.frontiers_[i])) continue;
         selected[i] = true;
         selected_indices.push_back(i);
     }
@@ -514,30 +562,33 @@ void CoverageSearchManager::publishSwarmFrontiers() {
     for (const size_t i : selected_indices) {
         const auto &frontier = frontier_finder_.frontiers_[i];
         if (frontier.viewpoints.empty()) continue;
-        const Eigen::Vector3d &point = frontier.viewpoints.front();
         prometheus_two_uav_coverage_search::SwarmFrontier item;
         Eigen::Vector3i index;
         coverage_map_.posToIndex(frontier.average, index);
         if (!coverage_map_.isInMapIndex(index)) continue;
         item.chunk_id = chunkIdForAddress(coverage_map_.toAddress(index));
         item.task_id = frontierTaskId(frontier);
-        item.cluster_version = frontier.changed_generation;
+        item.frontier_source_uav_id = uav_id_;
+        item.cluster_version = frontier.source_revision;
         item.frontier_cell_count = frontier.cells.size();
         item.centroid.x = frontier.average(0); item.centroid.y = frontier.average(1); item.centroid.z = frontier.average(2);
         item.box_min.x = frontier.box_min_(0); item.box_min.y = frontier.box_min_(1); item.box_min.z = frontier.box_min_(2);
         item.box_max.x = frontier.box_max_(0); item.box_max.y = frontier.box_max_(1); item.box_max.z = frontier.box_max_(2);
-        item.viewpoint.position.x = point(0);
-        item.viewpoint.position.y = point(1);
-        item.viewpoint.position.z = fly_height_;
-        const double yaw = frontier.viewpoint_yaws.empty() ? uav_yaw_ : frontier.viewpoint_yaws.front();
-        item.viewpoint.orientation.w = std::cos(0.5 * yaw);
-        item.viewpoint.orientation.z = std::sin(0.5 * yaw);
+        const size_t viewpoint_count = std::min<size_t>(3, frontier.viewpoints.size());
+        for (size_t view = 0; view < viewpoint_count; ++view) {
+            geometry_msgs::Pose pose;
+            pose.position.x = frontier.viewpoints[view](0);
+            pose.position.y = frontier.viewpoints[view](1);
+            pose.position.z = fly_height_;
+            const double yaw = view < frontier.viewpoint_yaws.size()
+                ? frontier.viewpoint_yaws[view] : uav_yaw_;
+            pose.orientation.w = std::cos(0.5 * yaw);
+            pose.orientation.z = std::sin(0.5 * yaw);
+            item.candidate_viewpoints.push_back(pose);
+        }
         item.information_gain = std::max(1, frontier.visib_num);
         for (auto &reservation : local_frontier_reservations_) {
             if (!frontierMatchesTask(frontier, reservation.task)) continue;
-            if (reservation.active) {
-                reservation.task.lease_expire_time = now + ros::Duration(5.0);
-            }
             if (reservation.task.lease_expire_time > now) {
                 item.reservation_owner_uav_id = uav_id_;
                 item.reservation_expire_time = reservation.task.lease_expire_time;
@@ -595,10 +646,30 @@ void CoverageSearchManager::publishSwarmBids() {
     };
     std::vector<RankedTask> ranked;
     ranked.reserve(tasks.size());
+    const auto has_live_lease = [&](uint64_t task_id) {
+        const auto contains = [&](const prometheus_two_uav_coverage_search::SwarmTaskArray &leases,
+                                  const ros::Time &received) {
+            if (received.isZero() || (now - received).toSec() > 5.0) return false;
+            for (const auto &lease : leases.tasks) {
+                if (lease.task_id == task_id && lease.lease_expire_time > now) return true;
+            }
+            return false;
+        };
+        return contains(local_swarm_tasks_, local_swarm_task_received_) ||
+               contains(remote_swarm_tasks_, remote_swarm_task_received_);
+    };
     for (const auto &entry : tasks) {
         const auto &frontier = entry.second;
-        const double dx = frontier.viewpoint.position.x - uav_pos_(0);
-        const double dy = frontier.viewpoint.position.y - uav_pos_(1);
+        // A local eight-second reservation is visible to the peer but is not
+        // an auction candidate.  The source coordinator converts it directly
+        // into a lease.
+        if (frontier.reservation_owner_uav_id != 0 &&
+            frontier.reservation_expire_time > now) continue;
+        if (has_live_lease(frontier.task_id)) continue;
+        if (frontier.candidate_viewpoints.empty()) continue;
+        const auto &bid_view = frontier.candidate_viewpoints.front();
+        const double dx = bid_view.position.x - uav_pos_(0);
+        const double dy = bid_view.position.y - uav_pos_(1);
         // Rank only decides which bounded set receives an expensive A* query;
         // it does not become the bid cost.
         ranked.push_back({frontier, std::hypot(dx, dy)});
@@ -612,7 +683,9 @@ void CoverageSearchManager::publishSwarmBids() {
     astar2d_.setSearchTimeout(20.0);
     for (size_t i = 0; i < limit; ++i) {
         const auto &frontier = ranked[i].frontier;
-        Eigen::Vector3d goal(frontier.viewpoint.position.x, frontier.viewpoint.position.y, fly_height_);
+        if (frontier.candidate_viewpoints.empty()) continue;
+        const auto &bid_view = frontier.candidate_viewpoints.front();
+        Eigen::Vector3d goal(bid_view.position.x, bid_view.position.y, fly_height_);
         double path_len = (goal.head<2>() - uav_pos_.head<2>()).norm();
         bool reachable = astar2d_.isPathTraversable(uav_pos_, goal, &path_len);
         if (!reachable && astar_attempts < swarm_bid_max_astar_) {
@@ -711,6 +784,7 @@ void CoverageSearchManager::remoteFrontierCb(
     if (!cooperative_mode_ || msg->source_uav_id == static_cast<uint32_t>(uav_id_) ||
         msg->map_epoch != static_cast<uint32_t>(map_epoch_)) return;
     remote_swarm_frontiers_ = *msg;
+    remote_swarm_frontier_received_ = ros::Time::now();
 }
 
 void CoverageSearchManager::swarmTaskCb(
@@ -727,15 +801,9 @@ void CoverageSearchManager::swarmTaskCb(
 
 uint64_t CoverageSearchManager::frontierTaskId(
     const FrontierFinder::FrontierCluster &frontier) {
-    Eigen::Vector3i index;
-    coverage_map_.posToIndex(frontier.average, index);
-    // A task identifies the frontier region, not its currently best viewpoint.
-    // ponytail: 0.5 m region keys can merge exceptionally close clusters; add
-    // an overlap signature only if such collisions appear in a denser map.
-    const int cells = std::max(1, static_cast<int>(std::ceil(0.5 / coverage_map_.resolution_)));
-    const uint32_t x = static_cast<uint32_t>(std::max(0, index(0) / cells));
-    const uint32_t y = static_cast<uint32_t>(std::max(0, index(1) / cells));
-    return ((static_cast<uint64_t>(x) << 20) | static_cast<uint64_t>(y)) + 1ULL;
+    ROS_ASSERT_MSG(frontier.task_id != 0,
+                   "Source frontier must receive a stable task ID before use");
+    return frontier.task_id;
 }
 
 bool CoverageSearchManager::isFrontierLeasedToSelf(
@@ -752,7 +820,8 @@ bool CoverageSearchManager::isFrontierLeasedToPeer(
         if (received_time.isZero() || (now - received_time).toSec() > 5.0) return false;
         for (const auto &task : tasks.tasks) {
             if (task.winner_uav_id != static_cast<uint32_t>(uav_id_) &&
-                task.lease_expire_time > now && frontierMatchesTask(frontier, task)) {
+                task.lease_expire_time > now &&
+                (frontierMatchesTask(frontier, task) || frontierOverlapsTask(frontier, task))) {
                 return true;
             }
         }
@@ -768,10 +837,11 @@ bool CoverageSearchManager::isFrontierLeasedToPeer(
             remote.reservation_expire_time <= now) continue;
         prometheus_two_uav_coverage_search::SwarmTask reservation;
         reservation.task_id = remote.task_id;
+        reservation.frontier_source_uav_id = remote.frontier_source_uav_id;
         reservation.centroid = remote.centroid;
         reservation.box_min = remote.box_min;
         reservation.box_max = remote.box_max;
-        if (frontierMatchesTask(frontier, reservation)) return true;
+        if (frontierOverlapsTask(frontier, reservation)) return true;
     }
     return false;
 }
@@ -779,9 +849,16 @@ bool CoverageSearchManager::isFrontierLeasedToPeer(
 bool CoverageSearchManager::frontierMatchesTask(
     const FrontierFinder::FrontierCluster &frontier,
     const prometheus_two_uav_coverage_search::SwarmTask &task) {
+    return task.frontier_source_uav_id == static_cast<uint32_t>(uav_id_) &&
+           frontierTaskId(frontier) == task.task_id;
+}
+
+bool CoverageSearchManager::frontierOverlapsTask(
+    const FrontierFinder::FrontierCluster &frontier,
+    const prometheus_two_uav_coverage_search::SwarmTask &task) const {
     const double dx = frontier.average(0) - task.centroid.x;
     const double dy = frontier.average(1) - task.centroid.y;
-    const bool centers_close = std::hypot(dx, dy) <= 0.5;
+    if (std::hypot(dx, dy) > 0.5) return false;
     const double overlap_x = std::max(0.0, std::min(frontier.box_max_(0), task.box_max.x) -
                                       std::max(frontier.box_min_(0), task.box_min.x));
     const double overlap_y = std::max(0.0, std::min(frontier.box_max_(1), task.box_max.y) -
@@ -791,9 +868,75 @@ bool CoverageSearchManager::frontierMatchesTask(
     const double task_area = (task.box_max.x - task.box_min.x) *
                              (task.box_max.y - task.box_min.y);
     const double smaller_area = std::min(frontier_area, task_area);
-    const bool boxes_overlap_75 = smaller_area > 1e-6 &&
-        overlap_x * overlap_y >= 0.75 * smaller_area;
-    return frontierTaskId(frontier) == task.task_id && centers_close && boxes_overlap_75;
+    return smaller_area > 1e-6 && overlap_x * overlap_y >= 0.75 * smaller_area;
+}
+
+bool CoverageSearchManager::getSelfLeasedRemoteTask(
+    uint64_t task_id, prometheus_two_uav_coverage_search::SwarmTask &task) {
+    if (!cooperative_mode_) return false;
+    const ros::Time now = ros::Time::now();
+    const auto find = [&](const prometheus_two_uav_coverage_search::SwarmTaskArray &tasks,
+                          const ros::Time &received) {
+        if (received.isZero() || (now - received).toSec() > 5.0) return false;
+        for (const auto &candidate : tasks.tasks) {
+            if (candidate.task_id == task_id &&
+                candidate.frontier_source_uav_id != static_cast<uint32_t>(uav_id_) &&
+                candidate.winner_uav_id == static_cast<uint32_t>(uav_id_) &&
+                candidate.lease_expire_time > now &&
+                !candidate.candidate_viewpoints.empty()) {
+                task = candidate;
+                return true;
+            }
+        }
+        return false;
+    };
+    return find(local_swarm_tasks_, local_swarm_task_received_) ||
+           find(remote_swarm_tasks_, remote_swarm_task_received_);
+}
+
+bool CoverageSearchManager::isRemoteTaskViewpointValid(
+    const prometheus_two_uav_coverage_search::SwarmTask &task,
+    const Eigen::Vector3d &point, double yaw) {
+    Eigen::Vector3i index;
+    coverage_map_.posToIndex(point, index);
+    if (!coverage_map_.isInMap2D(index(0), index(1)) ||
+        !coverage_map_.isFree2D(index(0), index(1)) ||
+        coverage_map_.getDistance2D(index(0), index(1)) + 1e-3 <
+            requiredTrajectoryClearance(point, traj_cut_clearance_)) return false;
+    bool candidate_found = false;
+    for (const auto &pose : task.candidate_viewpoints) {
+        const double pose_yaw = std::atan2(2.0 * (pose.orientation.w * pose.orientation.z +
+                                                   pose.orientation.x * pose.orientation.y),
+                                           1.0 - 2.0 * (pose.orientation.y * pose.orientation.y +
+                                                        pose.orientation.z * pose.orientation.z));
+        if (std::hypot(point(0) - pose.position.x, point(1) - pose.position.y) < 0.10 &&
+            std::fabs(std::atan2(std::sin(yaw - pose_yaw), std::cos(yaw - pose_yaw))) < 0.20) {
+            candidate_found = true;
+            break;
+        }
+    }
+    if (!candidate_found) return false;
+    const Eigen::Vector3d centroid(task.centroid.x, task.centroid.y, task.centroid.z);
+    return !coverage_map_.isRayOccluded(point, centroid);
+}
+
+bool CoverageSearchManager::hasConfirmedSelfLease(
+    const FrontierFinder::FrontierCluster &frontier) {
+    if (!cooperative_mode_) return true;
+    // A locally sensed frontier is already this UAV's eight-second lease.  It
+    // must be eligible for the fresh ATSP immediately; coordinator echo is not
+    // a prerequisite.
+    if (localReservationTaskIdForFrontier(frontier) != 0) return true;
+    const ros::Time now = ros::Time::now();
+    if (local_swarm_task_received_.isZero() ||
+        (now - local_swarm_task_received_).toSec() > 5.0) return false;
+    for (const auto &task : local_swarm_tasks_.tasks) {
+        if (task.winner_uav_id == static_cast<uint32_t>(uav_id_) &&
+            task.lease_expire_time > now && frontierMatchesTask(frontier, task)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 uint64_t CoverageSearchManager::leasedTaskIdForFrontier(
@@ -838,10 +981,11 @@ uint64_t CoverageSearchManager::leasedTaskIdForFrontier(
             remote.reservation_expire_time <= now) continue;
         prometheus_two_uav_coverage_search::SwarmTask reservation;
         reservation.task_id = remote.task_id;
+        reservation.frontier_source_uav_id = remote.frontier_source_uav_id;
         reservation.centroid = remote.centroid;
         reservation.box_min = remote.box_min;
         reservation.box_max = remote.box_max;
-        if (frontierMatchesTask(frontier, reservation)) return 0;
+        if (frontierOverlapsTask(frontier, reservation)) return 0;
     }
     return 0;
 }
@@ -863,14 +1007,14 @@ bool CoverageSearchManager::reserveLocalFrontier(
     const ros::Time now = ros::Time::now();
     for (auto &reservation : local_frontier_reservations_) {
         if (!frontierMatchesTask(frontier, reservation.task)) continue;
-        if (!reservation.active) reservation.task.lease_expire_time = now + ros::Duration(5.0);
         return false;
     }
 
     LocalFrontierReservation reservation;
     reservation.task.task_id = frontierTaskId(frontier);
+    reservation.task.frontier_source_uav_id = uav_id_;
     reservation.task.winner_uav_id = uav_id_;
-    reservation.task.cluster_version = frontier.changed_generation;
+    reservation.task.cluster_version = frontier.source_revision;
     reservation.task.frontier_cell_count = frontier.cells.size();
     reservation.task.centroid.x = frontier.average(0);
     reservation.task.centroid.y = frontier.average(1);
@@ -881,12 +1025,19 @@ bool CoverageSearchManager::reserveLocalFrontier(
     reservation.task.box_max.x = frontier.box_max_(0);
     reservation.task.box_max.y = frontier.box_max_(1);
     reservation.task.box_max.z = frontier.box_max_(2);
-    if (!frontier.viewpoints.empty()) {
-        reservation.task.goal.position.x = frontier.viewpoints.front()(0);
-        reservation.task.goal.position.y = frontier.viewpoints.front()(1);
-        reservation.task.goal.position.z = fly_height_;
+    const size_t viewpoint_count = std::min<size_t>(3, frontier.viewpoints.size());
+    for (size_t view = 0; view < viewpoint_count; ++view) {
+        geometry_msgs::Pose pose;
+        pose.position.x = frontier.viewpoints[view](0);
+        pose.position.y = frontier.viewpoints[view](1);
+        pose.position.z = fly_height_;
+        const double yaw = view < frontier.viewpoint_yaws.size()
+            ? frontier.viewpoint_yaws[view] : uav_yaw_;
+        pose.orientation.w = std::cos(0.5 * yaw);
+        pose.orientation.z = std::sin(0.5 * yaw);
+        reservation.task.candidate_viewpoints.push_back(pose);
     }
-    reservation.task.lease_expire_time = now + ros::Duration(5.0);
+    reservation.task.lease_expire_time = now + ros::Duration(8.0);
     local_frontier_reservations_.push_back(reservation);
     return true;
 }
@@ -910,18 +1061,18 @@ bool CoverageSearchManager::reserveLocalFrontierForGoal(
 }
 
 void CoverageSearchManager::markLocalReservationActive(uint64_t task_id) {
-    const ros::Time now = ros::Time::now();
     for (auto &reservation : local_frontier_reservations_) {
         if (reservation.task.task_id == task_id) {
             reservation.active = true;
-            reservation.task.lease_expire_time = now + ros::Duration(5.0);
         }
     }
 }
 
 bool CoverageSearchManager::hasActiveLocalReservation(uint64_t task_id) const {
+    const ros::Time now = ros::Time::now();
     for (const auto &reservation : local_frontier_reservations_) {
-        if (reservation.task.task_id == task_id && reservation.active) return true;
+        if (reservation.task.task_id == task_id && reservation.active &&
+            reservation.task.lease_expire_time > now) return true;
     }
     return false;
 }
@@ -935,9 +1086,58 @@ void CoverageSearchManager::eraseLocalReservation(uint64_t task_id) {
         local_frontier_reservations_.end());
 }
 
-bool CoverageSearchManager::currentGoalLeaseValid() const {
+bool CoverageSearchManager::isAtspTargetValid(const Eigen::Vector3d &target,
+                                               double target_yaw, uint64_t task_id) {
+    Eigen::Vector3i target_index;
+    coverage_map_.posToIndex(target, target_index);
+    if (!coverage_map_.isInMap2D(target_index(0), target_index(1)) ||
+        !coverage_map_.isFree2D(target_index(0), target_index(1)) ||
+        coverage_map_.getDistance2D(target_index(0), target_index(1)) + 1e-3 <
+            requiredTrajectoryClearance(target, traj_cut_clearance_)) {
+        return false;
+    }
+    for (const auto &frontier : frontier_finder_.frontiers_) {
+        if (frontierTaskId(frontier) != task_id || !hasConfirmedSelfLease(frontier) ||
+            isFrontierLeasedToPeer(frontier)) continue;
+        for (size_t view = 0; view < frontier.viewpoints.size(); ++view) {
+            const double yaw = view < frontier.viewpoint_yaws.size()
+                ? frontier.viewpoint_yaws[view] : target_yaw;
+            if ((frontier.viewpoints[view].head<2>() - target.head<2>()).norm() < 0.10 &&
+                std::fabs(std::atan2(std::sin(yaw - target_yaw),
+                                     std::cos(yaw - target_yaw))) < 0.20 &&
+                frontier_finder_.isViewpointVisible(frontier, frontier.viewpoints[view], yaw)) {
+                return true;
+            }
+        }
+    }
+    prometheus_two_uav_coverage_search::SwarmTask remote_task;
+    if (!getSelfLeasedRemoteTask(task_id, remote_task)) return false;
+
+    // A coordinator lease alone is not a live frontier.  The source UAV must
+    // still advertise the exact entity; an empty/newer source summary removes
+    // the viewpoint from our executable queue before its old lease expires.
+    const ros::Time now = ros::Time::now();
+    if (remote_swarm_frontier_received_.isZero() ||
+        (now - remote_swarm_frontier_received_).toSec() > 1.0) return false;
+    const auto source_it = std::find_if(remote_swarm_frontiers_.frontiers.begin(),
+                                        remote_swarm_frontiers_.frontiers.end(),
+        [&](const prometheus_two_uav_coverage_search::SwarmFrontier &frontier) {
+            return frontier.task_id == remote_task.task_id &&
+                   frontier.frontier_source_uav_id == remote_task.frontier_source_uav_id &&
+                   !frontier.candidate_viewpoints.empty();
+        });
+    return source_it != remote_swarm_frontiers_.frontiers.end() &&
+           isRemoteTaskViewpointValid(remote_task, target, target_yaw);
+}
+
+bool CoverageSearchManager::currentGoalLeaseValid() {
     if (!cooperative_mode_ || current_goal_task_id_ == 0) return true;
+    // Ownership and viewpoint liveness are deliberately separate.  A
+    // refreshed/disappeared viewpoint requests a rolling ATSP replan; it is
+    // not a reason to stop the old, still collision-free trajectory.
     if (hasActiveLocalReservation(current_goal_task_id_)) return true;
+    prometheus_two_uav_coverage_search::SwarmTask remote_task;
+    if (getSelfLeasedRemoteTask(current_goal_task_id_, remote_task)) return true;
     const ros::Time now = ros::Time::now();
     if (local_swarm_task_received_.isZero() ||
         (now - local_swarm_task_received_).toSec() > 5.0) return false;
@@ -955,6 +1155,15 @@ bool CoverageSearchManager::captureActiveGoalFrontier() {
     active_goal_frontier_cells_.clear();
     active_goal_frontier_checked_generation_ = frontier_finder_.update_generation_;
     if (current_goal_task_id_ == 0) return false;
+
+    prometheus_two_uav_coverage_search::SwarmTask remote_task;
+    if (getSelfLeasedRemoteTask(current_goal_task_id_, remote_task)) {
+        active_goal_frontier_ = remote_task;
+        // The source owns remote frontier cells, so this UAV must not infer
+        // completion from its fused map.  Lease/lifecycle changes invalidate
+        // the target through isAtspTargetValid instead.
+        return true;
+    }
 
     for (const auto &frontier : frontier_finder_.frontiers_) {
         if (frontierTaskId(frontier) != current_goal_task_id_) continue;
@@ -999,6 +1208,7 @@ bool CoverageSearchManager::currentGoalFrontierCovered() {
     active_goal_frontier_covered_pending_ = true;
     pending_traj_ = PendingTrajectory();
     ++rolling_generation_;
+    rolling_replan_requested_ = true;
     ROS_INFO("[CoverageSearch] Active frontier covered; force-replan request latched.");
     return true;
 }
@@ -1074,6 +1284,7 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
         has_traj_ = false;
         has_goal_ = false;
         pending_traj_ = PendingTrajectory();
+        rolling_replan_requested_ = false;
         ROS_INFO("[CoverageSearch] Trajectory terminal P/V/A hold converged; select next frontier.");
     }
     if (has_traj_) {
@@ -1204,6 +1415,7 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
             frontier_target_task_ids_.clear();
             current_goal_task_id_ = 0;
             frontier_target_idx_ = 0;
+            atsp_tour_active_ = false;
             replan_count_ = 0;
         }
 
@@ -1244,6 +1456,14 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
         //   但限次：连续重规划超 5 次仍无前进 → 放弃该目标
         //   ★★ 硬截止：目标选定超 goal_deadline_sec_ 秒仍未到达 → 强制放弃
         //      防止无人机在不可达目标上"挪动一点点就清零计数"而永远不放弃
+        const auto discard_atsp_tour = [&]() {
+            if (!atsp_tour_active_) return;
+            frontier_targets_.clear();
+            frontier_target_yaws_.clear();
+            frontier_target_task_ids_.clear();
+            frontier_target_idx_ = 0;
+            atsp_tour_active_ = false;
+        };
         if (has_goal_) {
             double goal_elapsed = (ros::Time::now() - goal_commit_time_).toSec();
             std::string cut_reason;
@@ -1258,6 +1478,7 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
                 failed_goal_time_ = ros::Time::now();
                 has_failed_goal_ = true;
                 has_goal_ = false;
+                discard_atsp_tour();
                 same_goal_replan_count_ = 0;
                 // 落到 selectNextFrontier
             } else {
@@ -1269,6 +1490,7 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
                     failed_goal_time_ = ros::Time::now();
                     has_failed_goal_ = true;
                     has_goal_ = false;
+                    discard_atsp_tour();
                     same_goal_replan_count_ = 0;
                 } else if (planPathToGoal()) {
                     generateBsplineTraj();
@@ -1283,6 +1505,7 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
                     failed_goal_time_ = ros::Time::now();
                     has_failed_goal_ = true;
                     has_goal_ = false;
+                    discard_atsp_tour();
                     same_goal_replan_count_ = 0;
                     cout << YELLOW << "[CoverageSearch] Re-plan to goal failed, give up. Will re-select." << TAIL << endl;
                 } else {
@@ -1290,6 +1513,7 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
                     failed_goal_time_ = ros::Time::now();
                     has_failed_goal_ = true;
                     has_goal_ = false;
+                    discard_atsp_tour();
                     same_goal_replan_count_ = 0;
                     cout << YELLOW << "[CoverageSearch] Re-plan to goal failed (A*), give up. Will re-select." << TAIL << endl;
                 }
@@ -1298,13 +1522,15 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
 
         // 2. 没有目标 → 先消费最新AABB地图更新，再选择目标
         updateFrontiers();
-        if (frontier_finder_.getFrontierCount() == 0 &&
+        if (!cooperative_mode_ && frontier_finder_.getFrontierCount() == 0 &&
             coverage_map_.getKnownSpaceRatio() < completion_known_ratio_ &&
             (ros::Time::now() - last_residual_search_time_).toSec() >= 2.0) {
             last_residual_search_time_ = ros::Time::now();
             frontier_finder_.searchResidualFrontiers(uav_pos_);
         }
         auto select_t0 = std::chrono::high_resolution_clock::now();
+        // ATSP is re-solved from the current state; its previous tour tail is
+        // never an executable target queue.
         bool selected_frontier = selectNextFrontier();
         auto select_t1 = std::chrono::high_resolution_clock::now();
         double select_ms = std::chrono::duration<double, std::milli>(select_t1 - select_t0).count();
@@ -1321,6 +1547,7 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
                 double best_dist = 1e9;
                 Eigen::Vector3d recovery_target = Eigen::Vector3d::Zero();
                 for (const auto &frontier : frontier_finder_.frontiers_) {
+                    if (atsp_enabled_ && !hasConfirmedSelfLease(frontier)) continue;
                     if (!isFrontierLeasedToSelf(frontier)) continue;
                     const Eigen::Vector3d &avg = frontier.average;
                     double dist = (avg.head<2>() - uav_pos_.head<2>()).norm();
@@ -1439,6 +1666,17 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
                      << " has no safe A* path. Trying next." << TAIL << endl;
             }
             if (reserved_free_goal) eraseLocalReservation(current_goal_task_id_);
+            if (atsp_tour_active_) {
+                // A failed edge invalidates the directed cost model.  Do not
+                // skip ahead in a stale tour; rebuild it from the latest map.
+                frontier_targets_.clear();
+                frontier_target_yaws_.clear();
+                frontier_target_task_ids_.clear();
+                frontier_target_idx_ = 0;
+                atsp_tour_active_ = false;
+                has_goal_ = false;
+                break;
+            }
             frontier_target_idx_++;
             has_goal_ = false;
         }

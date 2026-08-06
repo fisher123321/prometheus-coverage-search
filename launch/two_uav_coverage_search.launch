@@ -41,6 +41,10 @@
         <param name="coverage_search/max_yaw_acc" value="$(arg max_yaw_acc)"/>
         <!-- 滚动重规划交接前瞻时间(秒) -->
         <param name="coverage_search/replan_time" value="0.25"/>
+        <!-- FUEL-style replan triggers: covered frontier, periodic refresh, and terminal handoff. -->
+        <param name="coverage_search/replan_min_execute_time" value="0.5"/>
+        <param name="coverage_search/replan_periodic_time" value="1.5"/>
+        <param name="coverage_search/replan_remaining_time" value="0.5"/>
         <!-- 目标到达判定距离(米) -->
         <param name="coverage_search/goal_reach_dist" value="0.25"/>
         <!-- 前方障碍物检测距离(米) -->
@@ -61,6 +65,13 @@
         <param name="coverage_search/swarm_bid_period" value="2.0"/>
         <param name="coverage_search/swarm_bid_max_tasks" value="16"/>
         <param name="coverage_search/swarm_bid_max_astar" value="6"/>
+        <!-- 每机仅对已确认归属的最近五个租约簇做开放 ATSP；不改变协同消息。 -->
+        <param name="coverage_search/atsp_enabled" value="true"/>
+        <param name="coverage_search/atsp_max_clusters" value="5"/>
+        <!-- 对 tour 前三个簇各保留三个视点做分层局部精修。 -->
+        <param name="coverage_search/atsp_refine_clusters" value="3"/>
+        <param name="coverage_search/atsp_viewpoints_per_cluster" value="3"/>
+        <param name="coverage_search/atsp_edge_timeout_ms" value="100.0"/>
         <!-- 自动开始 -->
         <param name="coverage_search/auto_start" value="$(arg auto_start)"/>
         <param name="coverage_search/cooperative_mode" value="$(arg cooperative_mode)"/>
@@ -68,7 +79,7 @@
         <param name="coverage_search/global_coverage_source" value="$(arg global_coverage_source)"/>
         <param name="coverage_search/map_epoch" value="1"/>
         <param name="coverage_search/swarm_chunk_size" value="2.0"/>
-        <param name="coverage_search/swarm_chunk_delta_period" value="0.5"/>
+        <param name="coverage_search/swarm_chunk_delta_period" value="0.25"/>
         <param name="coverage_search/peer_state_timeout" value="0.6"/>
         <param name="coverage_search/peer_avoidance_radius" value="0.75"/>
         <param name="coverage_search/peer_avoidance_duration" value="2.0"/>

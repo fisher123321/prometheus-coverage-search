@@ -282,6 +282,7 @@ public:
                           double cur_yaw,
                           std::vector<Eigen::Vector3d> &points,
                           std::vector<double> &yaws);
+    void setMap(CoverageMap *map) { map_ = map; }
     void publishFrontiers();
     bool isFrontierCellsCovered(const std::vector<Eigen::Vector3d> &cells,
                                 double changed_fraction);
@@ -324,6 +325,10 @@ public:
         std::vector<double> viewpoint_yaws;
         std::vector<int> viewpoint_visib_nums;
         int visib_num = 0;
+        // Stable source-owned identity.  It is never derived from a viewpoint
+        // or a coarse spatial bucket.
+        uint64_t task_id = 0;
+        uint32_t source_revision = 0;
         uint64_t changed_generation = 0;
         bool local_discovery = false;
     };
@@ -337,6 +342,8 @@ public:
 
 private:
     CoverageMap *map_;
+    int source_uav_id_ = 1;
+    uint64_t next_task_sequence_ = 1;
     void expandFrontier(const Eigen::Vector3i &seed, std::vector<Eigen::Vector3d> &cluster_cells);
     void searchFrontiersFull(const Eigen::Vector3d &cur_pos, bool relaxed = false);
     bool haveOverlap(const Eigen::Vector3d &min1, const Eigen::Vector3d &max1,
@@ -344,6 +351,7 @@ private:
     bool isFrontierChanged(const FrontierCluster &ftr);
     void resetFrontierFlag(const FrontierCluster &ftr);
     void splitLargeFrontiers();
+    void assignNewTaskIdentities(const std::vector<FrontierCluster> &previous);
     void computeFrontierInfo(FrontierCluster &ftr);
     bool isValidFrontierCluster(const std::vector<Eigen::Vector3d> &cells,
                                 bool relaxed = false);
@@ -460,6 +468,10 @@ private:
 
     double fly_height_, sensing_range_, sensing_fov_h_, sensing_fov_v_;
     double max_vel_, max_acc_, max_yaw_rate_, max_yaw_acc_, replan_time_, goal_reach_dist_;
+    // FUEL-style execution triggers.  The handoff itself still uses replan_time_.
+    double replan_min_execute_time_ = 0.5;
+    double replan_periodic_time_ = 1.5;
+    double replan_remaining_time_ = 0.5;
     double peer_avoidance_radius_ = 0.75, peer_avoidance_duration_ = 2.0;
     bool sim_mode_, auto_start_, cooperative_mode_, external_goal_only_;
     int global_coverage_source_;
@@ -480,11 +492,18 @@ private:
     double swarm_bid_period_ = 2.0;
     int swarm_bid_max_tasks_ = 16;
     int swarm_bid_max_astar_ = 6;
+    bool atsp_enabled_ = true;
+    int atsp_max_clusters_ = 5;
+    int atsp_refine_clusters_ = 3;
+    int atsp_viewpoints_per_cluster_ = 3;
+    double atsp_edge_timeout_ms_ = 100.0;
+    bool atsp_tour_active_ = false;
     prometheus_two_uav_coverage_search::SwarmFrontierArray local_swarm_frontiers_;
     prometheus_two_uav_coverage_search::SwarmFrontierArray remote_swarm_frontiers_;
     prometheus_two_uav_coverage_search::SwarmTaskArray local_swarm_tasks_;
     prometheus_two_uav_coverage_search::SwarmTaskArray remote_swarm_tasks_;
-    ros::Time local_swarm_task_received_, remote_swarm_task_received_;
+    ros::Time local_swarm_task_received_, remote_swarm_task_received_,
+        remote_swarm_frontier_received_;
     string global_pcl_topic_, local_pcl_topic_, scan_pcl_topic_, depth_pcl_topic_;
     Eigen::Vector3d camera_offset_;
     double camera_pitch_;
@@ -582,17 +601,36 @@ private:
         TimeBspline time_spline;
         uint64_t source_generation = 0;
         uint64_t frontier_generation = 0;
+        std::vector<Eigen::Vector3d> frontier_targets;
+        std::vector<double> frontier_target_yaws;
+        std::vector<uint64_t> frontier_target_task_ids;
+        int frontier_target_idx = 0;
+        bool atsp_tour_active = false;
         ros::Time result_ready_time;
     } pending_traj_;
     bool rolling_prepare_in_progress_;
     bool rolling_snapshot_mode_ = false;
     uint64_t rolling_generation_ = 0;
+    // Coalesces frontier/map changes while the single rolling worker is busy.
+    // The active trajectory remains executable until a successor is accepted.
+    bool rolling_replan_requested_ = false;
     ros::Time rolling_last_attempt_time_;
     uint64_t rolling_replan_count_ = 0;
     bool planning_start_state_valid_ = false;
     Eigen::Vector3d planning_start_acc_ = Eigen::Vector3d::Zero();
     double planning_start_yaw_rate_ = 0.0;
     double planning_start_yaw_acc_ = 0.0;
+    double traj_esdf_ms_ = 0.0;
+    double traj_geometry_ms_ = 0.0;
+    double traj_profile_ms_ = 0.0;
+    struct AtspTiming {
+        bool valid = false;
+        bool solved = false;
+        double total_ms = 0.0;
+        double order_dp_ms = 0.0;
+        size_t cluster_count = 0;
+        const char *reason = "";
+    } rolling_atsp_timing_;
     std::atomic<bool> rolling_worker_running_{false};
     std::thread rolling_worker_;
     std::mutex rolling_result_mutex_;
@@ -603,6 +641,9 @@ private:
     std::vector<double> frontier_target_yaws_;
     std::vector<uint64_t> frontier_target_task_ids_;
     int frontier_target_idx_;
+    // The next locally observed frontier must be visited before a stale tail
+    // of the previous ATSP tour.  It is cleared once inserted into a new tour.
+    uint64_t local_discovery_priority_task_id_ = 0;
     uint64_t current_goal_task_id_ = 0;
     struct LocalFrontierReservation {
         prometheus_two_uav_coverage_search::SwarmTask task;
@@ -670,6 +711,9 @@ private:
 
     // ★ 核心方法
     bool selectNextFrontier();       // 选择下一个前沿簇目标
+    bool selectAtspTour();
+    bool hasConfirmedSelfLease(const FrontierFinder::FrontierCluster &frontier);
+    bool isAtspTargetValid(const Eigen::Vector3d &target, double yaw, uint64_t task_id);
     bool planPathToGoal();           // A*规划到目标的路径
     void generateBsplineTraj();      // 从A*路径生成B样条轨迹
     void executeTrajectory();        // 执行B样条轨迹
@@ -703,18 +747,27 @@ private:
                                double *path_time = nullptr,
                                double *direction_time = nullptr,
                                double *yaw_time = nullptr);
+    double computeTransitionCost(const Eigen::Vector3d &from_pos,
+                                 const Eigen::Vector3d &from_vel,
+                                 double from_yaw,
+                                 const Eigen::Vector3d &to_pos,
+                                 double to_yaw,
+                                 double path_len,
+                                 const Eigen::Vector3d &initial_path_dir) const;
     double requiredTrajectoryClearance(const Eigen::Vector3d &pos,
                                        double requested_clearance);
     // ★ 检查从 uav_pos 到 target 的直线是否被占据格阻挡（用于轨迹执行时避障）
     bool pathToTargetBlocked(const Eigen::Vector3d &to, const Eigen::Vector3d &from,
                              double min_clearance = -1.0);
     bool currentGoalUnsafe(std::string &reason);
+    bool activeTrajectoryUnsafe(std::string &reason);
     void abortCurrentGoalForSafety(const std::string &reason);
     void releaseCurrentGoal(const std::string &reason, bool mark_failed,
                             bool count_as_replan);
     // ★ 目标点前沿验证：目标点附近必须有unknown区域
     bool isNearFrontier(const Eigen::Vector3d &pos);
-    bool tryPrepareRollingHandoff(bool force_new_goal = false);
+    bool tryPrepareRollingHandoff(bool force_new_goal = false,
+                                  bool handoff_at_terminal = false);
     bool buildContinuousBridge(const Eigen::Vector3d &start_pos,
                                const Eigen::Vector3d &start_vel,
                                const Eigen::Vector3d &start_acc,
@@ -740,7 +793,14 @@ private:
     uint64_t leasedTaskIdForFrontier(const FrontierFinder::FrontierCluster &frontier);
     bool frontierMatchesTask(const FrontierFinder::FrontierCluster &frontier,
                              const prometheus_two_uav_coverage_search::SwarmTask &task);
-    bool currentGoalLeaseValid() const;
+    bool frontierOverlapsTask(const FrontierFinder::FrontierCluster &frontier,
+                              const prometheus_two_uav_coverage_search::SwarmTask &task) const;
+    bool getSelfLeasedRemoteTask(uint64_t task_id,
+                                 prometheus_two_uav_coverage_search::SwarmTask &task);
+    bool isRemoteTaskViewpointValid(
+        const prometheus_two_uav_coverage_search::SwarmTask &task,
+        const Eigen::Vector3d &point, double yaw);
+    bool currentGoalLeaseValid();
     bool captureActiveGoalFrontier();
     bool currentGoalFrontierCovered();
     uint64_t localReservationTaskIdForFrontier(

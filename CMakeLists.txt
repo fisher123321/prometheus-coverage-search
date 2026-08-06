@@ -60,6 +60,7 @@ link_directories(${PCL_LIBRARY_DIRS})
 # Local copy of the complete single-UAV coverage stack.  The coordination
 # nodes below are additions; they do not depend on a separately running node.
 add_library(two_uav_coverage_lib
+  src/two_uav_atsp.cpp
   src/two_uav_astar_2d.cpp
   src/two_uav_coverage_map.cpp
   src/two_uav_frontier_finder.cpp
@@ -94,6 +95,10 @@ target_link_libraries(two_uav_swarm_bridge ${catkin_LIBRARIES} zmq zmqpp)
 add_executable(two_uav_coordinator src/two_uav_coordinator.cpp)
 add_dependencies(two_uav_coordinator ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(two_uav_coordinator ${catkin_LIBRARIES})
+
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_gtest(two_uav_atsp_test test/test_two_uav_atsp.cpp src/two_uav_atsp.cpp)
+endif()
 
 install(TARGETS two_uav_coverage_lib
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
