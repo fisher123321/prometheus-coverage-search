@@ -14,6 +14,7 @@
 #include <set>
 #include <functional>
 #include <chrono>
+#include <condition_variable>
 #include <cassert>
 #include <atomic>
 #include <mutex>
@@ -21,6 +22,7 @@
 #include <cstdint>
 #include <memory>
 #include <limits>
+#include <map>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
@@ -37,12 +39,14 @@
 #include <prometheus_msgs/UAVState.h>
 #include <prometheus_msgs/UAVControlState.h>
 #include <prometheus_two_uav_coverage_search/SwarmFrontierArray.h>
-#include <prometheus_two_uav_coverage_search/SwarmBidArray.h>
 #include <prometheus_two_uav_coverage_search/SwarmMapChunk.h>
 #include <prometheus_two_uav_coverage_search/SwarmMapRequest.h>
 #include <prometheus_two_uav_coverage_search/SwarmState.h>
 #include <prometheus_two_uav_coverage_search/SwarmTaskArray.h>
 #include <prometheus_two_uav_coverage_search/SwarmTrajectory.h>
+#include <prometheus_two_uav_coverage_search/SwarmAuctionTaskSet.h>
+#include <prometheus_two_uav_coverage_search/SwarmAuctionAssignment.h>
+#include <prometheus_two_uav_coverage_search/SwarmFrontierTransferAck.h>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -155,8 +159,9 @@ public:
     pcl::PointCloud<pcl::PointXYZ>::Ptr global_pcl_;
     pcl::VoxelGrid<pcl::PointXYZ> voxel_filter_;
 
-    ros::Publisher coverage_vis_pub_;
+    ros::Publisher coverage_vis_pub_, fused_map_vis_pub_;
     ros::Timer map_pub_timer_;
+    ros::Time last_fused_map_vis_time_;
 
 private:
     bool setOccupancy(const Eigen::Vector3d &pos, uint8_t occ,
@@ -273,7 +278,6 @@ public:
 
     void init(ros::NodeHandle &nh, CoverageMap *map);
     void searchFrontiers(const Eigen::Vector3d &cur_pos);
-    void searchResidualFrontiers(const Eigen::Vector3d &cur_pos);
     void getFrontierAverages(std::vector<Eigen::Vector3d> &averages);
     void getFrontierClusters(std::vector<std::vector<Eigen::Vector3d>> &clusters);
     int  getFrontierCount();
@@ -284,6 +288,9 @@ public:
                           std::vector<double> &yaws);
     void setMap(CoverageMap *map) { map_ = map; }
     void publishFrontiers();
+    bool adoptFrontier(const prometheus_two_uav_coverage_search::SwarmFrontier &frontier);
+    bool moveFrontierToSleeping(uint64_t task_id);
+    std::vector<uint64_t> consumeRetiredTaskIds();
     bool isFrontierCellsCovered(const std::vector<Eigen::Vector3d> &cells,
                                 double changed_fraction);
     double lastAabbSearchMs() const { return last_aabb_search_ms_; }
@@ -315,6 +322,7 @@ public:
     int vis_down_sample_;
     int vis_max_points_;
     int vis_max_total_points_;
+    double retire_changed_ratio_ = 0.15;
 
     struct FrontierCluster {
         std::vector<Eigen::Vector3d> cells;
@@ -325,9 +333,10 @@ public:
         std::vector<double> viewpoint_yaws;
         std::vector<int> viewpoint_visib_nums;
         int visib_num = 0;
-        // Stable source-owned identity.  It is never derived from a viewpoint
-        // or a coarse spatial bucket.
+        // Immutable frontier identity, assigned only after clustering and PCA
+        // splitting. A task handoff never changes either field.
         uint64_t task_id = 0;
+        uint32_t source_uav_id = 0;
         uint32_t source_revision = 0;
         uint64_t changed_generation = 0;
         bool local_discovery = false;
@@ -338,6 +347,7 @@ public:
     void refreshViewpoints(FrontierCluster &ftr, const Eigen::Vector3d &cur_pos);
 
     std::vector<FrontierCluster> frontiers_;
+    std::vector<FrontierCluster> sleeping_frontiers_;
     uint64_t update_generation_ = 0;
 
 private:
@@ -345,10 +355,8 @@ private:
     int source_uav_id_ = 1;
     uint64_t next_task_sequence_ = 1;
     void expandFrontier(const Eigen::Vector3i &seed, std::vector<Eigen::Vector3d> &cluster_cells);
-    void searchFrontiersFull(const Eigen::Vector3d &cur_pos, bool relaxed = false);
     bool haveOverlap(const Eigen::Vector3d &min1, const Eigen::Vector3d &max1,
                      const Eigen::Vector3d &min2, const Eigen::Vector3d &max2);
-    bool isFrontierChanged(const FrontierCluster &ftr);
     void resetFrontierFlag(const FrontierCluster &ftr);
     void splitLargeFrontiers();
     void assignNewTaskIdentities(const std::vector<FrontierCluster> &previous);
@@ -364,8 +372,8 @@ private:
     bool isFrontierCell(const Eigen::Vector3i &idx);
     std::vector<bool> frontier_flag_;
     ros::Publisher frontier_vis_pub_;
-    int last_frontier_marker_count_ = 0;
-    int last_viewpoint_marker_count_ = 0;
+    std::set<int> published_frontier_marker_ids_;
+    std::vector<uint64_t> retired_task_ids_;
     double last_aabb_search_ms_ = 0.0;
     double last_viewpoint_ms_ = 0.0;
     int last_local_update_box_count_ = 0;
@@ -439,16 +447,47 @@ private:
     ros::Subscriber uav_state_sub_, uav_control_state_sub_;
     ros::Subscriber global_pcl_sub_, local_pcl_sub_, scan_pcl_sub_, depth_pcl_sub_, goal_sub_;
     ros::Subscriber remote_chunk_sub_, map_request_sub_, remote_frontier_sub_, remote_state_sub_;
-    ros::Subscriber local_task_sub_, remote_task_sub_, peer_collision_replan_sub_;
+    ros::Subscriber local_task_sub_, remote_task_sub_, peer_collision_replan_sub_, auction_task_set_sub_;
+    ros::Subscriber remote_frontier_transfer_ack_sub_;
     ros::Publisher uav_cmd_pub_, path_vis_pub_, fov_vis_pub_, coverage_status_pub_, uav_label_pub_, completion_ready_pub_;
-    ros::Publisher swarm_frontier_pub_, swarm_bid_pub_, swarm_traj_pub_, map_chunk_pub_, map_request_pub_;
+    ros::Publisher swarm_frontier_pub_, swarm_traj_pub_, map_chunk_pub_, map_request_pub_;
+    ros::Publisher auction_assignment_pub_;
+    ros::Publisher frontier_transfer_ack_pub_;
     // The command timer must never wait behind depth integration or frontier
     // extraction.  It has its own callback queue and emits only immutable
     // trajectory samples; map/planning state remains single-threaded.
     ros::CallbackQueue trajectory_callback_queue_;
     std::unique_ptr<ros::NodeHandle> trajectory_nh_;
     std::unique_ptr<ros::AsyncSpinner> trajectory_spinner_;
+    // Raw-command safety must not wait behind map updates or planning callbacks.
+    ros::CallbackQueue heartbeat_callback_queue_;
+    std::unique_ptr<ros::NodeHandle> heartbeat_nh_;
+    std::unique_ptr<ros::AsyncSpinner> heartbeat_spinner_;
     ros::Timer mainloop_timer_, trajectory_timer_, frontier_timer_, swarm_data_timer_;
+    ros::Timer raw_heartbeat_timer_;
+
+    struct AuctionMapSnapshot {
+        int nx = 0, ny = 0;
+        double resolution = 0.0;
+        Eigen::Vector3d origin = Eigen::Vector3d::Zero();
+        std::vector<uint8_t> walkable;
+    };
+    struct AuctionJob {
+        uint64_t sequence = 0;
+        prometheus_two_uav_coverage_search::SwarmAuctionTaskSet task_set;
+        AuctionMapSnapshot map;
+        Eigen::Vector3d uav1_start = Eigen::Vector3d::Zero();
+        Eigen::Vector3d uav2_start = Eigen::Vector3d::Zero();
+    };
+    std::mutex auction_worker_mutex_, auction_assignment_mutex_;
+    std::condition_variable auction_worker_cv_;
+    std::thread auction_worker_;
+    AuctionJob auction_job_;
+    bool auction_job_ready_ = false, auction_worker_stop_ = false;
+    uint64_t auction_job_sequence_ = 0;
+    uint64_t auction_active_task_set_hash_ = 0;
+    uint64_t auction_active_uav1_state_sequence_ = 0;
+    uint64_t auction_active_uav2_state_sequence_ = 0;
 
     prometheus_msgs::UAVState uav_state_;
     prometheus_msgs::UAVControlState uav_control_state_;
@@ -482,26 +521,27 @@ private:
     string swarm_tx_prefix_, swarm_rx_prefix_;
     int swarm_chunk_cells_x_, swarm_chunk_cells_y_;
     uint32_t swarm_frontier_revision_ = 0;
-    uint32_t swarm_bid_revision_ = 0;
     std::vector<int8_t> swarm_last_sent_evidence_;
     std::vector<uint32_t> swarm_chunk_revision_;
     std::vector<uint32_t> swarm_peer_chunk_revision_;
     std::vector<uint8_t> swarm_chunk_snapshot_stage_;
     std::vector<bool> swarm_chunk_force_snapshot_;
-    ros::Time last_swarm_bid_time_;
-    double swarm_bid_period_ = 2.0;
-    int swarm_bid_max_tasks_ = 16;
-    int swarm_bid_max_astar_ = 6;
     bool atsp_enabled_ = true;
     int atsp_max_clusters_ = 5;
     int atsp_refine_clusters_ = 3;
     int atsp_viewpoints_per_cluster_ = 3;
     double atsp_edge_timeout_ms_ = 100.0;
+    double auction_astar_timeout_ms_ = 50.0;
+    double atsp_planning_budget_ms_ = 250.0;
     bool atsp_tour_active_ = false;
     prometheus_two_uav_coverage_search::SwarmFrontierArray local_swarm_frontiers_;
     prometheus_two_uav_coverage_search::SwarmFrontierArray remote_swarm_frontiers_;
     prometheus_two_uav_coverage_search::SwarmTaskArray local_swarm_tasks_;
     prometheus_two_uav_coverage_search::SwarmTaskArray remote_swarm_tasks_;
+    prometheus_two_uav_coverage_search::SwarmAuctionTaskSet last_auction_task_set_;
+    prometheus_two_uav_coverage_search::SwarmAuctionAssignment last_auction_assignment_;
+    std::map<uint64_t, uint32_t> remote_transfer_ack_versions_;
+    std::map<uint64_t, uint32_t> sent_transfer_ack_versions_;
     ros::Time local_swarm_task_received_, remote_swarm_task_received_,
         remote_swarm_frontier_received_;
     string global_pcl_topic_, local_pcl_topic_, scan_pcl_topic_, depth_pcl_topic_;
@@ -650,6 +690,7 @@ private:
         bool active = false;
     };
     std::vector<LocalFrontierReservation> local_frontier_reservations_;
+    std::set<uint64_t> retired_frontier_ids_;
     prometheus_two_uav_coverage_search::SwarmTask active_goal_frontier_;
     std::vector<Eigen::Vector3d> active_goal_frontier_cells_;
     bool active_goal_frontier_valid_ = false;
@@ -668,7 +709,6 @@ private:
     double completion_known_ratio_;
     double residual_scan_yaw_rate_;
     double residual_scan_yaw_;
-    ros::Time last_residual_search_time_;
 
     // ★ 轨迹执行参数（按位置推进）
     double traj_step_size_;          // 轨迹点间距
@@ -700,13 +740,19 @@ private:
     void remoteChunkCb(const prometheus_two_uav_coverage_search::SwarmMapChunkConstPtr &msg);
     void remoteFrontierCb(const prometheus_two_uav_coverage_search::SwarmFrontierArrayConstPtr &msg);
     void swarmTaskCb(const prometheus_two_uav_coverage_search::SwarmTaskArrayConstPtr &msg);
+    void auctionTaskSetCb(const prometheus_two_uav_coverage_search::SwarmAuctionTaskSetConstPtr &msg);
+    void remoteFrontierTransferAckCb(
+        const prometheus_two_uav_coverage_search::SwarmFrontierTransferAckConstPtr &msg);
     void mapRequestCb(const prometheus_two_uav_coverage_search::SwarmMapRequestConstPtr &msg);
 
     void mainloopCb(const ros::TimerEvent &e);
     void trajectoryCb(const ros::TimerEvent &e);
     void frontierCb(const ros::TimerEvent &e);
+    void publishStartupHold();
     void updateFrontiers();
     void updateLocalFrontierReservations();
+    void synchronizeTransferredFrontiers();
+    void retireFrontierTasks(const std::vector<uint64_t> &task_ids);
     void setCompletionReady(bool ready);
 
     // ★ 核心方法
@@ -781,7 +827,16 @@ private:
     void publishCoverageStatus();
     void swarmDataCb(const ros::TimerEvent &e);
     void publishSwarmFrontiers();
-    void publishSwarmBids();
+    void publishAuctionAssignment(
+        const prometheus_two_uav_coverage_search::SwarmAuctionTaskSet &task_set);
+    AuctionMapSnapshot captureAuctionMapSnapshot();
+    static bool auctionSnapshotPathCost(const AuctionMapSnapshot &map,
+                                        const Eigen::Vector3d &start,
+                                        const Eigen::Vector3d &goal,
+                                        double timeout_ms, double *cost,
+                                        uint8_t *failure_mask);
+    void auctionWorkerLoop();
+    void rawHeartbeatCb(const ros::TimerEvent &e);
     void publishSwarmTrajectory();
     void publishSwarmMapDelta();
     int chunkIdForAddress(int address) const;

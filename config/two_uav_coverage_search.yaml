@@ -38,6 +38,8 @@ coverage_search:
   atsp_refine_clusters: 3        # refine only the first 3 tour clusters
   atsp_viewpoints_per_cluster: 3 # retain the top 3 viewpoints per refined cluster
   atsp_edge_timeout_ms: 100.0
+  atsp_planning_budget_ms: 250.0
+  auction_astar_timeout_ms: 50.0 # per candidate; timeout may use Euclidean fallback, NO_PATH may not
   swarm_chunk_delta_period: 0.25 # 4 Hz fused-map evidence exchange
 
 sensor:
@@ -65,6 +67,7 @@ map:
 # ===== 前沿查找器参数 =====
 frontier_finder:
   cluster_min: 5           # 最小前沿簇体素数
+  retire_changed_ratio: 0.15 # 旧簇15%体素不再是前沿时永久退休并局部重建
   cluster_size_xy: 2.5     # 最大前沿簇尺寸
   candidate_radius: 1.4    # 固定环形候选半径；每簇固定36个候选
   candidate_clearance: 0.45 # 三维ESDF到占据体素的最小净空

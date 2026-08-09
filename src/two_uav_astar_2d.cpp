@@ -7,8 +7,6 @@ void Astar2D::init(CoverageMap *map) {
     map_ = map;
     search_timeout_ms_ = 250.0;
     last_failure_reason_ = ASTAR_OK;
-    cout << GREEN << "[Astar2D] init. Grid: " << map_->grid_size_(0)
-         << "x" << map_->grid_size_(1) << TAIL << endl;
 }
 
 int Astar2D::toAddress2D(int x, int y) {
