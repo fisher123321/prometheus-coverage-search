@@ -128,6 +128,8 @@ void CoverageMap::init(ros::NodeHandle &nh) {
 
     coverage_vis_pub_ = nh.advertise<visualization_msgs::Marker>(
         uav_name + "/prometheus/coverage_search/coverage_status", 1);
+    fused_map_vis_pub_ = nh.advertise<visualization_msgs::MarkerArray>(
+        uav_name + "/prometheus/coverage_search/fused_map_vis", 1);
     map_pub_timer_ = nh.createTimer(ros::Duration(2.0), &CoverageMap::pubMapTimerCb, this);
 
     cout << GREEN << "[CoverageMap] init. Resolution: " << resolution_
@@ -136,9 +138,9 @@ void CoverageMap::init(ros::NodeHandle &nh) {
 }
 
 // ★ 新增：2D索引查询（使用缓存的z层索引，避免重复计算）
-bool CoverageMap::isOccupied2D(int x, int y) {
+bool CoverageMap::isOccupied2D(int x, int y, bool include_dynamic_peer) {
     if (!isInMap2D(x, y)) return true;
-    if (dynamic_peer_avoidance_valid_) {
+    if (include_dynamic_peer && dynamic_peer_avoidance_valid_) {
         Eigen::Vector3d p;
         indexToPos(Eigen::Vector3i(x, y, min_z_idx_), p);
         if ((p.head<2>() - dynamic_peer_avoidance_pos_.head<2>()).norm() <=
@@ -152,9 +154,9 @@ bool CoverageMap::isOccupied2D(int x, int y) {
     return false;
 }
 
-bool CoverageMap::isFree2D(int x, int y) {
+bool CoverageMap::isFree2D(int x, int y, bool include_dynamic_peer) {
     if (!isInMap2D(x, y)) return false;
-    if (isOccupied2D(x, y)) return false;
+    if (isOccupied2D(x, y, include_dynamic_peer)) return false;
     for (int z = min_z_idx_; z <= max_z_idx_; z++) {
         Eigen::Vector3i idx(x, y, z);
         int adr = toAddress(idx);
@@ -619,12 +621,6 @@ void CoverageMap::clearVolume(const Eigen::Vector3d &body_pos,
         }
     }
     if (!mark_local_update && changed) markRemoteUpdatedBox(changed_min, changed_max);
-    if (cleared_occupied > 0) {
-        ROS_WARN_THROTTLE(1.0,
-            "[CoverageMap] Cleared %d occupied voxels inside measured robot volume at "
-            "(%.2f, %.2f, %.2f).",
-            cleared_occupied, body_pos(0), body_pos(1), body_pos(2));
-    }
 }
 
 void CoverageMap::markUpdatedIndex(const Eigen::Vector3i &idx, int margin) {
@@ -1036,13 +1032,6 @@ bool CoverageMap::traceRay(const Eigen::Vector3d &start, const Eigen::Vector3d &
         const bool occupied = occupancy_buffer_[address] == 2 ||
             (projected_occlusion && isOccupied2D(idx(0), idx(1)));
         if (stop_at_occupied && occupied) {
-            if (integrate_free) {
-                ROS_WARN_THROTTLE(2.0,
-                    "[CoverageMap] Inferred ray stopped at occupied voxel "
-                    "(%d,%d,%d), evidence=%d; cells behind it were ignored.",
-                    idx(0), idx(1), idx(2),
-                    (int)occupancy_evidence_buffer_[address]);
-            }
             return 1;
         }
         if (unknown_addresses && occupancy_buffer_[address] == 0)
@@ -1088,6 +1077,51 @@ void CoverageMap::publishMap() {
              ratio * 100.0, getFreeCount(), getUnknownCount());
     marker.text = text;
     coverage_vis_pub_.publish(marker);
+
+    // Fused-map RViz data is much larger than the status marker.  The manager
+    // calls publishMap() at 20 Hz, so constructing it at that rate starves
+    // sensor callbacks on a loaded simulator.
+    const ros::Time now = ros::Time::now();
+    if (fused_map_vis_pub_.getNumSubscribers() < 1 ||
+        (!last_fused_map_vis_time_.isZero() &&
+         (now - last_fused_map_vis_time_).toSec() < 1.0)) return;
+    last_fused_map_vis_time_ = now;
+    visualization_msgs::MarkerArray map_markers;
+    visualization_msgs::Marker free_marker;
+    free_marker.header = marker.header;
+    free_marker.ns = "fused_map_free";
+    free_marker.id = 0;
+    free_marker.type = visualization_msgs::Marker::CUBE_LIST;
+    free_marker.action = visualization_msgs::Marker::ADD;
+    free_marker.scale.x = resolution_ * 0.8;
+    free_marker.scale.y = resolution_ * 0.8;
+    free_marker.scale.z = resolution_ * 0.25;
+    free_marker.color.r = 0.20;
+    free_marker.color.g = 0.65;
+    free_marker.color.b = 0.95;
+    free_marker.color.a = 0.18;
+    visualization_msgs::Marker occupied_marker = free_marker;
+    occupied_marker.ns = "fused_map_occupied";
+    occupied_marker.color.r = 0.85;
+    occupied_marker.color.g = 0.25;
+    occupied_marker.color.b = 0.20;
+    occupied_marker.color.a = 0.85;
+    for (int x = 0; x < grid_size_(0); ++x) {
+        for (int y = 0; y < grid_size_(1); ++y) {
+            const Eigen::Vector3i index(x, y, fly_z_idx_);
+            const int address = toAddress(index);
+            if (!observed_buffer_[address]) continue;
+            Eigen::Vector3d position;
+            indexToPos(index, position);
+            geometry_msgs::Point point;
+            point.x = position(0); point.y = position(1); point.z = position(2);
+            if (occupancy_buffer_[address]) occupied_marker.points.push_back(point);
+            else free_marker.points.push_back(point);
+        }
+    }
+    map_markers.markers.push_back(free_marker);
+    map_markers.markers.push_back(occupied_marker);
+    fused_map_vis_pub_.publish(map_markers);
 }
 
 void CoverageMap::pubMapTimerCb(const ros::TimerEvent &e) {

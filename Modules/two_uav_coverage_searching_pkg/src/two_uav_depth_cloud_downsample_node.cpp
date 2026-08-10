@@ -117,6 +117,8 @@ public:
             pose_topic_.clear();
             sync_frame_.clear();
         }
+        diagnostics_timer_ = nh.createTimer(ros::Duration(1.0),
+            &DepthCloudDownsampleNode::diagnosticsCb, this);
 
         ROS_INFO("[DepthCloudDownsample] %s -> %s leaf=%.2f range=[%.2f, %.2f] max_rate=%.1f",
                  input_topic_.c_str(), output_topic_.c_str(), leaf_size_,
@@ -143,6 +145,7 @@ public:
 
 private:
     void cloudCb(const sensor_msgs::PointCloud2ConstPtr &msg) {
+        last_input_received_ = ros::Time::now();
         if (!sync_frame_.empty()) {
             // Coverage planning can fall back to the latest vehicle state, so
             // never make it wait for the later pose needed by OctoMap's
@@ -196,6 +199,8 @@ private:
         if (publish_planning) {
             pub_.publish(out);
             last_pub_time_ = stamp;
+            last_planning_published_ = ros::Time::now();
+            last_planning_point_count_ = filtered->points.size();
         }
         if (!publish_octomap || !octomap_pub_) return true;
 
@@ -209,8 +214,6 @@ private:
         }
 
         if (!mappingPoseStable(msg->header.stamp)) {
-            ROS_WARN_THROTTLE(1.0,
-                "[DepthCloudDownsample] Skipped OctoMap cloud during fast body rotation.");
             return false;
         }
         pcl::PointCloud<pcl::PointXYZ>::Ptr raw_octomap_cloud(new pcl::PointCloud<pcl::PointXYZ>);
@@ -229,7 +232,42 @@ private:
         octomap_out.header = msg->header;
         if (!sync_frame_.empty()) octomap_out.header.frame_id = sync_frame_;
         octomap_pub_.publish(octomap_out);
+        last_octomap_published_ = ros::Time::now();
         return true;
+    }
+
+    void diagnosticsCb(const ros::TimerEvent&) {
+        const ros::Time now = ros::Time::now();
+        if (sub_.getNumPublishers() == 0) {
+            ROS_ERROR_THROTTLE(2.0,
+                "[DepthCloudDownsample] No publisher on %s; Gazebo D435i source is absent.",
+                input_topic_.c_str());
+            return;
+        }
+        if (last_input_received_.isZero() || (now - last_input_received_).toSec() > 1.0) {
+            ROS_ERROR_THROTTLE(2.0,
+                "[DepthCloudDownsample] %s has publisher(s), but no cloud has arrived for 1 s.",
+                input_topic_.c_str());
+            return;
+        }
+        if (last_planning_published_.isZero() ||
+            (now - last_planning_published_).toSec() > 1.0) {
+            ROS_ERROR_THROTTLE(2.0,
+                "[DepthCloudDownsample] Input is live but %s is not being published.",
+                output_topic_.c_str());
+            return;
+        }
+        if (last_planning_point_count_ == 0) {
+            ROS_WARN_THROTTLE(2.0,
+                "[DepthCloudDownsample] Input is live but filtering produced zero planning points; range=[%.2f, %.2f].",
+                min_range_, max_range_);
+        }
+        if (octomap_pub_ && (last_octomap_published_.isZero() ||
+            (now - last_octomap_published_).toSec() > 1.0)) {
+            ROS_WARN_THROTTLE(2.0,
+                "[DepthCloudDownsample] Planning cloud is live, but OctoMap waits for capture-time pose: pending=%zu poses=%zu.",
+                pending_clouds_.size(), pose_history_.size());
+        }
     }
 
     void localStateCb(const prometheus_msgs::UAVState::ConstPtr &msg) {
@@ -473,7 +511,12 @@ private:
     ros::Subscriber pose_sub_;
     ros::Publisher pub_;
     ros::Publisher octomap_pub_;
+    ros::Timer diagnostics_timer_;
     ros::Time last_pub_time_;
+    ros::Time last_input_received_;
+    ros::Time last_planning_published_;
+    ros::Time last_octomap_published_;
+    size_t last_planning_point_count_ = 0;
     tf2_ros::TransformBroadcaster sync_tf_pub_;
     std::string input_topic_;
     std::string output_topic_;

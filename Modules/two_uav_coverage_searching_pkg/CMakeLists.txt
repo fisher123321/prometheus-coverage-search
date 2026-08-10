@@ -15,6 +15,7 @@ find_package(catkin REQUIRED COMPONENTS
   visualization_msgs
   tf2
   tf2_ros
+  octomap_msgs
   octomap_server
   prometheus_msgs
   message_generation
@@ -35,6 +36,10 @@ add_message_files(FILES
   SwarmTask.msg
   SwarmTaskArray.msg
   SwarmTrajectory.msg
+  SwarmAuctionManifest.msg
+  SwarmAuctionTaskSet.msg
+  SwarmAuctionAssignment.msg
+  SwarmFrontierTransferAck.msg
 )
 
 generate_messages(DEPENDENCIES std_msgs geometry_msgs)
@@ -42,7 +47,7 @@ generate_messages(DEPENDENCIES std_msgs geometry_msgs)
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES two_uav_coverage_lib
-  CATKIN_DEPENDS roscpp rospy std_msgs sensor_msgs geometry_msgs nav_msgs laser_geometry pcl_ros visualization_msgs tf2 tf2_ros octomap_server prometheus_msgs message_runtime
+  CATKIN_DEPENDS roscpp rospy std_msgs sensor_msgs geometry_msgs nav_msgs laser_geometry pcl_ros visualization_msgs tf2 tf2_ros octomap_msgs octomap_server prometheus_msgs message_runtime
   DEPENDS PCL
 )
 
@@ -84,6 +89,11 @@ add_executable(two_uav_octomap_server_node src/two_uav_octomap_server_node.cpp)
 add_dependencies(two_uav_octomap_server_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(two_uav_octomap_server_node ${catkin_LIBRARIES})
 
+add_executable(two_uav_explored_map_fuser_node src/two_uav_explored_map_fuser_node.cpp)
+add_dependencies(two_uav_explored_map_fuser_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(two_uav_explored_map_fuser_node ${catkin_LIBRARIES})
+target_compile_definitions(two_uav_explored_map_fuser_node PRIVATE OCTOMAP_NODEBUGOUT)
+
 add_executable(two_uav_fov_visualizer src/two_uav_fov_visualizer.cpp)
 add_dependencies(two_uav_fov_visualizer ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(two_uav_fov_visualizer ${catkin_LIBRARIES})
@@ -98,12 +108,20 @@ target_link_libraries(two_uav_coordinator ${catkin_LIBRARIES})
 
 if(CATKIN_ENABLE_TESTING)
   catkin_add_gtest(two_uav_atsp_test test/test_two_uav_atsp.cpp src/two_uav_atsp.cpp)
+  catkin_add_gtest(two_uav_frontier_lifecycle_test test/test_two_uav_frontier_lifecycle.cpp)
+  if(TARGET two_uav_frontier_lifecycle_test)
+    target_link_libraries(two_uav_frontier_lifecycle_test two_uav_coverage_lib ${catkin_LIBRARIES})
+  endif()
+  catkin_add_gtest(two_uav_auction_protocol_test test/test_two_uav_auction_protocol.cpp)
+  if(TARGET two_uav_auction_protocol_test)
+    target_link_libraries(two_uav_auction_protocol_test ${catkin_LIBRARIES})
+  endif()
 endif()
 
 install(TARGETS two_uav_coverage_lib
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION})
-install(TARGETS two_uav_coverage_search_node two_uav_depth_cloud_downsample_node two_uav_octomap_server_node two_uav_fov_visualizer
+install(TARGETS two_uav_coverage_search_node two_uav_depth_cloud_downsample_node two_uav_octomap_server_node two_uav_explored_map_fuser_node two_uav_fov_visualizer
   two_uav_swarm_bridge two_uav_coordinator
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 install(DIRECTORY include/ launch config docs rviz

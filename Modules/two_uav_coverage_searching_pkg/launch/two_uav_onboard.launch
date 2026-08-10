@@ -55,5 +55,9 @@
     <param name="task_retry_cooldown" value="12.0"/>
     <param name="task_goal_separation" value="3.0"/>
     <param name="task_lease_duration" value="8.0"/>
+    <param name="unreachable_retry_period" value="1.0"/>
+    <param name="unreachable_retry_max_period" value="8.0"/>
+    <param name="auction_period" value="0.2"/>
+    <param name="raw_command_timeout" value="0.6"/>
   </node>
 </launch>

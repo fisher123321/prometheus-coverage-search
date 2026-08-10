@@ -51,6 +51,12 @@
     <param name="pointcloud_min_z" value="0.20"/><param name="pointcloud_max_z" value="2.8"/>
     <param name="occupancy_min_z" value="0.20"/><param name="filter_ground" value="false"/><param name="filter_speckles" value="true"/>
   </node>
+  <node pkg="prometheus_two_uav_coverage_search" type="two_uav_explored_map_fuser_node" name="explored_map_fuser" output="screen">
+    <param name="uav1_input" value="/uav$(arg uav1_id)/octomap_binary"/>
+    <param name="uav2_input" value="/uav$(arg uav2_id)/octomap_binary"/>
+    <param name="output" value="/two_uav/fused_explored_octomap_binary"/>
+    <param name="frame_id" value="world"/>
+  </node>
   <include file="$(find prometheus_two_uav_coverage_search)/launch/two_uav_onboard.launch">
     <arg name="uav_id" value="$(arg uav1_id)"/><arg name="peer_uav_id" value="$(arg uav2_id)"/><arg name="fly_height" value="$(arg fly_height)"/>
     <arg name="global_coverage_source" value="$(arg uav1_id)"/>

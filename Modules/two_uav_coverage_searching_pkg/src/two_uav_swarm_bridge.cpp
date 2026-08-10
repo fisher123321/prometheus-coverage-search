@@ -1,5 +1,5 @@
 // Adapted from swarm_ros_bridge (BSD-3-Clause, Peixuan Shu, 2023).
-// This version deliberately bridges only the six messages used by this package.
+// This version deliberately bridges only the messages used by this package.
 #include <atomic>
 #include <algorithm>
 #include <chrono>
@@ -15,7 +15,10 @@
 #include <zmqpp/zmqpp.hpp>
 
 #include <prometheus_two_uav_coverage_search/SwarmFrontierArray.h>
-#include <prometheus_two_uav_coverage_search/SwarmBidArray.h>
+#include <prometheus_two_uav_coverage_search/SwarmAuctionManifest.h>
+#include <prometheus_two_uav_coverage_search/SwarmAuctionTaskSet.h>
+#include <prometheus_two_uav_coverage_search/SwarmAuctionAssignment.h>
+#include <prometheus_two_uav_coverage_search/SwarmFrontierTransferAck.h>
 #include <prometheus_two_uav_coverage_search/SwarmMapChunk.h>
 #include <prometheus_two_uav_coverage_search/SwarmMapRequest.h>
 #include <prometheus_two_uav_coverage_search/SwarmState.h>
@@ -158,9 +161,20 @@ int main(int argc, char** argv) {
   BridgeChannel<prometheus_two_uav_coverage_search::SwarmFrontierArray> frontier(
       nh, context, tx_prefix + "/frontier", rx_prefix + "/frontier", local_ip, peer_ip,
       port_base + 2, peer_port_base + 2, data_hz, max_bytes);
-  BridgeChannel<prometheus_two_uav_coverage_search::SwarmBidArray> bid(
-      nh, context, tx_prefix + "/bid", rx_prefix + "/bid", local_ip, peer_ip,
-      port_base + 6, peer_port_base + 6, data_hz, max_bytes);
+  BridgeChannel<prometheus_two_uav_coverage_search::SwarmAuctionManifest> auction_manifest(
+      nh, context, tx_prefix + "/auction_manifest", rx_prefix + "/auction_manifest",
+      local_ip, peer_ip, port_base + 7, peer_port_base + 7, data_hz, max_bytes);
+  BridgeChannel<prometheus_two_uav_coverage_search::SwarmAuctionAssignment> auction_assignment(
+      nh, context, tx_prefix + "/auction_assignment", rx_prefix + "/auction_assignment",
+      // Proposal and final are consecutive protocol events. Dropping the
+      // second one deadlocks both coordinators while they wait for peer_final.
+      local_ip, peer_ip, port_base + 8, peer_port_base + 8, 0, max_bytes);
+  BridgeChannel<prometheus_two_uav_coverage_search::SwarmAuctionTaskSet> auction_task_set(
+      nh, context, tx_prefix + "/auction_task_set", rx_prefix + "/auction_task_set",
+      local_ip, peer_ip, port_base + 10, peer_port_base + 10, data_hz, max_bytes);
+  BridgeChannel<prometheus_two_uav_coverage_search::SwarmFrontierTransferAck> frontier_transfer_ack(
+      nh, context, tx_prefix + "/frontier_transfer_ack", rx_prefix + "/frontier_transfer_ack",
+      local_ip, peer_ip, port_base + 9, peer_port_base + 9, data_hz, max_bytes);
   BridgeChannel<prometheus_two_uav_coverage_search::SwarmTaskArray> task(
       nh, context, tx_prefix + "/task", rx_prefix + "/task", local_ip, peer_ip,
       port_base + 3, peer_port_base + 3, data_hz, max_bytes);

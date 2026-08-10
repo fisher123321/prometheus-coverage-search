@@ -24,6 +24,8 @@ void FrontierFinder::init(ros::NodeHandle &nh, CoverageMap *map) {
     nh.param("frontier_finder/vis_down_sample", vis_down_sample_, 2);
     nh.param("frontier_finder/vis_max_points", vis_max_points_, 3000);
     nh.param("frontier_finder/vis_max_total_points", vis_max_total_points_, 12000);
+    nh.param("frontier_finder/retire_changed_ratio", retire_changed_ratio_, 0.15);
+    retire_changed_ratio_ = std::max(0.0, std::min(1.0, retire_changed_ratio_));
     nh.param("coverage_search/sensing_range", sensing_range_, 5.0);
     nh.param("coverage_search/sensing_fov_h", sensing_fov_h_, 1.5708);
     nh.param("coverage_search/sensing_fov_v", sensing_fov_v_, 1.287);
@@ -52,6 +54,9 @@ void FrontierFinder::init(ros::NodeHandle &nh, CoverageMap *map) {
     int uav_id;
     nh.param("uav_id", uav_id, 1);
     source_uav_id_ = std::max(1, uav_id);
+    // Source ID + a monotonic per-process sequence makes every UID unique in
+    // this run; the wall-time seed also prevents collisions with stale data
+    // from an immediately preceding simulation run.
     next_task_sequence_ = ros::WallTime::now().toNSec() & 0x0000ffffffffffffULL;
     if (next_task_sequence_ == 0) next_task_sequence_ = 1;
     uav_name = "/uav" + std::to_string(uav_id);
@@ -66,52 +71,8 @@ void FrontierFinder::init(ros::NodeHandle &nh, CoverageMap *map) {
          << frontier_z_half_layers_ << TAIL << endl;
 }
 
-void FrontierFinder::searchFrontiersFull(const Eigen::Vector3d &cur_pos, bool relaxed) {
-    const std::vector<FrontierCluster> previous = frontiers_;
-    frontiers_.clear();
-    fill(frontier_flag_.begin(), frontier_flag_.end(), false);
-
-    const int z_min = std::max(0, map_->fly_z_idx_ - std::max(1, frontier_z_half_layers_));
-    const int z_max = std::min(map_->grid_size_(2) - 1,
-                               map_->fly_z_idx_ + std::max(1, frontier_z_half_layers_));
-    for (int x = 0; x < map_->grid_size_(0); x++) {
-        for (int y = 0; y < map_->grid_size_(1); y++) {
-            for (int z = z_min; z <= z_max; z++) {
-                Eigen::Vector3i seed(x, y, z);
-                int adr = map_->toAddress(seed);
-                if (frontier_flag_[adr]) continue;
-                if (!isFrontierCell(seed)) continue;
-
-                std::vector<Eigen::Vector3d> cluster_cells;
-                expandFrontier(seed, cluster_cells);
-                const int min_cluster = relaxed ? 2 : cluster_min_;
-                if ((int)cluster_cells.size() >= min_cluster &&
-                    isValidFrontierCluster(cluster_cells, relaxed)) {
-                    FrontierCluster ftr;
-                    ftr.cells = cluster_cells;
-                    ftr.changed_generation = update_generation_;
-                    computeFrontierInfo(ftr);
-                    frontiers_.push_back(ftr);
-                }
-            }
-        }
-    }
-
-    splitLargeFrontiers();
-    assignNewTaskIdentities(previous);
-    computeViewpoints(cur_pos);
-    // [FrontierTiming] full-scan log intentionally disabled during replan profiling.
-}
-
-void FrontierFinder::searchResidualFrontiers(const Eigen::Vector3d &cur_pos) {
-    ++update_generation_;
-    searchFrontiersFull(cur_pos, true);
-    ROS_WARN("[CoverageSearch] Relaxed residual-frontier full scan found %zu clusters.",
-             frontiers_.size());
-}
-
 void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
-    const std::vector<FrontierCluster> previous = frontiers_;
+    std::vector<FrontierCluster> previous = frontiers_;
     last_aabb_search_ms_ = 0.0;
     last_viewpoint_ms_ = 0.0;
     last_local_update_box_count_ = 0;
@@ -130,17 +91,17 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
     map_->getRemoteUpdatedBoxes(remote_boxes, true);
     last_remote_update_box_count_ = static_cast<int>(remote_boxes.size());
 
-    // A source UAV is still the only publisher of its frontier entities: a
-    // peer can never create one here.  It must, however, retire its own task
-    // as soon as the fused map says every stored frontier cell is gone.  This
-    // keeps a removed cluster, its viewpoints, and its task advertisement in
-    // one lifecycle instead of leaving an orphaned viewpoint behind.
+    // This is a lifecycle scan over existing clusters, not a map-wide frontier
+    // search. A cluster is retired as one entity once 15% of its remembered
+    // frontier voxels are no longer frontier voxels; local AABB extraction
+    // below then creates fresh, independently identified replacement clusters.
     bool retired_frontier = false;
     std::vector<FrontierCluster> live_frontiers;
     live_frontiers.reserve(frontiers_.size());
     for (auto &ftr : frontiers_) {
-        if (isFrontierCellsCovered(ftr.cells, 1.0)) {
+        if (isFrontierCellsCovered(ftr.cells, retire_changed_ratio_)) {
             resetFrontierFlag(ftr);
+            retired_task_ids_.push_back(ftr.task_id);
             retired_frontier = true;
             continue;
         }
@@ -161,11 +122,25 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
     }
     if (retired_frontier) {
         frontiers_.swap(live_frontiers);
+        // Retired IDs are never inherited by replacement clusters.
+        previous = frontiers_;
         ++update_generation_;
     }
 
-    // Remote evidence may retire the source's existing entity as above, but
-    // it is never used to create a new source frontier entity.
+    std::vector<FrontierCluster> live_sleeping;
+    live_sleeping.reserve(sleeping_frontiers_.size());
+    for (auto &ftr : sleeping_frontiers_) {
+        if (isFrontierCellsCovered(ftr.cells, retire_changed_ratio_)) {
+            resetFrontierFlag(ftr);
+            continue;
+        }
+        live_sleeping.push_back(ftr);
+    }
+    sleeping_frontiers_.swap(live_sleeping);
+
+    // Only local sensor AABBs are allowed to create or re-cluster frontiers.
+    // Fused peer evidence may retire an existing cluster above, but never
+    // creates a new local entity here.
     if (update_boxes.empty()) {
         return;
     }
@@ -208,11 +183,12 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
                 break;
             }
         }
-        if (affected && isFrontierChanged(ftr)) {
+        if (affected && isFrontierCellsCovered(ftr.cells, retire_changed_ratio_)) {
             resetFrontierFlag(ftr);
-        } else {
-            kept.push_back(ftr);
+            retired_task_ids_.push_back(ftr.task_id);
+            continue;
         }
+        kept.push_back(ftr);
     }
     frontiers_.swap(kept);
 
@@ -302,6 +278,7 @@ void FrontierFinder::assignNewTaskIdentities(const std::vector<FrontierCluster> 
         }
         if (best >= 0 && best_overlap >= 0.75) {
             frontier.task_id = previous[best].task_id;
+            frontier.source_uav_id = previous[best].source_uav_id;
             frontier.source_revision = previous[best].source_revision + 1;
             frontier.local_discovery = false;
         } else {
@@ -309,6 +286,7 @@ void FrontierFinder::assignNewTaskIdentities(const std::vector<FrontierCluster> 
             // monotonic sequence numbers and are never spatially quantized.
             frontier.task_id = (static_cast<uint64_t>(source_uav_id_ & 0xffff) << 48) |
                                (next_task_sequence_++ & 0x0000ffffffffffffULL);
+            frontier.source_uav_id = source_uav_id_;
             frontier.source_revision = 1;
             frontier.local_discovery = true;
         }
@@ -324,16 +302,6 @@ bool FrontierFinder::haveOverlap(const Eigen::Vector3d &min1, const Eigen::Vecto
     return true;
 }
 
-bool FrontierFinder::isFrontierChanged(const FrontierCluster &ftr) {
-    if (ftr.cells.empty()) return true;
-    for (const auto &cell : ftr.cells) {
-        Eigen::Vector3i idx;
-        map_->posToIndex(cell, idx);
-        if (!isFrontierCell(idx)) return true;
-    }
-    return false;
-}
-
 bool FrontierFinder::isFrontierCellsCovered(const std::vector<Eigen::Vector3d> &cells,
                                             double changed_fraction) {
     if (cells.empty()) return false;
@@ -346,6 +314,91 @@ bool FrontierFinder::isFrontierCellsCovered(const std::vector<Eigen::Vector3d> &
         if (!isFrontierCell(idx) && ++changed >= threshold) return true;
     }
     return false;
+}
+
+bool FrontierFinder::adoptFrontier(
+    const prometheus_two_uav_coverage_search::SwarmFrontier &frontier) {
+    if (frontier.task_id == 0 || frontier.frontier_source_uav_id == 0 ||
+        frontier.frontier_cells.empty()) return false;
+
+    FrontierCluster adopted;
+    adopted.task_id = frontier.task_id;
+    adopted.source_uav_id = frontier.frontier_source_uav_id;
+    adopted.source_revision = std::max(1u, frontier.cluster_version);
+    adopted.changed_generation = update_generation_;
+    adopted.local_discovery = false;
+    adopted.cells.reserve(frontier.frontier_cells.size());
+    for (const auto &point : frontier.frontier_cells) {
+        adopted.cells.emplace_back(point.x, point.y, point.z);
+    }
+    computeFrontierInfo(adopted);
+    adopted.visib_num = std::max(1, static_cast<int>(frontier.information_gain));
+    for (const auto &pose : frontier.candidate_viewpoints) {
+        adopted.viewpoints.emplace_back(pose.position.x, pose.position.y, pose.position.z);
+        adopted.viewpoint_yaws.push_back(std::atan2(
+            2.0 * (pose.orientation.w * pose.orientation.z +
+                   pose.orientation.x * pose.orientation.y),
+            1.0 - 2.0 * (pose.orientation.y * pose.orientation.y +
+                   pose.orientation.z * pose.orientation.z)));
+        adopted.viewpoint_visib_nums.push_back(adopted.visib_num);
+    }
+
+    for (auto &existing : frontiers_) {
+        if (existing.task_id != adopted.task_id) continue;
+        if (existing.source_uav_id != adopted.source_uav_id) return false;
+        if (existing.source_revision > adopted.source_revision) return true;
+        resetFrontierFlag(existing);
+        existing = adopted;
+        for (const auto &cell : existing.cells) {
+            Eigen::Vector3i index;
+            map_->posToIndex(cell, index);
+            if (map_->isInMapIndex(index)) frontier_flag_[map_->toAddress(index)] = true;
+        }
+        return true;
+    }
+    for (const auto &cell : adopted.cells) {
+        Eigen::Vector3i index;
+        map_->posToIndex(cell, index);
+        if (map_->isInMapIndex(index)) frontier_flag_[map_->toAddress(index)] = true;
+    }
+    frontiers_.push_back(std::move(adopted));
+    return true;
+}
+
+bool FrontierFinder::moveFrontierToSleeping(uint64_t task_id) {
+    const auto active = std::find_if(frontiers_.begin(), frontiers_.end(),
+                                     [task_id](const FrontierCluster &frontier) {
+                                         return frontier.task_id == task_id;
+                                     });
+    if (active == frontiers_.end()) return false;
+    const auto sleeping = std::find_if(sleeping_frontiers_.begin(), sleeping_frontiers_.end(),
+                                       [task_id](const FrontierCluster &frontier) {
+                                           return frontier.task_id == task_id;
+                                       });
+    if (sleeping == sleeping_frontiers_.end()) sleeping_frontiers_.push_back(*active);
+    else *sleeping = *active;
+    frontiers_.erase(active);
+    return true;
+}
+
+bool FrontierFinder::reactivateSleepingFrontier(uint64_t task_id, uint32_t min_revision) {
+    const auto sleeping = std::find_if(sleeping_frontiers_.begin(), sleeping_frontiers_.end(),
+        [task_id, min_revision](const FrontierCluster &frontier) {
+            return frontier.task_id == task_id && frontier.source_revision >= min_revision;
+        });
+    if (sleeping == sleeping_frontiers_.end()) return false;
+    frontiers_.push_back(*sleeping);
+    sleeping_frontiers_.erase(sleeping);
+    return true;
+}
+
+std::vector<uint64_t> FrontierFinder::consumeRetiredTaskIds() {
+    std::sort(retired_task_ids_.begin(), retired_task_ids_.end());
+    retired_task_ids_.erase(std::unique(retired_task_ids_.begin(), retired_task_ids_.end()),
+                            retired_task_ids_.end());
+    std::vector<uint64_t> retired;
+    retired.swap(retired_task_ids_);
+    return retired;
 }
 
 void FrontierFinder::resetFrontierFlag(const FrontierCluster &ftr) {
@@ -837,7 +890,7 @@ void FrontierFinder::getTopViewpoints(const Eigen::Vector3d &cur_pos,
 }
 
 void FrontierFinder::publishFrontiers() {
-    if (frontier_vis_pub_.getNumSubscribers() < 1 && last_frontier_marker_count_ == 0) return;
+    if (frontier_vis_pub_.getNumSubscribers() < 1 && published_frontier_marker_ids_.empty()) return;
 
     visualization_msgs::MarkerArray markers;
 
@@ -859,16 +912,21 @@ void FrontierFinder::publishFrontiers() {
 
     int total_added = 0;
     const int total_cap = std::max(vis_max_points_, vis_max_total_points_);
-    for (int i = 0; i < (int)frontiers_.size(); i++) {
-        auto c = hsvToRgb(std::fmod(0.02 + i * 0.61803398875, 1.0), 0.92, 0.95);
+    std::set<int> visible_marker_ids;
+    for (const auto &frontier : frontiers_) {
+        const uint64_t mixed = frontier.task_id ^ (frontier.task_id >> 33) ^
+            (frontier.task_id << 11);
+        const int marker_id = std::max(1, static_cast<int>(mixed & 0x7fffffffULL));
+        visible_marker_ids.insert(marker_id);
+        auto c = hsvToRgb(static_cast<double>(mixed % 10000ULL) / 10000.0, 0.92, 0.95);
         // RViz shows every frontier voxel; filtered_cells remains view-generation only.
-        const auto &vis_cells = frontiers_[i].cells;
+        const auto &vis_cells = frontier.cells;
 
         visualization_msgs::Marker cell_marker;
         cell_marker.header.frame_id = "world";
         cell_marker.header.stamp = ros::Time::now();
         cell_marker.ns = "frontier_cells";
-        cell_marker.id = i;
+        cell_marker.id = marker_id;
         cell_marker.type = visualization_msgs::Marker::CUBE_LIST;
         cell_marker.action = visualization_msgs::Marker::ADD;
         cell_marker.scale.x = map_->resolution_ * 0.85;
@@ -903,22 +961,21 @@ void FrontierFinder::publishFrontiers() {
         }
 
         Eigen::Vector3d live_target;
-        if (!frontiers_[i].viewpoints.empty() &&
-            getRepresentativeFrontierCell(frontiers_[i], live_target)) {
+        if (!frontier.viewpoints.empty() && getRepresentativeFrontierCell(frontier, live_target)) {
             int best_idx = 0;
-            if (!frontiers_[i].viewpoint_visib_nums.empty()) {
-                best_idx = (int)(std::max_element(frontiers_[i].viewpoint_visib_nums.begin(),
-                                                   frontiers_[i].viewpoint_visib_nums.end()) -
-                                  frontiers_[i].viewpoint_visib_nums.begin());
+            if (!frontier.viewpoint_visib_nums.empty()) {
+                best_idx = (int)(std::max_element(frontier.viewpoint_visib_nums.begin(),
+                                                   frontier.viewpoint_visib_nums.end()) -
+                                  frontier.viewpoint_visib_nums.begin());
             }
-            best_idx = std::max(0, std::min(best_idx, (int)frontiers_[i].viewpoints.size() - 1));
-            const Eigen::Vector3d &vp = frontiers_[i].viewpoints[best_idx];
+            best_idx = std::max(0, std::min(best_idx, (int)frontier.viewpoints.size() - 1));
+            const Eigen::Vector3d &vp = frontier.viewpoints[best_idx];
             double yaw = 0.0;
-            if (best_idx < (int)frontiers_[i].viewpoint_yaws.size()) {
-                yaw = frontiers_[i].viewpoint_yaws[best_idx];
+            if (best_idx < (int)frontier.viewpoint_yaws.size()) {
+                yaw = frontier.viewpoint_yaws[best_idx];
             } else {
                 Eigen::Vector3d target;
-                if (getRepresentativeFrontierCell(frontiers_[i], target))
+                if (getRepresentativeFrontierCell(frontier, target))
                     yaw = std::atan2(target(1) - vp(1), target(0) - vp(0));
             }
 
@@ -926,7 +983,7 @@ void FrontierFinder::publishFrontiers() {
             vp_marker.header.frame_id = "world";
             vp_marker.header.stamp = ros::Time::now();
             vp_marker.ns = "frontier_best_viewpoint";
-            vp_marker.id = i;
+            vp_marker.id = marker_id;
             vp_marker.type = visualization_msgs::Marker::SPHERE;
             vp_marker.action = visualization_msgs::Marker::ADD;
             vp_marker.pose.position.x = vp(0);
@@ -947,7 +1004,7 @@ void FrontierFinder::publishFrontiers() {
             yaw_marker.header.frame_id = "world";
             yaw_marker.header.stamp = ros::Time::now();
             yaw_marker.ns = "frontier_best_view_yaw";
-            yaw_marker.id = i;
+            yaw_marker.id = marker_id;
             yaw_marker.type = visualization_msgs::Marker::ARROW;
             yaw_marker.action = visualization_msgs::Marker::ADD;
             yaw_marker.scale.x = 0.035;
@@ -971,7 +1028,7 @@ void FrontierFinder::publishFrontiers() {
             del_vp.header.frame_id = "world";
             del_vp.header.stamp = ros::Time::now();
             del_vp.ns = "frontier_best_viewpoint";
-            del_vp.id = i;
+            del_vp.id = marker_id;
             del_vp.action = visualization_msgs::Marker::DELETE;
             markers.markers.push_back(del_vp);
 
@@ -982,29 +1039,22 @@ void FrontierFinder::publishFrontiers() {
 
     }
 
-    for (int i = (int)frontiers_.size(); i < last_frontier_marker_count_; i++) {
+    for (const int marker_id : published_frontier_marker_ids_) {
+        if (visible_marker_ids.count(marker_id) != 0) continue;
         visualization_msgs::Marker delete_marker;
         delete_marker.header.frame_id = "world";
         delete_marker.header.stamp = ros::Time::now();
         delete_marker.ns = "frontier_cells";
-        delete_marker.id = i;
+        delete_marker.id = marker_id;
         delete_marker.action = visualization_msgs::Marker::DELETE;
         markers.markers.push_back(delete_marker);
-    }
-    for (int i = (int)frontiers_.size(); i < last_viewpoint_marker_count_; i++) {
-        visualization_msgs::Marker delete_marker;
-        delete_marker.header.frame_id = "world";
-        delete_marker.header.stamp = ros::Time::now();
         delete_marker.ns = "frontier_best_viewpoint";
-        delete_marker.id = i;
-        delete_marker.action = visualization_msgs::Marker::DELETE;
         markers.markers.push_back(delete_marker);
 
         visualization_msgs::Marker delete_yaw = delete_marker;
         delete_yaw.ns = "frontier_best_view_yaw";
         markers.markers.push_back(delete_yaw);
     }
-    last_frontier_marker_count_ = (int)frontiers_.size();
-    last_viewpoint_marker_count_ = (int)frontiers_.size();
+    published_frontier_marker_ids_.swap(visible_marker_ids);
     frontier_vis_pub_.publish(markers);
 }

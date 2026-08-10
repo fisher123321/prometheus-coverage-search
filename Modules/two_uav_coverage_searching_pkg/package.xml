@@ -21,6 +21,7 @@
   <depend>visualization_msgs</depend>
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
+  <depend>octomap_msgs</depend>
   <depend>octomap_server</depend>
   <depend>prometheus_msgs</depend>
 

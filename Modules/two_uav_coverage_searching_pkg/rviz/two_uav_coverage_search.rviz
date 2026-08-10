@@ -59,6 +59,17 @@ Visualization Manager:
       Voxel Alpha: 1
       Voxel Coloring: Z-Axis
       Voxel Rendering: Occupied Voxels
+    - Alpha: 1
+      Class: octomap_rviz_plugin/OccupancyMap
+      Color Scheme: map
+      Draw Behind: true
+      Enabled: true
+      Max. Octree Depth: 15
+      Name: Fused explored area (either UAV known)
+      Octomap Binary Topic: /two_uav/fused_explored_octomap_binary
+      Unreliable: false
+      Use Timestamp: false
+      Value: true
     - Class: octomap_rviz_plugin/OccupancyGrid
       Enabled: true
       Max. Height Display: 3.4028234663852886e+38
@@ -286,7 +297,7 @@ Visualization Manager:
         - Class: rviz/Marker
           Enabled: true
           Marker Topic: /uav1/prometheus/coverage_search/task_labels
-          Name: 任务归属标签
+          Name: 视点任务归属（UAV+剩余租约）
           Namespaces:
             task_owner: true
           Queue Size: 20
@@ -328,7 +339,7 @@ Visualization Manager:
         - Class: rviz/Marker
           Enabled: true
           Marker Topic: /uav2/prometheus/coverage_search/task_labels
-          Name: 任务归属标签
+          Name: 视点任务归属（UAV+剩余租约）
           Namespaces:
             task_owner: true
           Queue Size: 20

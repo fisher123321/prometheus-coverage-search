@@ -763,12 +763,6 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         traj_accs_.swap(accelerations);
         traj_yaws_.swap(yaws);
         traj_dt_ = sample_dt;
-        ROS_INFO("[CoverageSearch] Time B-spline accepted: position=%.2fs, yaw=%.2fs, "
-                 "total=%.2fs, ctrl=%d, samples=%zu, peak_v=%.2f, peak_a=%.2f, "
-                 "peak_yaw_rate=%.2f, peak_yaw_acc=%.2f.",
-                 candidate.position_duration, candidate.yaw_duration, candidate.duration,
-                 control_count, traj_points_.size(), peak_speed, peak_acc,
-                 peak_yaw_rate, peak_yaw_acc);
         return true;
     }
 
@@ -795,7 +789,10 @@ void CoverageSearchManager::generateBsplineTraj() {
     traj_yaws_.clear();
 
     if (astar_path_.empty()) { has_traj_ = false; return; }
-    coverage_map_.updateDistanceFields();
+    {
+        std::lock_guard<std::mutex> lock(coverage_map_update_mutex_);
+        coverage_map_.updateDistanceFields();
+    }
     const auto distance_field_end = std::chrono::steady_clock::now();
 
     std::string traj_type = "Bspline";
@@ -1170,10 +1167,6 @@ void CoverageSearchManager::generateBsplineTraj() {
         traj_points_.swap(stitched);
         traj_yaws_.assign(traj_points_.size(), uav_yaw_);
         traj_vels_.assign(traj_points_.size(), Eigen::Vector3d::Zero());
-        ROS_WARN("[CoverageSearch] Piecewise B-spline recovery succeeded: spline_pieces=%d, "
-                 "straight_safety_pieces=%d, join_smoothing=%s, points=%zu.",
-                 spline_pieces, linear_pieces,
-                 join_smoothing_applied ? "yes" : "no", traj_points_.size());
         return true;
     };
 
@@ -1451,9 +1444,6 @@ void CoverageSearchManager::generateBsplineTraj() {
         }
         traj_yaws_.front() = uav_yaw_;
         traj_yaws_.back() = current_goal_yaw_;
-        ROS_INFO("[CoverageSearch] Coupled yaw B-spline: start=%.2f, goal=%.2f, delta=%.2f rad.",
-                 uav_yaw_, current_goal_yaw_, yaw_delta);
-
         // 对几何轨迹做一次前后向速度规划，供原生 TRAJECTORY 模式同时跟踪 P/V/A。
         traj_vels_.assign(n, Eigen::Vector3d::Zero());
         traj_accs_.assign(n, Eigen::Vector3d::Zero());
@@ -1579,9 +1569,6 @@ void CoverageSearchManager::generateBsplineTraj() {
         traj_profile_ms_ = std::chrono::duration<double, std::milli>(trajectory_build_end - geometry_end).count();
     }
 
-    cout << GREEN << "[CoverageSearch] Trajectory generated: "
-         << traj_points_.size() << " points from "
-         << astar_path_.size() << " waypoints (" << traj_type << ")." << TAIL << endl;
 }
 
 bool CoverageSearchManager::buildContinuousBridge(
@@ -2131,8 +2118,6 @@ void CoverageSearchManager::executeRealtimeTrajectory() {
             uint64_t expected = 0;
             if (realtime_completed_generation_.compare_exchange_strong(
                     expected, snapshot->generation)) {
-                ROS_INFO("[CoverageSearch] Terminal P/V/A=0 hold settled: dist=%.2fm, speed=%.2fm/s, yaw_error=%.2frad.",
-                         goal_dist, measured_vel.head<2>().norm(), yaw_error);
             }
         }
     }
@@ -2165,7 +2150,6 @@ void CoverageSearchManager::maintainActiveTrajectory() {
             replan_reason = "trajectory ending";
         }
         if (!replan_reason.empty()) {
-            ROS_INFO("[CoverageSearch] Replan: %s.", replan_reason.c_str());
             // The active spline remains in the realtime executor while this
             // worker re-solves ATSP and a new first-viewpoint trajectory.
             tryPrepareRollingHandoff(true);

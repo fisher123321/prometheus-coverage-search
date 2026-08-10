@@ -60,11 +60,7 @@
         <!-- 完成条件：固定区域覆盖率严格大于 99%。 -->
         <param name="coverage_search/completion_known_ratio" value="$(arg completion_known_ratio)"/>
         <param name="coverage_search/residual_scan_yaw_rate" value="0.6"/>
-        <!-- Bids use A* path length.  Bound their rate/work so bid generation
-             never competes with the real-time command loop. -->
-        <param name="coverage_search/swarm_bid_period" value="2.0"/>
-        <param name="coverage_search/swarm_bid_max_tasks" value="16"/>
-        <param name="coverage_search/swarm_bid_max_astar" value="6"/>
+        <!-- Stable expired leases enter the two-stage distributed A* round. -->
         <!-- 每机仅对已确认归属的最近五个租约簇做开放 ATSP；不改变协同消息。 -->
         <param name="coverage_search/atsp_enabled" value="true"/>
         <param name="coverage_search/atsp_max_clusters" value="5"/>
@@ -72,6 +68,8 @@
         <param name="coverage_search/atsp_refine_clusters" value="3"/>
         <param name="coverage_search/atsp_viewpoints_per_cluster" value="3"/>
         <param name="coverage_search/atsp_edge_timeout_ms" value="100.0"/>
+        <param name="coverage_search/atsp_planning_budget_ms" value="250.0"/>
+        <param name="coverage_search/auction_astar_timeout_ms" value="50.0"/>
         <!-- 自动开始 -->
         <param name="coverage_search/auto_start" value="$(arg auto_start)"/>
         <param name="coverage_search/cooperative_mode" value="$(arg cooperative_mode)"/>
@@ -124,6 +122,7 @@
 
         <!-- 前沿查找器参数 -->
         <param name="frontier_finder/cluster_min" value="5"/>
+        <param name="frontier_finder/retire_changed_ratio" value="0.15"/>
         <param name="frontier_finder/cluster_size_xy" value="2.2"/>
         <param name="frontier_finder/candidate_radius" value="1.4"/>
         <param name="frontier_finder/candidate_clearance" value="0.45"/>
