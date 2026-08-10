@@ -66,6 +66,27 @@ TEST(TwoUavAuctionProtocol, TaskSetDigestUsesOnlyRepresentativeViewpoint) {
             two_uav_auction::taskSetHash({second}));
 }
 
+TEST(TwoUavAuctionProtocol, RequiresMutualAcknowledgementOfTheSameOfferPair) {
+  prometheus_two_uav_coverage_search::SwarmAuctionTaskSet uav1;
+  prometheus_two_uav_coverage_search::SwarmAuctionTaskSet uav2;
+  uav1.offer_sequence = 7;
+  uav2.offer_sequence = 9;
+  EXPECT_FALSE(two_uav_auction::offersMutuallyAcknowledged(uav1, uav2));
+  uav1.peer_offer_sequence_ack = 9;
+  EXPECT_FALSE(two_uav_auction::offersMutuallyAcknowledged(uav1, uav2));
+  uav2.peer_offer_sequence_ack = 7;
+  EXPECT_TRUE(two_uav_auction::offersMutuallyAcknowledged(uav1, uav2));
+  uav2.offer_sequence = 10;
+  EXPECT_FALSE(two_uav_auction::offersMutuallyAcknowledged(uav1, uav2));
+}
+
+TEST(TwoUavAuctionProtocol, UnreachableRetryBacksOffAndCaps) {
+  EXPECT_DOUBLE_EQ(1.0, two_uav_auction::unreachableRetryDelay(1.0, 8.0, 1));
+  EXPECT_DOUBLE_EQ(2.0, two_uav_auction::unreachableRetryDelay(1.0, 8.0, 2));
+  EXPECT_DOUBLE_EQ(4.0, two_uav_auction::unreachableRetryDelay(1.0, 8.0, 3));
+  EXPECT_DOUBLE_EQ(8.0, two_uav_auction::unreachableRetryDelay(1.0, 8.0, 8));
+}
+
 TEST(TwoUavAuctionProtocol, AssignmentDigestDetectsOwnerConflict) {
   std::vector<prometheus_two_uav_coverage_search::SwarmFrontier> tasks{
       frontier(11, 1, 7, 1.0), frontier(22, 2, 4, 3.0)};
@@ -82,23 +103,67 @@ TEST(TwoUavAuctionProtocol, ResolvesEveryOwnerConflictToLowerId) {
   EXPECT_EQ(0u, two_uav_auction::resolveOwner(0, 0, 1));
 }
 
-TEST(TwoUavAuctionProtocol, CommonTaskSetUsesConfirmedUidsAndSourceDescriptor) {
+TEST(TwoUavAuctionProtocol, RejectsOwnerNotConfirmedByItsOwnEvaluator) {
+  // This is the previous peer-final deadlock: UAV1's map selected UAV2,
+  // while UAV2 rejected the endpoint for both vehicles.  The final result
+  // must be a valid explicit UNREACHABLE, not owner=2 with that mode.
+  EXPECT_EQ(0u, two_uav_auction::resolveConsensusOwner(2, 1, 0, 2, 1));
+  EXPECT_EQ(0u, two_uav_auction::resolveConsensusOwner(0, 1, 1, 2, 1));
+  EXPECT_EQ(1u, two_uav_auction::resolveConsensusOwner(1, 1, 0, 2, 1));
+  EXPECT_EQ(2u, two_uav_auction::resolveConsensusOwner(2, 1, 2, 2, 1));
+  EXPECT_EQ(1u, two_uav_auction::resolveConsensusOwner(2, 1, 1, 2, 1));
+}
+
+TEST(TwoUavAuctionProtocol, ConfirmedTaskSetIncludesOneSidedUidsAndSourceDescriptor) {
   prometheus_two_uav_coverage_search::SwarmAuctionTaskSet uav1;
   uav1.source_uav_id = 1;
   uav1.map_epoch = 1;
+  uav1.offer_sequence = 4;
   uav1.frontiers = {frontier(11, 1, 7, 1.0), frontier(33, 1, 1, 8.0)};
   prometheus_two_uav_coverage_search::SwarmAuctionTaskSet uav2;
   uav2.source_uav_id = 2;
   uav2.map_epoch = 1;
+  uav2.offer_sequence = 6;
   uav2.frontiers = {frontier(11, 1, 9, 9.0), frontier(22, 2, 4, 3.0)};
 
-  const auto first = two_uav_auction::commonTaskSet(uav1, uav2);
-  const auto second = two_uav_auction::commonTaskSet(uav2, uav1);
-  ASSERT_EQ(1u, first.frontiers.size());
-  ASSERT_EQ(1u, second.frontiers.size());
+  const auto first = two_uav_auction::confirmedTaskSet(uav1, uav2);
+  const auto second = two_uav_auction::confirmedTaskSet(uav2, uav1);
+  ASSERT_EQ(3u, first.frontiers.size());
+  ASSERT_EQ(3u, second.frontiers.size());
   EXPECT_EQ(11u, first.frontiers.front().task_id);
   EXPECT_EQ(7u, first.frontiers.front().cluster_version);
   EXPECT_EQ(first.task_set_hash, second.task_set_hash);
+  uav2.offer_sequence = 7;
+  EXPECT_NE(first.task_set_hash,
+            two_uav_auction::confirmedTaskSet(uav1, uav2).task_set_hash);
+}
+
+TEST(TwoUavAuctionProtocol, ConfirmedTaskSetFreezesMatchingNewestPositions) {
+  prometheus_two_uav_coverage_search::SwarmAuctionTaskSet uav1;
+  uav1.source_uav_id = 1;
+  uav1.offer_sequence = 4;
+  uav1.uav1_state_sequence = 10;
+  uav1.uav2_state_sequence = 7;
+  uav1.uav1_position.x = 1.0;
+  uav1.uav2_position.x = 20.0;
+  prometheus_two_uav_coverage_search::SwarmAuctionTaskSet uav2;
+  uav2.source_uav_id = 2;
+  uav2.offer_sequence = 6;
+  uav2.uav1_state_sequence = 9;
+  uav2.uav2_state_sequence = 12;
+  uav2.uav1_position.x = 2.0;
+  uav2.uav2_position.x = 21.0;
+
+  const auto first = two_uav_auction::confirmedTaskSet(uav1, uav2);
+  const auto second = two_uav_auction::confirmedTaskSet(uav2, uav1);
+  EXPECT_EQ(10u, first.uav1_state_sequence);
+  EXPECT_EQ(12u, first.uav2_state_sequence);
+  EXPECT_DOUBLE_EQ(1.0, first.uav1_position.x);
+  EXPECT_DOUBLE_EQ(21.0, first.uav2_position.x);
+  EXPECT_EQ(first.task_set_hash, second.task_set_hash);
+  uav1.uav1_position.x = 1.5;
+  EXPECT_NE(first.task_set_hash,
+            two_uav_auction::confirmedTaskSet(uav1, uav2).task_set_hash);
 }
 
 TEST(TwoUavAuctionProtocol, SnapshotSurvivesUnrelatedChangesAndOwnRevisionRefresh) {

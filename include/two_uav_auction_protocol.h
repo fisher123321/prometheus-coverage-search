@@ -2,6 +2,7 @@
 #define TWO_UAV_AUCTION_PROTOCOL_H
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <map>
 #include <vector>
@@ -17,6 +18,13 @@ inline uint64_t mix(uint64_t hash, uint64_t value) {
   // security primitive or a persistent identity.
   hash ^= value;
   return hash * 1099511628211ULL;
+}
+
+inline double unreachableRetryDelay(double initial, double maximum,
+                                    uint32_t consecutive_failures) {
+  const uint32_t exponent = consecutive_failures > 0
+      ? std::min<uint32_t>(consecutive_failures - 1, 20) : 0;
+  return std::min(maximum, std::ldexp(initial, exponent));
 }
 
 inline bool taskLess(const prometheus_two_uav_coverage_search::SwarmFrontier& lhs,
@@ -78,30 +86,82 @@ inline uint64_t taskSetHash(
   return hash;
 }
 
-// Both offers are frozen while this commutative intersection is built. A
-// one-sided new task waits for the next round instead of cancelling the tasks
-// already confirmed by both UAVs. The discovering UAV's descriptor is
-// authoritative; transferred tasks fall back to the lower coordinator ID.
-inline prometheus_two_uav_coverage_search::SwarmAuctionTaskSet commonTaskSet(
+inline bool offersMutuallyAcknowledged(
+    const prometheus_two_uav_coverage_search::SwarmAuctionTaskSet& first,
+    const prometheus_two_uav_coverage_search::SwarmAuctionTaskSet& second) {
+  return first.offer_sequence != 0 && second.offer_sequence != 0 &&
+         first.peer_offer_sequence_ack == second.offer_sequence &&
+         second.peer_offer_sequence_ack == first.offer_sequence;
+}
+
+inline const prometheus_two_uav_coverage_search::SwarmAuctionTaskSet& stateOffer(
+    const prometheus_two_uav_coverage_search::SwarmAuctionTaskSet& first,
+    const prometheus_two_uav_coverage_search::SwarmAuctionTaskSet& second,
+    uint32_t uav_id) {
+  const uint64_t first_sequence = uav_id == 1 ? first.uav1_state_sequence
+                                               : first.uav2_state_sequence;
+  const uint64_t second_sequence = uav_id == 1 ? second.uav1_state_sequence
+                                                : second.uav2_state_sequence;
+  if (first_sequence != second_sequence)
+    return first_sequence > second_sequence ? first : second;
+  if (first.source_uav_id == uav_id) return first;
+  if (second.source_uav_id == uav_id) return second;
+  return first.source_uav_id < second.source_uav_id ? first : second;
+}
+
+// Both offers are frozen while this commutative union is built. A task needs
+// one advertisement, not two: its discovering UAV naturally has it in its
+// local offer while the other UAV may only learn it through this exchange.
+// The discovering UAV's descriptor is authoritative when both offers contain
+// the task; transferred tasks fall back to the lower coordinator ID.
+inline prometheus_two_uav_coverage_search::SwarmAuctionTaskSet confirmedTaskSet(
     const prometheus_two_uav_coverage_search::SwarmAuctionTaskSet& first,
     const prometheus_two_uav_coverage_search::SwarmAuctionTaskSet& second) {
   prometheus_two_uav_coverage_search::SwarmAuctionTaskSet out;
   out.map_epoch = first.map_epoch;
   out.uav1_state_sequence = std::max(first.uav1_state_sequence, second.uav1_state_sequence);
   out.uav2_state_sequence = std::max(first.uav2_state_sequence, second.uav2_state_sequence);
+  const auto& uav1_state = stateOffer(first, second, 1);
+  const auto& uav2_state = stateOffer(first, second, 2);
+  out.uav1_position = uav1_state.uav1_position;
+  out.uav2_position = uav2_state.uav2_position;
 
   std::map<uint64_t, const prometheus_two_uav_coverage_search::SwarmFrontier*> peer;
   for (const auto& frontier : second.frontiers) peer[frontier.task_id] = &frontier;
   for (const auto& local : first.frontiers) {
     const auto found = peer.find(local.task_id);
-    if (found == peer.end() || !sameTaskKey(local, *found->second)) continue;
+    if (found == peer.end()) {
+      out.frontiers.push_back(local);
+      continue;
+    }
     const auto& remote = *found->second;
+    if (!sameTaskKey(local, remote)) {
+      peer.erase(found);
+      continue;
+    }
     if (local.frontier_source_uav_id == first.source_uav_id) out.frontiers.push_back(local);
     else if (remote.frontier_source_uav_id == second.source_uav_id) out.frontiers.push_back(remote);
     else out.frontiers.push_back(first.source_uav_id < second.source_uav_id ? local : remote);
+    peer.erase(found);
   }
+  for (const auto& entry : peer) out.frontiers.push_back(*entry.second);
   std::sort(out.frontiers.begin(), out.frontiers.end(), taskLess);
   out.task_set_hash = taskSetHash(out.frontiers);
+  const uint64_t uav1_offer = first.source_uav_id < second.source_uav_id
+      ? first.offer_sequence : second.offer_sequence;
+  const uint64_t uav2_offer = first.source_uav_id < second.source_uav_id
+      ? second.offer_sequence : first.offer_sequence;
+  out.task_set_hash = mix(mix(out.task_set_hash, uav1_offer), uav2_offer);
+  const auto mix_point = [&](const geometry_msgs::Point& point) {
+    out.task_set_hash = mix(out.task_set_hash,
+        static_cast<uint64_t>(static_cast<int64_t>(point.x * 1000.0)));
+    out.task_set_hash = mix(out.task_set_hash,
+        static_cast<uint64_t>(static_cast<int64_t>(point.y * 1000.0)));
+    out.task_set_hash = mix(out.task_set_hash,
+        static_cast<uint64_t>(static_cast<int64_t>(point.z * 1000.0)));
+  };
+  mix_point(out.uav1_position);
+  mix_point(out.uav2_position);
   return out;
 }
 
@@ -138,6 +198,24 @@ inline uint32_t resolveOwner(uint32_t local_owner, uint32_t peer_owner,
   if (local_owner == peer_owner) return local_owner;
   if (local_owner == 0) return peer_owner;
   if (peer_owner == 0) return local_owner;
+  return lower_uav_id;
+}
+
+// A hard endpoint rejection is not a normal bid conflict: assigning that
+// UAV anyway would create a lease that its own planner must immediately
+// reject.  A one-sided non-zero decision is therefore accepted only when the
+// proposed owner is the evaluator that made it.  Ordinary non-zero conflicts
+// still follow the deterministic lower-ID rule.
+inline uint32_t resolveConsensusOwner(uint32_t first_owner,
+                                      uint32_t first_evaluator_id,
+                                      uint32_t second_owner,
+                                      uint32_t second_evaluator_id,
+                                      uint32_t lower_uav_id) {
+  if (first_owner == second_owner) return first_owner;
+  if (first_owner == 0)
+    return second_owner == second_evaluator_id ? second_owner : 0;
+  if (second_owner == 0)
+    return first_owner == first_evaluator_id ? first_owner : 0;
   return lower_uav_id;
 }
 

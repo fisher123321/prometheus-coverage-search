@@ -11,6 +11,7 @@ CoverageSearchManager::~CoverageSearchManager() {
     raw_heartbeat_timer_.stop();
     if (trajectory_spinner_) trajectory_spinner_->stop();
     if (heartbeat_spinner_) heartbeat_spinner_->stop();
+    if (auction_spinner_) auction_spinner_->stop();
     {
         std::lock_guard<std::mutex> lock(auction_worker_mutex_);
         auction_worker_stop_ = true;
@@ -160,7 +161,9 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
             &CoverageSearchManager::swarmTaskCb, this);
         remote_state_sub_ = nh.subscribe(swarm_rx_prefix_ + "/state", 10,
             &CoverageSearchManager::remoteStateCb, this);
-        auction_task_set_sub_ = nh.subscribe(
+        auction_nh_.reset(new ros::NodeHandle(nh));
+        auction_nh_->setCallbackQueue(&auction_callback_queue_);
+        auction_task_set_sub_ = auction_nh_->subscribe(
             uav_name_ + "/prometheus/coverage_search/auction_task_set", 2,
             &CoverageSearchManager::auctionTaskSetCb, this);
         remote_frontier_transfer_ack_sub_ = nh.subscribe(
@@ -202,6 +205,10 @@ void CoverageSearchManager::init(ros::NodeHandle &nh) {
     heartbeat_spinner_.reset(new ros::AsyncSpinner(1, &heartbeat_callback_queue_));
     heartbeat_spinner_->start();
     auction_worker_ = std::thread(&CoverageSearchManager::auctionWorkerLoop, this);
+    if (auction_nh_) {
+        auction_spinner_.reset(new ros::AsyncSpinner(1, &auction_callback_queue_));
+        auction_spinner_->start();
+    }
     frontier_timer_ = nh.createTimer(ros::Duration(0.3), &CoverageSearchManager::frontierCb, this);
 
     exec_state_ = EXEC_STATE::INIT;
@@ -265,6 +272,7 @@ void CoverageSearchManager::uavControlStateCb(const prometheus_msgs::UAVControlS
 
 void CoverageSearchManager::globalPclCb(const sensor_msgs::PointCloud2ConstPtr &msg) {
     sensor_ready_ = true;
+    std::lock_guard<std::mutex> lock(coverage_map_update_mutex_);
     coverage_map_.updateFromGlobalPcl(msg);
 }
 
@@ -276,6 +284,7 @@ void CoverageSearchManager::localPclCb(const sensor_msgs::PointCloud2ConstPtr &m
     odom.pose.pose.position.y = uav_state_.position[1];
     odom.pose.pose.position.z = uav_state_.position[2];
     odom.pose.pose.orientation = uav_state_.attitude_q;
+    std::lock_guard<std::mutex> lock(coverage_map_update_mutex_);
     coverage_map_.updateFromLocalPcl(msg, odom);
 }
 
@@ -286,6 +295,7 @@ void CoverageSearchManager::scanPclCb(const sensor_msgs::PointCloud2ConstPtr &ms
     Eigen::Vector3d sensor_pos(uav_state_.position[0], uav_state_.position[1],
                                 fly_height_);
     double sensor_yaw = uav_yaw_;
+    std::lock_guard<std::mutex> lock(coverage_map_update_mutex_);
     coverage_map_.updateFromScanPcl(msg, sensor_pos, sensor_yaw);
 }
 
@@ -344,6 +354,7 @@ void CoverageSearchManager::depthPclCb(const sensor_msgs::PointCloud2ConstPtr &m
                                        uav_state_.position[2]);
         camera_pos = body_pos + R_wb * camera_offset_;
     }
+    std::lock_guard<std::mutex> lock(coverage_map_update_mutex_);
     coverage_map_.updateFromDepthPcl(msg, camera_pos, R_wc);
 }
 
@@ -376,6 +387,7 @@ void CoverageSearchManager::remoteStateCb(
     if (!msg->odom_valid) {
         peer_state_valid_ = false;
         peer_completion_ready_ = false;
+        std::lock_guard<std::mutex> lock(coverage_map_update_mutex_);
         coverage_map_.setDynamicPeerVolume(Eigen::Vector3d::Zero(), false);
         return;
     }
@@ -383,6 +395,7 @@ void CoverageSearchManager::remoteStateCb(
     peer_state_received_ = ros::Time::now();
     peer_state_valid_ = true;
     peer_completion_ready_ = msg->completion_ready;
+    std::lock_guard<std::mutex> lock(coverage_map_update_mutex_);
     coverage_map_.setDynamicPeerVolume(peer_pos_, true);
 }
 
@@ -451,7 +464,10 @@ void CoverageSearchManager::publishStartupHold() {
 void CoverageSearchManager::updateFrontiers() {
     if (!sensor_ready_ || !coverage_map_.map_ready_) return;
 
-    coverage_map_.updateDistanceFields();
+    {
+        std::lock_guard<std::mutex> lock(coverage_map_update_mutex_);
+        coverage_map_.updateDistanceFields();
+    }
     frontier_finder_.searchFrontiers(uav_pos_);
     retireFrontierTasks(frontier_finder_.consumeRetiredTaskIds());
     updateLocalFrontierReservations();
@@ -722,12 +738,13 @@ void CoverageSearchManager::auctionTaskSetCb(
             return;
         }
     }
-    last_auction_task_set_ = *msg;
-    publishAuctionAssignment(last_auction_task_set_);
+    publishAuctionAssignment(*msg);
 }
 
 CoverageSearchManager::AuctionMapSnapshot CoverageSearchManager::captureAuctionMapSnapshot() {
+    std::lock_guard<std::mutex> lock(coverage_map_update_mutex_);
     AuctionMapSnapshot snapshot;
+    if (!coverage_map_.map_ready_) return snapshot;
     snapshot.nx = coverage_map_.grid_size_(0);
     snapshot.ny = coverage_map_.grid_size_(1);
     snapshot.resolution = coverage_map_.resolution_;
@@ -736,9 +753,13 @@ CoverageSearchManager::AuctionMapSnapshot CoverageSearchManager::captureAuctionM
     const double clearance = std::max(0.45, coverage_map_.esdf_safe_distance_);
     for (int x = 0; x < snapshot.nx; ++x) {
         for (int y = 0; y < snapshot.ny; ++y) {
-            snapshot.walkable[x * snapshot.ny + y] =
-                coverage_map_.isFree2D(x, y) && !coverage_map_.isOccupied2D(x, y) &&
+            const uint8_t walkable =
+                coverage_map_.isFree2D(x, y, false) &&
                 coverage_map_.getDistance2D(x, y) + 1e-3 >= clearance;
+            snapshot.walkable[x * snapshot.ny + y] = walkable;
+            snapshot.walkable_count += walkable;
+            snapshot.walkable_hash ^= walkable;
+            snapshot.walkable_hash *= 1099511628211ULL;
         }
     }
     return snapshot;
@@ -836,13 +857,7 @@ bool CoverageSearchManager::auctionSnapshotPathCost(const AuctionMapSnapshot &ma
 
 void CoverageSearchManager::publishAuctionAssignment(
     const prometheus_two_uav_coverage_search::SwarmAuctionTaskSet &task_set) {
-    if (!coverage_map_.map_ready_ || !peer_state_valid_) {
-        ROS_WARN("[CoverageSearch] UAV %d cannot evaluate distributed round %llu: "
-                 "map_ready=%d peer_state_valid=%d.",
-                 uav_id_, static_cast<unsigned long long>(task_set.task_set_hash),
-                 coverage_map_.map_ready_, peer_state_valid_);
-        return;
-    }
+    const auto callback_started = std::chrono::steady_clock::now();
     const auto job_is_current = [&](const AuctionJob &candidate) {
         return candidate.task_set.task_set_hash == task_set.task_set_hash &&
             candidate.task_set.uav1_state_sequence == task_set.uav1_state_sequence &&
@@ -857,9 +872,30 @@ void CoverageSearchManager::publishAuctionAssignment(
     }
     AuctionJob job;
     job.task_set = task_set;
+    job.callback_started = callback_started;
+    if (!task_set.header.stamp.isZero()) {
+        job.receive_age_ms = std::max(0.0,
+            (ros::Time::now() - task_set.header.stamp).toSec() * 1000.0);
+    }
+    const auto snapshot_started = std::chrono::steady_clock::now();
     job.map = captureAuctionMapSnapshot();
-    job.uav1_start = uav_id_ == 1 ? uav_pos_ : peer_pos_;
-    job.uav2_start = uav_id_ == 1 ? peer_pos_ : uav_pos_;
+    if (job.map.walkable.empty()) {
+        ROS_WARN("[CoverageSearch] UAV %d cannot evaluate distributed round %llu: map not ready.",
+                 uav_id_, static_cast<unsigned long long>(task_set.task_set_hash));
+        return;
+    }
+    job.snapshot_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - snapshot_started).count();
+    job.uav1_start = Eigen::Vector3d(task_set.uav1_position.x,
+                                    task_set.uav1_position.y,
+                                    task_set.uav1_position.z);
+    job.uav2_start = Eigen::Vector3d(task_set.uav2_position.x,
+                                    task_set.uav2_position.y,
+                                    task_set.uav2_position.z);
+    job.peer_state_age_s = peer_state_received_.isZero() ?
+        std::numeric_limits<double>::infinity() :
+        std::max(0.0, (ros::Time::now() - peer_state_received_).toSec());
+    job.enqueued = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lock(auction_worker_mutex_);
         if ((auction_job_ready_ && job_is_current(auction_job_)) ||
@@ -886,6 +922,9 @@ void CoverageSearchManager::auctionWorkerLoop() {
             auction_active_uav1_state_sequence_ = job.task_set.uav1_state_sequence;
             auction_active_uav2_state_sequence_ = job.task_set.uav2_state_sequence;
         }
+        const auto evaluation_started = std::chrono::steady_clock::now();
+        const double queue_ms = std::chrono::duration<double, std::milli>(
+            evaluation_started - job.enqueued).count();
         prometheus_two_uav_coverage_search::SwarmAuctionAssignment out;
         out.header.stamp = ros::Time::now();
         out.source_uav_id = uav_id_;
@@ -982,13 +1021,33 @@ void CoverageSearchManager::auctionWorkerLoop() {
                  owner, mode_name);
     }
         out.assignment_hash = two_uav_auction::assignmentHash(out);
+        const auto evaluation_finished = std::chrono::steady_clock::now();
+        bool superseded = false;
         {
             std::lock_guard<std::mutex> lock(auction_worker_mutex_);
-            if (job.sequence != auction_job_sequence_) continue;
-            auction_active_task_set_hash_ = 0;
-            auction_active_uav1_state_sequence_ = 0;
-            auction_active_uav2_state_sequence_ = 0;
+            superseded = job.sequence != auction_job_sequence_;
+            if (!superseded) {
+                auction_active_task_set_hash_ = 0;
+                auction_active_uav1_state_sequence_ = 0;
+                auction_active_uav2_state_sequence_ = 0;
+            }
         }
+        ROS_INFO("[AuctionEvalTiming] evaluator=UAV%d round=%llu tasks=%zu "
+                 "receive_age=%.1fms snapshot=%.1fms queue=%.1fms compute=%.1fms total=%.1fms "
+                 "peer_age=%.3fs start1=(%.2f,%.2f) start2=(%.2f,%.2f) "
+                 "walkable=%zu/%zu map_hash=%llu superseded=%s.",
+                 uav_id_, static_cast<unsigned long long>(job.task_set.task_set_hash),
+                 job.task_set.frontiers.size(), job.receive_age_ms, job.snapshot_ms, queue_ms,
+                 std::chrono::duration<double, std::milli>(
+                     evaluation_finished - evaluation_started).count(),
+                 std::chrono::duration<double, std::milli>(
+                     evaluation_finished - job.callback_started).count(),
+                 job.peer_state_age_s, job.uav1_start.x(), job.uav1_start.y(),
+                 job.uav2_start.x(), job.uav2_start.y(), job.map.walkable_count,
+                 job.map.walkable.size(),
+                 static_cast<unsigned long long>(job.map.walkable_hash),
+                 superseded ? "yes" : "no");
+        if (superseded) continue;
         {
             std::lock_guard<std::mutex> lock(auction_assignment_mutex_);
             last_auction_assignment_ = out;
@@ -1015,6 +1074,7 @@ void CoverageSearchManager::remoteChunkCb(
         return;
     }
     if (msg->revision < have) return;
+    std::lock_guard<std::mutex> lock(coverage_map_update_mutex_);
     const int voxel_count = coverage_map_.grid_size_(0) * coverage_map_.grid_size_(1) *
                             coverage_map_.grid_size_(2);
     bool changed = false;
@@ -1066,8 +1126,7 @@ void CoverageSearchManager::swarmTaskCb(
 void CoverageSearchManager::remoteFrontierTransferAckCb(
     const prometheus_two_uav_coverage_search::SwarmFrontierTransferAckConstPtr &msg) {
     if (!cooperative_mode_ || msg->source_uav_id == static_cast<uint32_t>(uav_id_) ||
-        msg->map_epoch != static_cast<uint32_t>(map_epoch_) ||
-        msg->frontier_source_uav_id != static_cast<uint32_t>(uav_id_)) return;
+        msg->map_epoch != static_cast<uint32_t>(map_epoch_)) return;
     remote_transfer_ack_versions_[msg->task_id] = std::max(
         remote_transfer_ack_versions_[msg->task_id], msg->cluster_version);
     synchronizeTransferredFrontiers();
@@ -1094,11 +1153,34 @@ void CoverageSearchManager::synchronizeTransferredFrontiers() {
             if (task.lease_expire_time <= now) continue;
             if (retired_frontier_ids_.count(task.task_id) != 0) continue;
             const auto copy = peer_advertisement(task);
-            if (task.winner_uav_id == static_cast<uint32_t>(uav_id_) &&
-                task.frontier_source_uav_id != static_cast<uint32_t>(uav_id_) &&
-                copy != remote_swarm_frontiers_.frontiers.end() &&
-                !copy->frontier_cells.empty()) {
-                if (frontier_finder_.adoptFrontier(*copy)) {
+            if (task.winner_uav_id == static_cast<uint32_t>(uav_id_)) {
+                bool active = std::any_of(frontier_finder_.frontiers_.begin(),
+                                          frontier_finder_.frontiers_.end(),
+                    [&](const FrontierFinder::FrontierCluster &frontier) {
+                        return frontier.task_id == task.task_id &&
+                            frontier.source_revision >= task.cluster_version;
+                    });
+                if (!active)
+                    active = frontier_finder_.reactivateSleepingFrontier(
+                        task.task_id, task.cluster_version);
+                const bool complete_copy = copy != remote_swarm_frontiers_.frontiers.end() &&
+                    !copy->frontier_cells.empty() &&
+                    copy->cluster_version >= task.cluster_version;
+                if (!active && complete_copy)
+                    active = frontier_finder_.adoptFrontier(*copy);
+
+                if (!active && copy == remote_swarm_frontiers_.frontiers.end()) {
+                    ROS_WARN_THROTTLE(2.0,
+                        "[FrontierTransfer] UAV %d owns task=%llu but peer descriptor is missing.",
+                        uav_id_, static_cast<unsigned long long>(task.task_id));
+                } else if (!active && !complete_copy) {
+                    ROS_WARN_THROTTLE(2.0,
+                        "[FrontierTransfer] UAV %d owns task=%llu but peer sent descriptor only: "
+                        "required_version=%u received_version=%u cells=%zu.",
+                        uav_id_, static_cast<unsigned long long>(task.task_id),
+                        task.cluster_version, copy->cluster_version,
+                        copy->frontier_cells.size());
+                } else if (active && complete_copy) {
                     const auto sent = sent_transfer_ack_versions_.find(task.task_id);
                     if (sent == sent_transfer_ack_versions_.end() ||
                         sent->second < task.cluster_version) {
@@ -1111,16 +1193,25 @@ void CoverageSearchManager::synchronizeTransferredFrontiers() {
                         ack.cluster_version = task.cluster_version;
                         frontier_transfer_ack_pub_.publish(ack);
                         sent_transfer_ack_versions_[task.task_id] = task.cluster_version;
+                        ROS_INFO("[FrontierTransfer] UAV %d activated task=%llu version=%u "
+                                 "and acknowledged peer.",
+                                 uav_id_, static_cast<unsigned long long>(task.task_id),
+                                 task.cluster_version);
                     }
                 }
             }
-            // Only an explicit ACK from the receiver can retire the source's
-            // active copy. This keeps a recoverable sleeping backup if the
+            // Only an explicit ACK from the receiver can retire the current
+            // holder's active copy. The immutable source ID is identity, not ownership.
+            // This keeps a recoverable sleeping backup if the
             // complete-cell transfer was lost or only partially received.
             if (task.winner_uav_id != static_cast<uint32_t>(uav_id_) &&
-                task.frontier_source_uav_id == static_cast<uint32_t>(uav_id_) &&
                 remote_transfer_ack_versions_[task.task_id] >= task.cluster_version) {
-                frontier_finder_.moveFrontierToSleeping(task.task_id);
+                if (frontier_finder_.moveFrontierToSleeping(task.task_id)) {
+                    ROS_INFO("[FrontierTransfer] UAV %d moved acknowledged task=%llu "
+                             "version=%u to sleeping.",
+                             uav_id_, static_cast<unsigned long long>(task.task_id),
+                             task.cluster_version);
+                }
             }
         }
     };
@@ -1587,21 +1678,24 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
     const bool peer_fresh = cooperative_mode_ && peer_state_valid_ &&
         (ros::Time::now() - peer_state_received_).toSec() <= peer_state_timeout_;
     if (!peer_fresh) peer_completion_ready_ = false;
-    coverage_map_.setDynamicPeerVolume(peer_pos_, peer_fresh);
-    const bool peer_avoidance_active = peer_fresh &&
-        ros::Time::now() < peer_avoidance_until_;
-    coverage_map_.setDynamicPeerAvoidance(peer_pos_, peer_avoidance_active,
-                                           peer_avoidance_radius_);
-    if (peer_fresh && coverage_map_.map_ready_) {
-        if (last_peer_clear_valid_ &&
-            (last_peer_clear_pos_ - peer_pos_).norm() > 0.05) {
-            coverage_map_.clearDynamicPeerVolume(last_peer_clear_pos_);
+    {
+        std::lock_guard<std::mutex> lock(coverage_map_update_mutex_);
+        coverage_map_.setDynamicPeerVolume(peer_pos_, peer_fresh);
+        const bool peer_avoidance_active = peer_fresh &&
+            ros::Time::now() < peer_avoidance_until_;
+        coverage_map_.setDynamicPeerAvoidance(peer_pos_, peer_avoidance_active,
+                                               peer_avoidance_radius_);
+        if (peer_fresh && coverage_map_.map_ready_) {
+            if (last_peer_clear_valid_ &&
+                (last_peer_clear_pos_ - peer_pos_).norm() > 0.05) {
+                coverage_map_.clearDynamicPeerVolume(last_peer_clear_pos_);
+            }
+            coverage_map_.clearDynamicPeerVolume(peer_pos_);
+            last_peer_clear_pos_ = peer_pos_;
+            last_peer_clear_valid_ = true;
+        } else if (!peer_fresh) {
+            last_peer_clear_valid_ = false;
         }
-        coverage_map_.clearDynamicPeerVolume(peer_pos_);
-        last_peer_clear_pos_ = peer_pos_;
-        last_peer_clear_valid_ = true;
-    } else if (!peer_fresh) {
-        last_peer_clear_valid_ = false;
     }
 
     // UAV ID 标签 — 独立于 FSM 状态，只要节点运行就发布
@@ -1666,8 +1760,11 @@ void CoverageSearchManager::mainloopCb(const ros::TimerEvent &e) {
 
     // 机体真实占据的体积不可能同时是静态障碍；清除自反射/旧深度噪点，
     // 但不清除外部0.35m安全膨胀区。
-    coverage_map_.clearRobotVolume(Eigen::Vector3d(
-        uav_state_.position[0], uav_state_.position[1], uav_state_.position[2]));
+    {
+        std::lock_guard<std::mutex> lock(coverage_map_update_mutex_);
+        coverage_map_.clearRobotVolume(Eigen::Vector3d(
+            uav_state_.position[0], uav_state_.position[1], uav_state_.position[2]));
+    }
     coverage_map_.publishMap();
     publishCoverageStatus();
 

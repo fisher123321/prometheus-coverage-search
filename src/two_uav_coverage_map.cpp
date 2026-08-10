@@ -138,9 +138,9 @@ void CoverageMap::init(ros::NodeHandle &nh) {
 }
 
 // ★ 新增：2D索引查询（使用缓存的z层索引，避免重复计算）
-bool CoverageMap::isOccupied2D(int x, int y) {
+bool CoverageMap::isOccupied2D(int x, int y, bool include_dynamic_peer) {
     if (!isInMap2D(x, y)) return true;
-    if (dynamic_peer_avoidance_valid_) {
+    if (include_dynamic_peer && dynamic_peer_avoidance_valid_) {
         Eigen::Vector3d p;
         indexToPos(Eigen::Vector3i(x, y, min_z_idx_), p);
         if ((p.head<2>() - dynamic_peer_avoidance_pos_.head<2>()).norm() <=
@@ -154,9 +154,9 @@ bool CoverageMap::isOccupied2D(int x, int y) {
     return false;
 }
 
-bool CoverageMap::isFree2D(int x, int y) {
+bool CoverageMap::isFree2D(int x, int y, bool include_dynamic_peer) {
     if (!isInMap2D(x, y)) return false;
-    if (isOccupied2D(x, y)) return false;
+    if (isOccupied2D(x, y, include_dynamic_peer)) return false;
     for (int z = min_z_idx_; z <= max_z_idx_; z++) {
         Eigen::Vector3i idx(x, y, z);
         int adr = toAddress(idx);

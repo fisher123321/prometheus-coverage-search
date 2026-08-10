@@ -381,6 +381,17 @@ bool FrontierFinder::moveFrontierToSleeping(uint64_t task_id) {
     return true;
 }
 
+bool FrontierFinder::reactivateSleepingFrontier(uint64_t task_id, uint32_t min_revision) {
+    const auto sleeping = std::find_if(sleeping_frontiers_.begin(), sleeping_frontiers_.end(),
+        [task_id, min_revision](const FrontierCluster &frontier) {
+            return frontier.task_id == task_id && frontier.source_revision >= min_revision;
+        });
+    if (sleeping == sleeping_frontiers_.end()) return false;
+    frontiers_.push_back(*sleeping);
+    sleeping_frontiers_.erase(sleeping);
+    return true;
+}
+
 std::vector<uint64_t> FrontierFinder::consumeRetiredTaskIds() {
     std::sort(retired_task_ids_.begin(), retired_task_ids_.end());
     retired_task_ids_.erase(std::unique(retired_task_ids_.begin(), retired_task_ids_.end()),

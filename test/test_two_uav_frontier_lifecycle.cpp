@@ -21,4 +21,11 @@ TEST(FrontierLifecycle, TransferKeepsImmutableIdentity) {
     EXPECT_EQ(frontier.task_id, finder.sleeping_frontiers_.front().task_id);
     EXPECT_EQ(frontier.source_uav_id, finder.sleeping_frontiers_.front().source_uav_id);
     EXPECT_EQ(frontier.source_revision, finder.sleeping_frontiers_.front().source_revision);
+
+    EXPECT_FALSE(finder.reactivateSleepingFrontier(frontier.task_id, 4));
+    EXPECT_TRUE(finder.reactivateSleepingFrontier(frontier.task_id, 3));
+    ASSERT_EQ(1u, finder.frontiers_.size());
+    EXPECT_TRUE(finder.sleeping_frontiers_.empty());
+    EXPECT_EQ(frontier.task_id, finder.frontiers_.front().task_id);
+    EXPECT_EQ(frontier.source_uav_id, finder.frontiers_.front().source_uav_id);
 }

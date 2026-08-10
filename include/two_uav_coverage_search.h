@@ -100,8 +100,8 @@ public:
                                std::set<int> &unknown_addresses);
 
     // 2D索引查询
-    bool isOccupied2D(int x, int y);
-    bool isFree2D(int x, int y);
+    bool isOccupied2D(int x, int y, bool include_dynamic_peer = true);
+    bool isFree2D(int x, int y, bool include_dynamic_peer = true);
     bool isUnknown2D(int x, int y);
     bool isInMap2D(int x, int y);
 
@@ -290,6 +290,7 @@ public:
     void publishFrontiers();
     bool adoptFrontier(const prometheus_two_uav_coverage_search::SwarmFrontier &frontier);
     bool moveFrontierToSleeping(uint64_t task_id);
+    bool reactivateSleepingFrontier(uint64_t task_id, uint32_t min_revision);
     std::vector<uint64_t> consumeRetiredTaskIds();
     bool isFrontierCellsCovered(const std::vector<Eigen::Vector3d> &cells,
                                 double changed_fraction);
@@ -463,6 +464,12 @@ private:
     ros::CallbackQueue heartbeat_callback_queue_;
     std::unique_ptr<ros::NodeHandle> heartbeat_nh_;
     std::unique_ptr<ros::AsyncSpinner> heartbeat_spinner_;
+    // Auction requests must enter their worker even while the default queue is
+    // planning. Map writers and the immutable auction snapshot share one lock.
+    ros::CallbackQueue auction_callback_queue_;
+    std::unique_ptr<ros::NodeHandle> auction_nh_;
+    std::unique_ptr<ros::AsyncSpinner> auction_spinner_;
+    std::mutex coverage_map_update_mutex_;
     ros::Timer mainloop_timer_, trajectory_timer_, frontier_timer_, swarm_data_timer_;
     ros::Timer raw_heartbeat_timer_;
 
@@ -471,6 +478,8 @@ private:
         double resolution = 0.0;
         Eigen::Vector3d origin = Eigen::Vector3d::Zero();
         std::vector<uint8_t> walkable;
+        size_t walkable_count = 0;
+        uint64_t walkable_hash = 1469598103934665603ULL;
     };
     struct AuctionJob {
         uint64_t sequence = 0;
@@ -478,6 +487,11 @@ private:
         AuctionMapSnapshot map;
         Eigen::Vector3d uav1_start = Eigen::Vector3d::Zero();
         Eigen::Vector3d uav2_start = Eigen::Vector3d::Zero();
+        std::chrono::steady_clock::time_point callback_started;
+        std::chrono::steady_clock::time_point enqueued;
+        double receive_age_ms = 0.0;
+        double snapshot_ms = 0.0;
+        double peer_state_age_s = 0.0;
     };
     std::mutex auction_worker_mutex_, auction_assignment_mutex_;
     std::condition_variable auction_worker_cv_;
@@ -538,7 +552,6 @@ private:
     prometheus_two_uav_coverage_search::SwarmFrontierArray remote_swarm_frontiers_;
     prometheus_two_uav_coverage_search::SwarmTaskArray local_swarm_tasks_;
     prometheus_two_uav_coverage_search::SwarmTaskArray remote_swarm_tasks_;
-    prometheus_two_uav_coverage_search::SwarmAuctionTaskSet last_auction_task_set_;
     prometheus_two_uav_coverage_search::SwarmAuctionAssignment last_auction_assignment_;
     std::map<uint64_t, uint32_t> remote_transfer_ack_versions_;
     std::map<uint64_t, uint32_t> sent_transfer_ack_versions_;

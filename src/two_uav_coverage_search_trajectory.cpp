@@ -789,7 +789,10 @@ void CoverageSearchManager::generateBsplineTraj() {
     traj_yaws_.clear();
 
     if (astar_path_.empty()) { has_traj_ = false; return; }
-    coverage_map_.updateDistanceFields();
+    {
+        std::lock_guard<std::mutex> lock(coverage_map_update_mutex_);
+        coverage_map_.updateDistanceFields();
+    }
     const auto distance_field_end = std::chrono::steady_clock::now();
 
     std::string traj_type = "Bspline";

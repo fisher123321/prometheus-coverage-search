@@ -126,8 +126,12 @@ class TwoUavCoordinator {
     nh_.param("task_goal_separation", task_goal_separation_, 3.0);
     nh_.param("task_lease_duration", task_lease_duration_, 8.0);
     nh_.param("unreachable_retry_period", unreachable_retry_period_, 1.0);
+    nh_.param("unreachable_retry_max_period", unreachable_retry_max_period_, 8.0);
     nh_.param("auction_period", auction_period_, 0.2);
     nh_.param("raw_command_timeout", raw_command_timeout_, 0.6);
+    unreachable_retry_period_ = std::max(0.2, unreachable_retry_period_);
+    unreachable_retry_max_period_ = std::max(
+        unreachable_retry_period_, unreachable_retry_max_period_);
     nh_.param<std::string>("tx_prefix", tx_prefix_, "/two_uav/tx");
     nh_.param<std::string>("rx_prefix", rx_prefix_, "/two_uav/rx");
     const std::string uav = "/uav" + std::to_string(uav_id_);
@@ -605,6 +609,7 @@ class TwoUavCoordinator {
       if (current == tasks.end() ||
           current->second.cluster_version != it->second.cluster_version) {
         unreachable_retry_after_.erase(it->first);
+        unreachable_retry_counts_.erase(it->first);
         it = unreachable_tasks_.erase(it);
       } else {
         ++it;
@@ -616,6 +621,8 @@ class TwoUavCoordinator {
     out->map_epoch = map_epoch_;
     out->uav1_state_sequence = uav_id_ == 1 ? state_sequence_ : peer_.sequence;
     out->uav2_state_sequence = uav_id_ == 1 ? peer_.sequence : state_sequence_;
+    out->uav1_position = uav_id_ == 1 ? ownPoint() : peer_.pose.position;
+    out->uav2_position = uav_id_ == 1 ? peer_.pose.position : ownPoint();
     out->frontiers.clear();
     for (const auto& entry : tasks) {
       const auto& frontier = entry.second;
@@ -643,6 +650,12 @@ class TwoUavCoordinator {
       if (retry != unreachable_retry_after_.end() && retry->second > now) {
         continue;
       }
+      const auto suppression = recently_assigned_.find(frontier.task_id);
+      if (suppression != recently_assigned_.end()) {
+        if (suppression->second.first == frontier.cluster_version &&
+            suppression->second.second > now) continue;
+        recently_assigned_.erase(suppression);
+      }
       auto descriptor = frontier;
       descriptor.frontier_cells.clear();
       descriptor.candidate_viewpoints.resize(1);  // best representative only
@@ -662,7 +675,7 @@ class TwoUavCoordinator {
   }
 
   void logAuctionOfferDifference(
-      const prometheus_two_uav_coverage_search::SwarmAuctionTaskSet& common) {
+      const prometheus_two_uav_coverage_search::SwarmAuctionTaskSet& confirmed) {
     const uint64_t low = std::min(local_auction_offer_.task_set_hash,
                                   peer_auction_offer_.task_set_hash);
     const uint64_t high = std::max(local_auction_offer_.task_set_hash,
@@ -686,12 +699,12 @@ class TwoUavCoordinator {
     const auto local_only = only_in(local_auction_offer_, peer_auction_offer_);
     const auto peer_only = only_in(peer_auction_offer_, local_auction_offer_);
     if (local_only.empty() && peer_only.empty()) return;
-    ROS_INFO("[AuctionTaskSet] UAV %d local=%zu peer=%zu common=%zu "
-             "local_only=%s peer_only=%s common_uids=%s.",
+    ROS_INFO("[AuctionTaskSet] UAV %d local=%zu peer=%zu agreed=%zu "
+             "local_only=%s peer_only=%s agreed_uids=%s.",
              uav_id_, local_auction_offer_.frontiers.size(),
-             peer_auction_offer_.frontiers.size(), common.frontiers.size(),
+             peer_auction_offer_.frontiers.size(), confirmed.frontiers.size(),
              taskIds(local_only).c_str(), taskIds(peer_only).c_str(),
-             taskIds(common.frontiers).c_str());
+             taskIds(confirmed.frontiers).c_str());
   }
 
   bool auctionInputsFresh(const ros::Time& now) const {
@@ -769,7 +782,7 @@ class TwoUavCoordinator {
              std::max(0.0, (now - auction_round_started_).toSec()));
   }
 
-  void clearAuctionRound() {
+  void clearAuctionRound(bool clear_offers = true) {
     current_auction_task_set_ = prometheus_two_uav_coverage_search::SwarmAuctionTaskSet();
     current_auction_task_set_hash_ = 0;
     auction_round_started_ = ros::Time(0);
@@ -780,7 +793,7 @@ class TwoUavCoordinator {
     auction_last_stage_ = ros::Time(0);
     auction_timing_stages_ = 0;
     auction_stage_elapsed_s_.fill(0.0);
-    clearAuctionOffers();
+    if (clear_offers) clearAuctionOffers();
   }
 
   void resetAuctionRound(
@@ -807,19 +820,34 @@ class TwoUavCoordinator {
     for (size_t i = 0; i < final->owner_uav_ids.size(); ++i) {
       const uint32_t local_owner = local_auction_proposal_.owner_uav_ids[i];
       const uint32_t peer_owner = peer_auction_proposal_.owner_uav_ids[i];
-      const uint32_t owner = two_uav_auction::resolveOwner(
-          local_owner, peer_owner, std::min<uint32_t>(uav_id_, peer_uav_id_));
+      const uint32_t owner = two_uav_auction::resolveConsensusOwner(
+          local_owner, local_auction_proposal_.source_uav_id,
+          peer_owner, peer_auction_proposal_.source_uav_id,
+          std::min<uint32_t>(uav_id_, peer_uav_id_));
       final->owner_uav_ids[i] = owner;
-      const auto& selected = owner == static_cast<uint32_t>(uav_id_)
-          ? local_auction_proposal_
-          : owner == static_cast<uint32_t>(peer_uav_id_)
-          ? peer_auction_proposal_
-          : (uav_id_ < peer_uav_id_ ? local_auction_proposal_ : peer_auction_proposal_);
-      final->viewpoint_indices[i] = selected.viewpoint_indices[i];
-      final->assignment_modes[i] = owner == 0
-          ? static_cast<uint8_t>(
-              prometheus_two_uav_coverage_search::SwarmAuctionAssignment::MODE_UNREACHABLE)
-          : selected.assignment_modes[i];
+      if (owner == 0) {
+        final->assignment_modes[i] =
+            prometheus_two_uav_coverage_search::SwarmAuctionAssignment::MODE_UNREACHABLE;
+        if (local_owner != peer_owner) {
+          ROS_WARN("[AuctionResolution] task=%llu explicit UNREACHABLE: "
+                   "UAV%d proposed owner=%u, UAV%d proposed owner=%u; "
+                   "candidate owner did not confirm its own endpoint.",
+                   static_cast<unsigned long long>(final->task_ids[i]),
+                   local_auction_proposal_.source_uav_id, local_owner,
+                   peer_auction_proposal_.source_uav_id, peer_owner);
+        }
+        continue;
+      }
+      const auto *owner_proposal =
+          local_auction_proposal_.source_uav_id == owner && local_owner == owner
+              ? &local_auction_proposal_
+              : peer_auction_proposal_.source_uav_id == owner && peer_owner == owner
+              ? &peer_auction_proposal_ : nullptr;
+      final->viewpoint_indices[i] = owner_proposal ? owner_proposal->viewpoint_indices[i] : 0;
+      final->assignment_modes[i] = owner_proposal
+          ? owner_proposal->assignment_modes[i]
+          : static_cast<uint8_t>(
+              prometheus_two_uav_coverage_search::SwarmAuctionAssignment::MODE_ASTAR);
     }
     final->assignment_hash = two_uav_auction::assignmentHash(*final);
     return true;
@@ -834,6 +862,7 @@ class TwoUavCoordinator {
       const auto& frontier = current_auction_task_set_.frontiers[i];
       const uint32_t owner = final.owner_uav_ids[i];
       if (owner == 0) {
+        recently_assigned_.erase(frontier.task_id);
         auto unresolved = frontier;
         const uint32_t view = final.viewpoint_indices[i];
         if (view < unresolved.candidate_viewpoints.size() && view != 0) {
@@ -842,12 +871,21 @@ class TwoUavCoordinator {
                       unresolved.candidate_viewpoints.begin() + view + 1);
         }
         unreachable_tasks_[frontier.task_id] = unresolved;
+        const uint32_t failures = ++unreachable_retry_counts_[frontier.task_id];
         unreachable_retry_after_[frontier.task_id] =
-            now + ros::Duration(unreachable_retry_period_);
+            now + ros::Duration(two_uav_auction::unreachableRetryDelay(
+                unreachable_retry_period_, unreachable_retry_max_period_, failures));
         ++unreachable;
       } else {
         unreachable_tasks_.erase(frontier.task_id);
         unreachable_retry_after_.erase(frontier.task_id);
+        unreachable_retry_counts_.erase(frontier.task_id);
+        // Both coordinators suppress this committed UID until its advertised
+        // lease expires. This closes the bridge-delay window where the losing
+        // UAV has not received the owner's task heartbeat yet and would
+        // otherwise immediately auction the same task again.
+        recently_assigned_[frontier.task_id] = std::make_pair(
+            frontier.cluster_version, now + ros::Duration(task_lease_duration_));
       }
       ROS_INFO("[AuctionResult] UAV %d round=%llu task=%llu owner=%u view=%u mode=%s.",
                uav_id_, static_cast<unsigned long long>(final.task_set_hash),
@@ -891,6 +929,9 @@ class TwoUavCoordinator {
       if (!source_still_offers(it->second) || it->second.lease_expire_time <= now) {
         it = own_leases_.erase(it);
       } else {
+        // Only the task actually being executed renews its lease. Queued
+        // distributed tasks return to the shared pool after 8 seconds so one
+        // UAV cannot hold an entire bundle indefinitely.
         if (it->first == active_task_id && active_fresh)
           it->second.lease_expire_time = now + ros::Duration(task_lease_duration_);
         ++it;
@@ -906,11 +947,16 @@ class TwoUavCoordinator {
           return;
         }
         local_auction_offer_.source_uav_id = uav_id_;
+        local_auction_offer_.offer_sequence = ++auction_offer_sequence_;
+        local_auction_offer_.peer_offer_sequence_ack = 0;
         local_auction_offer_created_ = now;
       }
+      const bool peer_offer_fresh = !peer_auction_offer_received_.isZero() &&
+          (now - peer_auction_offer_received_).toSec() <= 1.0;
+      if (peer_offer_fresh)
+        local_auction_offer_.peer_offer_sequence_ack = peer_auction_offer_.offer_sequence;
       auction_task_set_sync_pub_.publish(local_auction_offer_);
-      if (peer_auction_offer_received_.isZero() ||
-          (now - peer_auction_offer_received_).toSec() > 1.0) {
+      if (!peer_offer_fresh) {
         if (!local_auction_offer_.frontiers.empty()) {
           ROS_WARN_THROTTLE(2.0,
               "[AuctionTaskSet] UAV %d peer offer missing; local_uids=%s.",
@@ -919,7 +965,12 @@ class TwoUavCoordinator {
         publishOwnLeases(now);
         return;
       }
-      task_set = two_uav_auction::commonTaskSet(local_auction_offer_, peer_auction_offer_);
+      if (!two_uav_auction::offersMutuallyAcknowledged(
+              local_auction_offer_, peer_auction_offer_)) {
+        publishOwnLeases(now);
+        return;
+      }
+      task_set = two_uav_auction::confirmedTaskSet(local_auction_offer_, peer_auction_offer_);
       task_set.header.stamp = now;
       task_set.source_uav_id = uav_id_;
       logAuctionOfferDifference(task_set);
@@ -933,6 +984,9 @@ class TwoUavCoordinator {
       resetAuctionRound(task_set);
       logAuctionStage(TIMING_FROZEN, now);
     } else {
+      // Keep the frozen offer visible until both coordinators finish this
+      // round. This lets the slower peer complete the mutual acknowledgement.
+      auction_task_set_sync_pub_.publish(local_auction_offer_);
       task_set = current_auction_task_set_;
       if (!auctionSnapshotStillEligible(now)) {
         logAuctionAbort("member_disappeared", now);
@@ -969,7 +1023,10 @@ class TwoUavCoordinator {
         logAuctionAbort("peer_common_set_differs", now);
         ROS_INFO("[two_uav_coordinator] UAV %d abandoned distributed round %llu: peer task-set snapshot differs.",
                  uav_id_, static_cast<unsigned long long>(task_set.task_set_hash));
-        clearAuctionRound();
+        // The peer may still have emitted a delayed manifest from its previous
+        // offer pair. Preserve our frozen offer so the explicit offer ACK can
+        // converge without generating yet another candidate generation.
+        clearAuctionRound(false);
       } else if ((now - auction_round_started_).toSec() > task_commit_timeout_) {
         logAuctionAbort("peer_common_set_timeout", now);
         ROS_WARN("[two_uav_coordinator] UAV %d abandoned distributed round %llu: peer confirmation timed out.",
@@ -1146,6 +1203,7 @@ class TwoUavCoordinator {
   double auction_period_ = 0.2, task_reach_dist_ = 0.35, raw_command_timeout_ = 0.6;
   double task_commit_timeout_ = 15.0, task_retry_cooldown_ = 12.0, task_goal_separation_ = 3.0;
   double task_lease_duration_ = 8.0, unreachable_retry_period_ = 1.0;
+  double unreachable_retry_max_period_ = 8.0;
   std::string tx_prefix_, rx_prefix_;
   Phase phase_ = WAIT_PEER;
   bool have_state_ = false, have_peer_ = false, have_raw_command_ = false, completion_ready_ = false;
@@ -1172,6 +1230,7 @@ class TwoUavCoordinator {
   ros::Time last_collision_replan_request_;
   uint64_t state_sequence_ = 0;
   uint64_t current_auction_task_set_hash_ = 0;
+  uint64_t auction_offer_sequence_ = 0;
   uint64_t last_offer_pair_log_hash_ = 0;
   ros::Time auction_round_started_, auction_last_stage_;
   uint32_t auction_timing_stages_ = 0;
@@ -1180,6 +1239,8 @@ class TwoUavCoordinator {
   std::map<uint64_t, prometheus_two_uav_coverage_search::SwarmTask> own_leases_;
   std::map<uint64_t, prometheus_two_uav_coverage_search::SwarmFrontier> unreachable_tasks_;
   std::map<uint64_t, ros::Time> unreachable_retry_after_;
+  std::map<uint64_t, uint32_t> unreachable_retry_counts_;
+  std::map<uint64_t, std::pair<uint32_t, ros::Time>> recently_assigned_;
   ros::Subscriber state_sub_, control_sub_, raw_command_sub_, local_frontier_sub_, local_trajectory_sub_, completion_ready_sub_;
   ros::Subscriber local_auction_assignment_sub_;
   ros::Subscriber peer_state_sub_, peer_frontier_sub_, peer_task_sub_, peer_trajectory_sub_;
