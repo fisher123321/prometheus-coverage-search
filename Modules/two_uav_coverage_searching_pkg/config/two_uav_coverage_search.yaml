@@ -12,10 +12,10 @@ coverage_search:
   max_acc: 1.0
   max_yaw_rate: 1.3962634  # 80 deg/s
   max_yaw_acc: 1.5707963  # 90 deg/s^2
-  replan_time: 0.25
   replan_min_execute_time: 0.5
   replan_periodic_time: 1.5
   replan_remaining_time: 0.5
+  trajectory_plan_clearance: 0.60 # B样条引导/梯度修复目标；硬碰撞阈值仍为0.45m
   goal_reach_dist: 0.25
   auto_start: true
   map_input_source: 3      # 0=global pcl, 1=local pcl, 2=scan pcl, 3=D435i depth pcl
@@ -39,8 +39,14 @@ coverage_search:
   atsp_viewpoints_per_cluster: 3 # retain the top 3 viewpoints per refined cluster
   atsp_edge_timeout_ms: 100.0
   atsp_planning_budget_ms: 250.0
+  atsp_goal_switch_min_distance: 1.0 # keep current valid goal unless new A* path is >=1m shorter
+  atsp_goal_switch_min_ratio: 0.15   # and >=15% shorter; invalid/covered goals switch immediately
+  kinodynamic_corridor_radius: 1.0  # restrict state-space A* to the geometric A* corridor
   auction_astar_timeout_ms: 50.0 # per candidate; timeout may use Euclidean fallback, NO_PATH may not
+  auction_owner_switch_min_distance: 1.0 # switch owner only for at least 1 m path improvement
+  auction_owner_switch_min_ratio: 0.15   # and at least 15% relative path improvement
   swarm_chunk_delta_period: 0.25 # 4 Hz fused-map evidence exchange
+  swarm_snapshot_chunks_per_tick: 1 # 增量仍4Hz，每次仅轮询1个完整块
 
 sensor:
   depth_min_range: 0.2

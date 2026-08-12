@@ -4,11 +4,6 @@
 
 namespace {
 
-double quinticProgress(double x) {
-    x = std::max(0.0, std::min(1.0, x));
-    return x * x * x * (10.0 + x * (-15.0 + 6.0 * x));
-}
-
 struct LocalBsplineOptContext {
     CoverageMap *map = nullptr;
     std::vector<Eigen::Vector3d> initial_ctrl;
@@ -121,7 +116,10 @@ double localBsplineCost(const std::vector<double> &x, std::vector<double> &grad,
     }
     constexpr double kTimeWeight = 8.0;
     cost += kTimeWeight * duration;
-    grad[time_index] = kTimeWeight;
+    // Keep the duration gradients accumulated by velocity feasibility.  The
+    // previous assignment erased them, so NLOpt kept shortening time while
+    // the outer loop repeatedly rejected excessive speed/acceleration.
+    grad[time_index] += kTimeWeight;
     for (int i = 0; i + 2 < (int)q.size(); ++i) {
         const Eigen::Vector2d acceleration = acc_scale *
             (q[i + 2] - 2.0 * q[i + 1] + q[i]).head<2>();
@@ -357,7 +355,8 @@ bool CoverageSearchManager::optimizeTimeBspline2D(TimeBspline &spline, bool roll
 
 bool CoverageSearchManager::buildTimeParameterizedSpline(
     const Eigen::Vector3d &start_acc, double start_yaw_rate,
-    double start_yaw_acceleration) {
+    double start_yaw_acceleration, bool escape_recovery) {
+    last_bspline_failure_reason_.clear();
     active_time_spline_ = TimeBspline();
     if (traj_points_.size() < 2) return false;
 
@@ -370,6 +369,8 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
     if (total_length < 0.05) return false;
 
     const bool rolling = rolling_prepare_in_progress_;
+    const double spline_max_vel = escape_recovery ? std::min(0.40, max_vel_) : max_vel_;
+    const double spline_max_acc = escape_recovery ? std::min(0.60, max_acc_) : max_acc_;
     const double control_spacing = rolling ? 0.25 : 0.10;
     const int control_limit = rolling ? 120 : 160;
     const int control_count = std::max(7, std::min(control_limit,
@@ -403,15 +404,16 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         if (tangent.norm() > 1e-3) {
             tangent.normalize();
             const double forward_speed = std::max(0.0, std::min(
-                0.8 * max_vel_, start_vel.head<2>().dot(tangent.head<2>())));
+                0.8 * spline_max_vel, start_vel.head<2>().dot(tangent.head<2>())));
             start_vel = forward_speed * tangent;
         } else {
             start_vel.setZero();
         }
         desired_start_acc.setZero();
     }
-    const double yaw_delta = std::atan2(std::sin(current_goal_yaw_ - uav_yaw_),
-                                        std::cos(current_goal_yaw_ - uav_yaw_));
+    const double spline_goal_yaw = escape_recovery ? uav_yaw_ : current_goal_yaw_;
+    const double yaw_delta = std::atan2(std::sin(spline_goal_yaw - uav_yaw_),
+                                        std::cos(spline_goal_yaw - uav_yaw_));
     const double goal_yaw_unwrapped = uav_yaw_ + yaw_delta;
     const auto minTravelTime = [](double distance, double initial_speed,
                                   double final_speed, double speed_limit,
@@ -452,13 +454,19 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
     // the moving trajectory instead of creating a terminal hover.
     double position_duration = std::max(1.0,
         minTravelTime(total_length, start_vel.head<2>().norm(),
-                      terminal_vel.head<2>().norm(), max_vel_, max_acc_));
+                      terminal_vel.head<2>().norm(), spline_max_vel, spline_max_acc));
     const double hard_clearance = std::max(
         std::max(0.35, coverage_map_.esdf_safe_distance_), traj_cut_clearance_);
     const Eigen::Vector3d terminal_pos = traj_points_.back();
     std::string last_rejection = "unknown";
+    double rejected_peak_speed = 0.0, rejected_peak_acc = 0.0;
+    double rejected_duration = 0.0;
     std::vector<Eigen::Vector3d> repair_seed;
     int spatial_repair_attempts = 0;
+    std::string repair_failure_reason = "not_attempted";
+    int repair_basis_first = -1, repair_basis_last = -1;
+    int repair_free_first = -1, repair_free_last = -1;
+    double repair_clearance = -1.0;
 
     const auto setUniformKnots = [](std::vector<double> &knots, int count,
                                     int degree, double duration) {
@@ -470,13 +478,36 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         }
     };
     const auto configureYaw = [&](TimeBspline &spline, double yaw_duration) {
+        yaw_duration = std::max(0.02, yaw_duration);
         spline.yaw_duration = yaw_duration;
         spline.yaw_ctrl.resize(control_count);
-        for (int i = 0; i < control_count; ++i) {
-            const double fraction = (double)i / (control_count - 1);
-            spline.yaw_ctrl[i] = Eigen::Vector3d(
-                uav_yaw_ + quinticProgress(fraction) * yaw_delta, 0.0, 0.0);
-        }
+        const double t2 = yaw_duration * yaw_duration;
+        const double t3 = t2 * yaw_duration;
+        const double t4 = t3 * yaw_duration;
+        const double t5 = t4 * yaw_duration;
+        const double c0 = uav_yaw_;
+        const double c1 = start_yaw_rate;
+        const double c2 = 0.5 * start_yaw_acceleration;
+        const double residual_position = goal_yaw_unwrapped -
+            (c0 + c1 * yaw_duration + c2 * t2);
+        const double residual_velocity = -(c1 + 2.0 * c2 * yaw_duration);
+        const double residual_acceleration = -2.0 * c2;
+        const double c3 = 10.0 * residual_position / t3 -
+                          4.0 * residual_velocity / t2 +
+                          0.5 * residual_acceleration / yaw_duration;
+        const double c4 = -15.0 * residual_position / t4 +
+                           7.0 * residual_velocity / t3 -
+                           residual_acceleration / t2;
+        const double c5 = 6.0 * residual_position / t5 -
+                          3.0 * residual_velocity / t4 +
+                          0.5 * residual_acceleration / t3;
+        const auto referenceYaw = [&](double time) {
+            return c0 + c1 * time + c2 * time * time +
+                c3 * time * time * time + c4 * std::pow(time, 4) +
+                c5 * std::pow(time, 5);
+        };
+        std::fill(spline.yaw_ctrl.begin(), spline.yaw_ctrl.end(),
+                  Eigen::Vector3d::Zero());
         setUniformKnots(spline.yaw_knots, control_count, spline.degree, yaw_duration);
         const double span = yaw_duration / (control_count - spline.degree);
         const double next_yaw_rate = start_yaw_rate +
@@ -487,6 +518,39 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         spline.yaw_ctrl[control_count - 1](0) = goal_yaw_unwrapped;
         spline.yaw_ctrl[control_count - 2](0) = goal_yaw_unwrapped;
         spline.yaw_ctrl[control_count - 3](0) = goal_yaw_unwrapped;
+
+        // Quintic samples are curve values, not B-spline control points. Fit
+        // only the free controls while the first/last three keep the exact
+        // inherited and terminal yaw P/V/A boundary states.
+        const int first_free = 3;
+        const int last_free = control_count - 4;
+        const int free_count = std::max(0, last_free - first_free + 1);
+        if (free_count > 0) {
+            const int samples = std::max(12, 2 * free_count);
+            Eigen::MatrixXd basis(samples, free_count);
+            Eigen::VectorXd values(samples);
+            std::vector<Eigen::Vector3d> unit(control_count, Eigen::Vector3d::Zero());
+            for (int row = 0; row < samples; ++row) {
+                const double time = yaw_duration * (row + 1.0) / (samples + 1.0);
+                const double locked = deBoor(
+                    spline.yaw_ctrl, spline.yaw_knots, spline.degree, time)(0);
+                values(row) = referenceYaw(time) - locked;
+                for (int column = 0; column < free_count; ++column) {
+                    unit[first_free + column](0) = 1.0;
+                    basis(row, column) = deBoor(
+                        unit, spline.yaw_knots, spline.degree, time)(0);
+                    unit[first_free + column](0) = 0.0;
+                }
+            }
+            const Eigen::VectorXd fitted = basis.colPivHouseholderQr().solve(values);
+            for (int i = 0; i < free_count; ++i)
+                spline.yaw_ctrl[first_free + i](0) = fitted(i);
+            const std::vector<Eigen::Vector3d> unsmoothed = spline.yaw_ctrl;
+            for (int i = first_free; i <= last_free; ++i) {
+                spline.yaw_ctrl[i](0) = 0.90 * unsmoothed[i](0) + 0.05 *
+                    (unsmoothed[i - 1](0) + unsmoothed[i + 1](0));
+            }
+        }
     };
     const auto yawFitsLimits = [&](TimeBspline &spline, double yaw_duration,
                                    double &peak_rate, double &peak_acceleration) {
@@ -510,9 +574,18 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
     };
     const auto repairUnsafeSplineSample = [&](TimeBspline &spline, double time,
                                               const Eigen::Vector3d &point) {
+        repair_failure_reason = "unknown";
+        repair_basis_first = repair_basis_last = -1;
+        repair_free_first = repair_free_last = -1;
+        repair_clearance = -1.0;
+        const auto failRepair = [&](const char *reason) {
+            repair_failure_reason = reason;
+            return false;
+        };
         Eigen::Vector3i point_idx;
         coverage_map_.posToIndex(point, point_idx);
-        if (!coverage_map_.isInMap2D(point_idx(0), point_idx(1))) return false;
+        if (!coverage_map_.isInMap2D(point_idx(0), point_idx(1)))
+            return failRepair("outside_map");
 
         const double gradient_step = std::max(0.05, 0.5 * coverage_map_.resolution_);
         const auto distanceAt = [&](const Eigen::Vector3d &query, double &distance) {
@@ -528,10 +601,11 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         double dxp = 0.0, dxm = 0.0, dyp = 0.0, dym = 0.0, clearance = 0.0;
         if (!distanceAt(px, dxp) || !distanceAt(mx, dxm) ||
             !distanceAt(py, dyp) || !distanceAt(my, dym) ||
-            !distanceAt(point, clearance)) return false;
+            !distanceAt(point, clearance)) return failRepair("distance_unavailable");
+        repair_clearance = clearance;
         Eigen::Vector2d clearance_gradient((dxp - dxm) / (2.0 * gradient_step),
                                            (dyp - dym) / (2.0 * gradient_step));
-        if (clearance_gradient.norm() < 1e-4) return false;
+        if (clearance_gradient.norm() < 1e-4) return failRepair("flat_gradient");
         clearance_gradient.normalize();
 
         const int degree = spline.degree;
@@ -545,6 +619,8 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
                                           clamped_time) - spline.knots.begin()) - 1;
             span = std::max(degree, std::min(last, span));
         }
+        repair_basis_first = span - degree;
+        repair_basis_last = span;
         const int first_free = 3;
         const int last_free = control_count - 4;
         std::vector<std::pair<int, double>> support;
@@ -558,10 +634,17 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
             support.emplace_back(i, weight);
             squared_weight_sum += weight * weight;
         }
-        if (support.empty() || squared_weight_sum < 1e-8) return false;
+        if (support.empty() || squared_weight_sum < 1e-8) {
+            if (span <= degree) return failRepair("start_locked");
+            if (span >= last) return failRepair("end_locked");
+            return failRepair("no_free_control_support");
+        }
+        repair_free_first = support.front().first;
+        repair_free_last = support.back().first;
 
         const double required_clearance = requiredTrajectoryClearance(point, hard_clearance);
-        const double target_clearance = std::max(0.60, required_clearance + 0.10);
+        const double target_clearance = std::max(
+            trajectory_plan_clearance_, required_clearance + 0.10);
         const double sample_shift = std::min(0.20,
             std::max(0.08, target_clearance - clearance));
         for (const auto &entry : support) {
@@ -575,6 +658,56 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
             ctrl(1) = std::max(coverage_map_.origin_(1) + 0.1,
                 std::min(coverage_map_.origin_(1) + coverage_map_.map_size_3d_(1) - 0.1,
                          ctrl(1) + shift(1)));
+        }
+        repair_failure_reason = "applied";
+        return true;
+    };
+
+    const auto raiseInitialControlClearance = [&](TimeBspline &spline) {
+        const double target = std::max(trajectory_plan_clearance_, hard_clearance + 0.10);
+        const double step = std::max(0.08, coverage_map_.resolution_);
+        const int last_free = static_cast<int>(spline.position_ctrl.size()) - 4;
+        for (int i = 3; i <= last_free; ++i) {
+            Eigen::Vector3d &control = spline.position_ctrl[i];
+            for (int attempt = 0; attempt < 4; ++attempt) {
+                Eigen::Vector3i idx;
+                coverage_map_.posToIndex(control, idx);
+                if (!coverage_map_.isInMap2D(idx(0), idx(1))) return false;
+                const double clearance = coverage_map_.getDistance2D(idx(0), idx(1));
+                if (clearance + 1e-3 >= target) break;
+
+                Eigen::Vector3d best = control;
+                double best_clearance = clearance;
+                for (int dx = -1; dx <= 1; ++dx) {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        if (dx == 0 && dy == 0) continue;
+                        Eigen::Vector2d direction(dx, dy);
+                        direction.normalize();
+                        Eigen::Vector3d candidate = control;
+                        candidate.head<2>() += step * direction;
+                        candidate(2) = fly_height_;
+                        Eigen::Vector3i candidate_idx;
+                        coverage_map_.posToIndex(candidate, candidate_idx);
+                        if (!coverage_map_.isInMap2D(candidate_idx(0), candidate_idx(1)) ||
+                            !coverage_map_.isFree2D(candidate_idx(0), candidate_idx(1))) continue;
+                        const double candidate_clearance = coverage_map_.getDistance2D(
+                            candidate_idx(0), candidate_idx(1));
+                        if (candidate_clearance > best_clearance + 1e-3) {
+                            best = candidate;
+                            best_clearance = candidate_clearance;
+                        }
+                    }
+                }
+                if (best_clearance <= clearance + 1e-3) break;
+                control = best;
+            }
+            Eigen::Vector3i idx;
+            coverage_map_.posToIndex(control, idx);
+            if (!coverage_map_.isInMap2D(idx(0), idx(1)) ||
+                !coverage_map_.isFree2D(idx(0), idx(1)) ||
+                coverage_map_.getDistance2D(idx(0), idx(1)) + 1e-3 < target) {
+                return false;
+            }
         }
         return true;
     };
@@ -604,7 +737,12 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         candidate.valid = true;
         configureYaw(candidate, position_duration);  // optimizer needs a complete spline state
 
-        if (!optimizeTimeBspline2D(candidate, rolling_prepare_in_progress_, last_rejection)) {
+        if (!escape_recovery && !raiseInitialControlClearance(candidate)) {
+            last_rejection = "initial free control point below planning clearance";
+            break;
+        }
+        if (!escape_recovery &&
+            !optimizeTimeBspline2D(candidate, rolling_prepare_in_progress_, last_rejection)) {
             position_duration *= 1.15;
             continue;
         }
@@ -658,7 +796,7 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         candidate.duration = candidate.position_duration;
 
         const int sample_count = std::max(2, (int)std::ceil(
-            candidate.duration / std::min(0.10, 0.05 / std::max(0.20, max_vel_))));
+            candidate.duration / std::min(0.10, 0.05 / std::max(0.20, spline_max_vel))));
         const double sample_dt = candidate.duration / sample_count;
         std::vector<Eigen::Vector3d> points;
         std::vector<Eigen::Vector3d> velocities;
@@ -671,8 +809,17 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         bool safe = true;
         bool repaired_spatial_failure = false;
         bool unrepairable_spatial_failure = false;
+        bool braking_corridor_blocked = false;
+        double kinematic_time_scale = 1.0;
         double peak_speed = 0.0, peak_acc = 0.0;
         Eigen::Vector3d previous = start_pos;
+        bool escaping_curve = escape_recovery;
+        Eigen::Vector3i escape_start_idx;
+        coverage_map_.posToIndex(start_pos, escape_start_idx);
+        double escape_previous_clearance = coverage_map_.getDistance2D(
+            escape_start_idx(0), escape_start_idx(1));
+        const double escape_target_clearance = std::max(
+            trajectory_plan_clearance_, hard_clearance + 0.10);
         for (int i = 0; i <= sample_count; ++i) {
             Eigen::Vector3d p, v, a;
             double yaw = 0.0, yaw_rate = 0.0, yaw_acceleration = 0.0;
@@ -687,27 +834,92 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
             a(2) = 0.0;
             Eigen::Vector3i idx;
             coverage_map_.posToIndex(p, idx);
-            const bool point_safe = coverage_map_.isInMap2D(idx(0), idx(1)) &&
-                coverage_map_.isFree2D(idx(0), idx(1)) &&
-                coverage_map_.getDistance2D(idx(0), idx(1)) + 1e-3 >=
+            const bool point_in_map = coverage_map_.isInMap2D(idx(0), idx(1));
+            const bool point_grid_free = point_in_map &&
+                coverage_map_.isFree2D(idx(0), idx(1));
+            const bool escape_segment = escaping_curve;
+            const double point_clearance = point_in_map
+                ? coverage_map_.getDistance2D(idx(0), idx(1)) : -1.0;
+            bool point_safe = point_grid_free;
+            if (point_safe && escaping_curve) {
+                point_safe = point_clearance + 1e-3 >= escape_previous_clearance;
+                if (point_safe) {
+                    escape_previous_clearance = point_clearance;
+                    if (point_clearance + 1e-3 >= escape_target_clearance)
+                        escaping_curve = false;
+                }
+            } else if (point_safe) {
+                point_safe = point_clearance + 1e-3 >=
                     requiredTrajectoryClearance(p, hard_clearance);
+            }
             peak_speed = std::max(peak_speed, v.head<2>().norm());
             peak_acc = std::max(peak_acc, a.head<2>().norm());
-            const bool segment_blocked = point_safe && i > 0 &&
+            const bool segment_blocked = point_safe && i > 0 && !escape_segment &&
                 pathToTargetBlocked(p, previous, traj_cut_clearance_);
-            if (!point_safe || segment_blocked || peak_speed > 1.03 * max_vel_ ||
-                peak_acc > 1.03 * max_acc_) {
+            const double speed = v.head<2>().norm();
+            const double remaining_time = candidate.duration - i * sample_dt;
+            const double stopping_time = speed / std::max(0.3, spline_max_acc) + 0.30;
+            // Straight-line emergency stopping is relevant only after the
+            // reference itself has entered its terminal braking phase. On an
+            // earlier curved segment the accepted spline, not its tangent,
+            // defines the safe continuation corridor.
+            if (speed > 0.15 && remaining_time <= stopping_time) {
+                Eigen::Vector3d stop_probe = p;
+                stop_probe.head<2>() +=
+                    (speed * speed / (2.0 * std::max(0.3, spline_max_acc)) + 0.30) *
+                    v.head<2>().normalized();
+                stop_probe(2) = fly_height_;
+                braking_corridor_blocked =
+                    pathToTargetBlocked(stop_probe, p, traj_cut_clearance_);
+            }
+            if (peak_speed > 1.03 * spline_max_vel) {
+                kinematic_time_scale = std::max(
+                    kinematic_time_scale, peak_speed / std::max(0.1, spline_max_vel));
+            }
+            if (peak_acc > 1.03 * spline_max_acc) {
+                kinematic_time_scale = std::max(kinematic_time_scale,
+                    std::sqrt(peak_acc / std::max(0.1, spline_max_acc)));
+            }
+            if (!point_safe || segment_blocked || braking_corridor_blocked) {
                 last_rejection = !point_safe ? "ESDF/free-space point check" :
                     (segment_blocked ? "continuous segment clearance" :
-                     (peak_speed > 1.03 * max_vel_ ? "speed limit" : "acceleration limit"));
-                if (!point_safe && spatial_repair_attempts < (rolling ? 3 : 4) &&
-                    repairUnsafeSplineSample(candidate, i * sample_dt, p)) {
-                    repair_seed = candidate.position_ctrl;
-                    ++spatial_repair_attempts;
-                    repaired_spatial_failure = true;
-                } else if (!point_safe) {
-                    last_rejection += " (no movable ESDF-gradient repair)";
-                    unrepairable_spatial_failure = true;
+                     "blocked terminal braking corridor");
+                if (!point_safe) {
+                    const int repair_limit = rolling ? 3 : 4;
+                    if (!point_in_map) {
+                        repair_failure_reason = "outside_map";
+                        repair_clearance = -1.0;
+                    } else if (!point_grid_free) {
+                        repair_failure_reason = coverage_map_.isInDynamicPeerVolume(p)
+                            ? "dynamic_peer_cell" : "grid_cell_not_free";
+                        repair_clearance = point_clearance;
+                    } else if (spatial_repair_attempts < repair_limit &&
+                        repairUnsafeSplineSample(candidate, i * sample_dt, p)) {
+                        repair_seed = candidate.position_ctrl;
+                        ++spatial_repair_attempts;
+                        repaired_spatial_failure = true;
+                    } else {
+                        if (spatial_repair_attempts >= repair_limit) {
+                            repair_failure_reason = "free_support_budget_exhausted";
+                            repair_clearance = coverage_map_.isInMap2D(idx(0), idx(1))
+                                ? coverage_map_.getDistance2D(idx(0), idx(1)) : -1.0;
+                        }
+                    }
+                    if (!repaired_spatial_failure) {
+                        last_rejection += " (repair=" + repair_failure_reason + ")";
+                        ROS_WARN("[BsplineRepair][UAV%d] task=%llu t=%.3f/%.3fs "
+                                 "pos=(%.2f,%.2f) clearance=%.3f reason=%s "
+                                 "basis=[%d,%d] free_support=[%d,%d] attempts=%d/%d.",
+                                 uav_id_,
+                                 static_cast<unsigned long long>(current_goal_task_id_),
+                                 i * sample_dt, candidate.position_duration,
+                                 p(0), p(1), repair_clearance,
+                                 repair_failure_reason.c_str(),
+                                 repair_basis_first, repair_basis_last,
+                                 repair_free_first, repair_free_last,
+                                 spatial_repair_attempts, repair_limit);
+                        unrepairable_spatial_failure = true;
+                    }
                 }
                 safe = false;
                 break;
@@ -718,14 +930,40 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
             yaws.push_back(yaw);
             previous = p;
         }
+        rejected_peak_speed = peak_speed;
+        rejected_peak_acc = peak_acc;
+        rejected_duration = candidate.position_duration;
+        if (safe && escaping_curve) {
+            safe = false;
+            last_rejection = "escape did not reach planning clearance";
+        }
+        // Scan the complete curve before scaling time. Breaking at the first
+        // 3% violation only measured a near-threshold value and exhausted all
+        // five retries before the true acceleration peak was ever sampled.
+        if (safe && (peak_speed > 1.03 * spline_max_vel ||
+                     peak_acc > 1.03 * spline_max_acc)) {
+            safe = false;
+            last_rejection = peak_speed > 1.03 * spline_max_vel
+                ? "speed limit" : "acceleration limit";
+        }
         if (!safe) {
             if (repaired_spatial_failure) {
                 position_duration = candidate.position_duration;
                 continue;
             }
             if (unrepairable_spatial_failure) break;
-            position_duration = std::max(position_duration * 1.15,
-                                         candidate.position_duration * 1.05);
+            if (kinematic_time_scale > 1.0) {
+                // Cubic B-spline velocity scales as 1/T and acceleration as
+                // 1/T^2. Jump directly to the sampled feasible duration
+                // instead of burning retries on blind 15% expansion.
+                position_duration = candidate.position_duration *
+                    1.03 * kinematic_time_scale;
+            } else if (braking_corridor_blocked) {
+                position_duration = candidate.position_duration * 1.15;
+            } else {
+                position_duration = std::max(position_duration * 1.15,
+                                             candidate.position_duration * 1.05);
+            }
             continue;
         }
 
@@ -758,6 +996,7 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         }
 
         active_time_spline_ = candidate;
+        last_bspline_failure_reason_.clear();
         traj_points_.swap(points);
         traj_vels_.swap(velocities);
         traj_accs_.swap(accelerations);
@@ -766,8 +1005,11 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
         return true;
     }
 
+    last_bspline_failure_reason_ = last_rejection;
     ROS_WARN("[CoverageSearch] Time B-spline rejected after position-duration expansion: "
-             "last_reason=%s.", last_rejection.c_str());
+             "last_reason=%s duration=%.2fs peak_v=%.2f/%.2f peak_a=%.2f/%.2f.",
+             last_rejection.c_str(), rejected_duration, rejected_peak_speed, spline_max_vel,
+             rejected_peak_acc, spline_max_acc);
     return false;
 }
 
@@ -777,6 +1019,7 @@ bool CoverageSearchManager::buildTimeParameterizedSpline(
 // ============================================================
 void CoverageSearchManager::generateBsplineTraj() {
     const auto trajectory_build_start = std::chrono::steady_clock::now();
+    last_bspline_failure_reason_.clear();
     if (!rolling_prepare_in_progress_) {
         pending_traj_ = PendingTrajectory();
         rolling_last_attempt_time_ = ros::Time::now();
@@ -799,13 +1042,39 @@ void CoverageSearchManager::generateBsplineTraj() {
     const double traj_min_clearance = std::max(
         std::max(0.35, coverage_map_.esdf_safe_distance_), traj_cut_clearance_);
     const double preferred_clearance = std::max(0.80, traj_min_clearance);
-    const std::vector<Eigen::Vector3d> raw_astar_path = astar_path_;
+    std::vector<Eigen::Vector3d> raw_astar_path = astar_path_;
     Eigen::Vector3i start_idx;
     coverage_map_.posToIndex(uav_pos_, start_idx);
     const bool start_requires_escape =
         !coverage_map_.isFree2D(start_idx(0), start_idx(1)) ||
         coverage_map_.getDistance2D(start_idx(0), start_idx(1)) <
             requiredTrajectoryClearance(uav_pos_, traj_min_clearance);
+    if (start_requires_escape) {
+        const double escape_target = std::max(
+            trajectory_plan_clearance_, traj_min_clearance + 0.10);
+        size_t escape_end = raw_astar_path.size();
+        for (size_t i = 1; i < raw_astar_path.size(); ++i) {
+            Eigen::Vector3i idx;
+            coverage_map_.posToIndex(raw_astar_path[i], idx);
+            if (coverage_map_.isInMap2D(idx(0), idx(1)) &&
+                coverage_map_.isFree2D(idx(0), idx(1)) &&
+                coverage_map_.getDistance2D(idx(0), idx(1)) + 1e-3 >= escape_target) {
+                escape_end = i;
+                break;
+            }
+        }
+        if (escape_end == raw_astar_path.size()) {
+            has_traj_ = false;
+            ROS_WARN("[CoverageSearch][UAV%d] A* escape did not reach %.2fm clearance.",
+                     uav_id_, escape_target);
+            return;
+        }
+        raw_astar_path.resize(escape_end + 1);
+        astar_path_ = raw_astar_path;
+        ROS_WARN("[CoverageSearch][UAV%d] Low-clearance start: execute only the "
+                 "monotonic A* escape to %.2fm before normal replanning.",
+                 uav_id_, escape_target);
+    }
     const bool startup_bootstrap =
         !start_time_.isZero() && (ros::Time::now() - start_time_).toSec() < 6.0 &&
         (current_goal_ - uav_pos_).head<2>().norm() < 1.8;
@@ -911,6 +1180,8 @@ void CoverageSearchManager::generateBsplineTraj() {
         double escape_prev_clearance =
             coverage_map_.getDistance2D(escape_start_idx(0), escape_start_idx(1));
         bool escaping_start = start_requires_escape;
+        const double escape_target = std::max(
+            trajectory_plan_clearance_, traj_min_clearance + 0.10);
         auto rejectLinear = [&](const char *reason, int waypoint, int sample,
                                 const Eigen::Vector3d &p, double clearance) {
             ROS_WARN_THROTTLE(1.0,
@@ -921,6 +1192,11 @@ void CoverageSearchManager::generateBsplineTraj() {
             return false;
         };
 
+        if (escaping_start) {
+            pts.push_back(last_pt);
+            yaws.push_back(uav_yaw_);
+            vels.push_back(Eigen::Vector3d::Zero());
+        }
         for (int i = 0; i < (int)astar_path_.size(); i++) {
             Eigen::Vector3d pt = astar_path_[i];
             pt(2) = fly_height_;
@@ -955,8 +1231,7 @@ void CoverageSearchManager::generateBsplineTraj() {
                         blocked_reason = "escape_clearance_decreased";
                     } else if (!in_start_cell) {
                         escape_prev_clearance = clearance;
-                        if (clearance >= requiredTrajectoryClearance(
-                                interp, traj_min_clearance)) escaping_start = false;
+                        if (clearance + 1e-3 >= escape_target) escaping_start = false;
                     }
                 } else if (!free) {
                     blocked = true;
@@ -1543,7 +1818,7 @@ void CoverageSearchManager::generateBsplineTraj() {
         const double start_yaw_acc = planning_start_state_valid_
             ? planning_start_yaw_acc_ : 0.0;
         const bool time_spline_ready = buildTimeParameterizedSpline(
-            start_acc, start_yaw_rate, start_yaw_acc);
+            start_acc, start_yaw_rate, start_yaw_acc, start_requires_escape);
         time_bspline_end = std::chrono::steady_clock::now();
         planning_start_state_valid_ = false;
         if (!time_spline_ready && rolling_prepare_in_progress_) {
@@ -1553,8 +1828,9 @@ void CoverageSearchManager::generateBsplineTraj() {
             return;
         }
         if (!time_spline_ready) {
-            ROS_WARN("[CoverageSearch] Keep safety-checked legacy samples for this trajectory; "
-                     "rolling handoff is disabled until the next time B-spline succeeds.");
+            has_traj_ = false;
+            active_time_spline_ = TimeBspline();
+            return;
         }
     }
     traj_start_time_ = ros::Time::now();
@@ -1767,10 +2043,15 @@ bool CoverageSearchManager::buildContinuousBridge(
 bool CoverageSearchManager::activatePendingTrajectory() {
     if (!pending_traj_.ready || pending_traj_.points.empty()) return false;
 
+    const uint64_t planned_task_id = pending_traj_.task_id;
+    const double expected_goal_travel_time =
+        pending_traj_.expected_goal_travel_time;
+    const double planning_duration_ms = pending_traj_.planning_duration_ms;
+    const std::string trigger_reason = pending_traj_.trigger_reason.empty()
+        ? "unspecified" : pending_traj_.trigger_reason;
     const ros::Time now = ros::Time::now();
     const bool timed_handoff = active_time_spline_.valid &&
         pending_traj_.time_spline.valid && pending_traj_.handoff_time >= 0.0;
-    ros::Time handoff_stamp;
     double successor_elapsed = 0.0;
     Eigen::Vector3d successor_pos = pending_traj_.points.front();
     Eigen::Vector3d successor_vel = pending_traj_.vels.front();
@@ -1780,10 +2061,9 @@ bool CoverageSearchManager::activatePendingTrajectory() {
     bool missed_handoff = false;
     bool successor_state_valid = true;
     if (timed_handoff) {
-        handoff_stamp = traj_start_time_ + ros::Duration(pending_traj_.handoff_time);
-        successor_elapsed = std::max(0.0, (now - handoff_stamp).toSec());
-        missed_handoff = !pending_traj_.result_ready_time.isZero() &&
-            pending_traj_.result_ready_time > handoff_stamp;
+        successor_elapsed = std::max(0.0,
+            currentTrajectoryTime() - pending_traj_.handoff_time);
+        missed_handoff = successor_elapsed > 0.08;
         if (successor_elapsed > pending_traj_.time_spline.duration ||
             !evaluateTimeBspline(pending_traj_.time_spline, successor_elapsed,
                                  successor_pos, successor_vel, successor_acc,
@@ -1802,19 +2082,29 @@ bool CoverageSearchManager::activatePendingTrajectory() {
         (uav_vel_.head<2>() - successor_vel.head<2>()).norm();
     const double yaw_error = std::fabs(std::atan2(
         std::sin(successor_yaw - uav_yaw_), std::cos(successor_yaw - uav_yaw_)));
-    const double max_switch_error = std::max(0.45, 1.5 * traj_advance_dist_);
     bool frontier_still_present = false;
     bool peer_owns_goal = false;
+    uint64_t rebound_task_id = 0;
     for (const auto &frontier : frontier_finder_.frontiers_) {
-        if (frontierTaskId(frontier) == pending_traj_.task_id) {
-            for (const auto &viewpoint : frontier.viewpoints) {
-                if ((viewpoint.head<2>() - pending_traj_.goal.head<2>()).norm() < 0.10) {
+        for (size_t view = 0; view < frontier.viewpoints.size(); ++view) {
+            const auto &viewpoint = frontier.viewpoints[view];
+            const double viewpoint_yaw = view < frontier.viewpoint_yaws.size()
+                ? frontier.viewpoint_yaws[view] : pending_traj_.goal_yaw;
+            const bool same_view =
+                (viewpoint.head<2>() - pending_traj_.goal.head<2>()).norm() < 0.10 &&
+                std::fabs(std::atan2(std::sin(viewpoint_yaw - pending_traj_.goal_yaw),
+                                     std::cos(viewpoint_yaw - pending_traj_.goal_yaw))) < 0.20 &&
+                frontier_finder_.isViewpointVisible(frontier, viewpoint, viewpoint_yaw);
+            if (same_view) {
+                if (frontierTaskId(frontier) == pending_traj_.task_id &&
+                    hasConfirmedSelfLease(frontier) &&
+                    !isFrontierLeasedToPeer(frontier)) {
                     frontier_still_present = true;
-                    break;
+                } else if (rebound_task_id == 0 && hasConfirmedSelfLease(frontier) &&
+                           !isFrontierLeasedToPeer(frontier)) {
+                    rebound_task_id = frontierTaskId(frontier);
                 }
             }
-        }
-        for (const auto &viewpoint : frontier.viewpoints) {
             if ((viewpoint.head<2>() - pending_traj_.goal.head<2>()).norm() < 0.30 &&
                 isFrontierLeasedToPeer(frontier)) {
                 peer_owns_goal = true;
@@ -1823,6 +2113,18 @@ bool CoverageSearchManager::activatePendingTrajectory() {
         }
         if (peer_owns_goal) break;
     }
+    if (!frontier_still_present && !peer_owns_goal && rebound_task_id != 0) {
+        const uint64_t stale_task_id = pending_traj_.task_id;
+        pending_traj_.task_id = rebound_task_id;
+        for (auto &task_id : pending_traj_.frontier_target_task_ids) {
+            if (task_id == stale_task_id) task_id = rebound_task_id;
+        }
+        frontier_still_present = true;
+        ROS_INFO("[RollingDecision][UAV%d] rebound refreshed task UID %llu -> %llu "
+                 "for the same live viewpoint.", uav_id_,
+                 static_cast<unsigned long long>(stale_task_id),
+                 static_cast<unsigned long long>(rebound_task_id));
+    }
     Eigen::Vector3i goal_idx;
     coverage_map_.posToIndex(pending_traj_.goal, goal_idx);
     const bool goal_still_free = coverage_map_.isInMap(pending_traj_.goal) &&
@@ -1830,43 +2132,32 @@ bool CoverageSearchManager::activatePendingTrajectory() {
         coverage_map_.isFree2D(goal_idx(0), goal_idx(1)) &&
         coverage_map_.getDistance2D(goal_idx(0), goal_idx(1)) + 1e-3 >=
             requiredTrajectoryClearance(pending_traj_.goal, traj_cut_clearance_);
-    // A frontier can be re-clustered between planning and handoff.  Its exact
-    // task ID is then stale, but the already planned route remains reusable if
-    // the target is still free and no peer owns the nearby frontier.
-    bool atsp_tour_valid = true;
-    if (pending_traj_.atsp_tour_active) {
-        for (int index = pending_traj_.frontier_target_idx;
-             index < static_cast<int>(pending_traj_.frontier_targets.size()); ++index) {
-            if (!isAtspTargetValid(pending_traj_.frontier_targets[index],
-                                   pending_traj_.frontier_target_yaws[index],
-                                   pending_traj_.frontier_target_task_ids[index])) {
-                atsp_tour_valid = false;
-                break;
-            }
-        }
-    }
-    const bool goal_reusable = pending_traj_.atsp_tour_active ? atsp_tour_valid :
-        !peer_owns_goal && (frontier_still_present || goal_still_free);
+    // ATSP ranks this snapshot; only its selected first task is executable.
+    // A later tour entry must never invalidate this already checked successor.
+    const bool selected_task_valid = !peer_owns_goal && frontier_still_present;
+    const bool goal_reusable = selected_task_valid && goal_still_free;
     if (!successor_state_valid || !goal_reusable) {
-        ROS_WARN("[CoverageSearch] Rolling successor discarded: valid=%s, frontier=%s, "
-                 "goal_free=%s, peer_owned=%s, atsp_tour=%s.",
+        ROS_WARN("[CoverageSearch][UAV%d] Rolling successor discarded: task=%llu "
+                 "trigger=%s valid=%s, frontier=%s, goal_free=%s, "
+                 "peer_owned=%s, selected_task=%s.", uav_id_,
+                 static_cast<unsigned long long>(planned_task_id),
+                 trigger_reason.c_str(),
                  successor_state_valid ? "yes" : "no",
                  frontier_still_present ? "fresh" : "stale",
                  goal_still_free ? "yes" : "no",
                  peer_owns_goal ? "yes" : "no",
-                 atsp_tour_valid ? "valid" : "invalid");
+                 selected_task_valid ? "valid" : "invalid");
         pending_traj_ = PendingTrajectory();
         rolling_replan_requested_ = true;
         return false;
     }
 
-    const bool direct_handoff = timed_handoff && !missed_handoff &&
-        tracking_error <= max_switch_error && velocity_error <= 0.30 &&
-        yaw_error <= 0.20;
+    const bool direct_handoff = timed_handoff && !missed_handoff;
 
     const Eigen::Vector3d old_goal = current_goal_;
     const double old_goal_yaw = current_goal_yaw_;
     const uint64_t old_goal_task_id = current_goal_task_id_;
+    const Eigen::Vector3d old_semantic_goal = current_goal_;
     const std::vector<Eigen::Vector3d> old_astar_path = astar_path_;
     const std::vector<Eigen::Vector3d> old_points = traj_points_;
     const std::vector<Eigen::Vector3d> old_vels = traj_vels_;
@@ -1876,6 +2167,8 @@ bool CoverageSearchManager::activatePendingTrajectory() {
     const double old_traj_dt = traj_dt_;
     const int old_traj_idx = traj_idx_;
     const ros::Time old_traj_start = traj_start_time_;
+    const double old_remaining_at_activation = old_spline.valid
+        ? std::max(0.0, old_spline.duration - currentTrajectoryTime()) : 0.0;
 
     current_goal_ = pending_traj_.goal;
     current_goal_yaw_ = pending_traj_.goal_yaw;
@@ -1883,6 +2176,7 @@ bool CoverageSearchManager::activatePendingTrajectory() {
     frontier_targets_ = pending_traj_.frontier_targets;
     frontier_target_yaws_ = pending_traj_.frontier_target_yaws;
     frontier_target_task_ids_ = pending_traj_.frontier_target_task_ids;
+    atsp_tour_visualization_ = pending_traj_.atsp_tour_visualization;
     frontier_target_idx_ = pending_traj_.frontier_target_idx;
     atsp_tour_active_ = pending_traj_.atsp_tour_active;
     astar_path_ = pending_traj_.astar_path;
@@ -1952,21 +2246,42 @@ bool CoverageSearchManager::activatePendingTrajectory() {
     astar_path_idx_ = 0;
     has_goal_ = true;
     has_traj_ = true;
-    traj_start_time_ = bridge_used ? now : (timed_handoff ? handoff_stamp : now);
+    planned_goal_travel_time_ = expected_goal_travel_time;
+    const bool new_physical_goal =
+        (old_semantic_goal - current_goal_).head<2>().norm() > 0.10;
+    if (new_physical_goal) {
+        goal_commit_time_ = now;
+        goal_deadline_sec_ = goalDeadlineSeconds(std::max(
+            expected_goal_travel_time, active_time_spline_.duration));
+    } else {
+        goal_deadline_sec_ = std::max(goal_deadline_sec_, goalDeadlineSeconds(
+            std::max(expected_goal_travel_time, active_time_spline_.duration)));
+    }
+    traj_start_time_ = now - ros::Duration(bridge_used ? 0.0 : successor_elapsed);
     traj_point_reach_time_ = now;
     armRealtimeTrajectory();
+    const bool followup_requested = rolling_replan_requested_;
     pending_traj_ = PendingTrajectory();
-    rolling_replan_requested_ = false;
-    rolling_last_attempt_time_ = traj_start_time_;
+    rolling_replan_requested_ = followup_requested;
+    if (!followup_requested) rolling_replan_reason_.clear();
+    rolling_last_attempt_time_ = now;
     ++rolling_generation_;
     if (!captureActiveGoalFrontier()) {
         ROS_WARN("[CoverageSearch] Rolling handoff target has no fresh frontier signature.");
     }
     markLocalReservationActive(current_goal_task_id_);
+    if (current_goal_task_id_ == local_continuation_task_id_) {
+        local_continuation_task_id_ = 0;
+        local_continuation_confidence_ = 0.0;
+    }
 
-    ROS_INFO("[CoverageSearch] Rolling handoff activated: next_goal=(%.2f,%.2f), "
+    ROS_INFO("[RollingDecision][UAV%d] old_task=%llu new_task=%llu trigger=%s "
+             "planning=%.1fms old_remaining=%.2fs next_goal=(%.2f,%.2f), "
              "phase=%.2fs, bridge=%s, missed=%s, pos_err=%.2fm, vel_err=%.2fm/s, "
-             "yaw_err=%.2frad.",
+             "yaw_err=%.2frad.", uav_id_,
+             static_cast<unsigned long long>(old_goal_task_id),
+             static_cast<unsigned long long>(current_goal_task_id_),
+             trigger_reason.c_str(), planning_duration_ms, old_remaining_at_activation,
              current_goal_(0), current_goal_(1), successor_elapsed,
              bridge_used ? "C2" : "direct", missed_handoff ? "yes" : "no",
              tracking_error, velocity_error, yaw_error);
@@ -1982,6 +2297,10 @@ double CoverageSearchManager::terminalBrakingDistance() const {
     const double speed = uav_vel_.head<2>().norm();
     return std::max(goal_reach_dist_,
                     speed * speed / (2.0 * std::max(0.3, max_acc_)) + 0.30);
+}
+
+double CoverageSearchManager::currentTrajectoryTime() {
+    return std::max(0.0, (ros::Time::now() - traj_start_time_).toSec());
 }
 
 void CoverageSearchManager::armRealtimeTrajectory() {
@@ -2000,6 +2319,13 @@ void CoverageSearchManager::armRealtimeTrajectory() {
     snapshot->start_time = traj_start_time_;
     snapshot->goal = current_goal_;
     snapshot->goal_yaw = current_goal_yaw_;
+    if (snapshot->time_spline.valid) {
+        Eigen::Vector3d velocity, acceleration;
+        double yaw_rate = 0.0, yaw_acceleration = 0.0;
+        evaluateTimeBspline(snapshot->time_spline, snapshot->time_spline.duration,
+                            snapshot->goal, velocity, acceleration,
+                            snapshot->goal_yaw, yaw_rate, yaw_acceleration);
+    }
     snapshot->sample_dt = std::max(0.01, traj_dt_);
     realtime_command_id_.store(std::max(realtime_command_id_.load(), uav_command_.Command_ID));
     realtime_completed_generation_.store(0);
@@ -2047,21 +2373,21 @@ void CoverageSearchManager::executeRealtimeTrajectory() {
     const double duration = snapshot->time_spline.valid
         ? snapshot->time_spline.duration : fallback_duration;
     if (duration <= 1e-3) return;
-    const double elapsed = std::max(0.0, (ros::Time::now() - snapshot->start_time).toSec());
-    const double command_time = std::min(elapsed, duration);
+    const double path_time = std::min(duration,
+        std::max(0.0, (ros::Time::now() - snapshot->start_time).toSec()));
 
     Eigen::Vector3d target, velocity, acceleration;
     double yaw = snapshot->goal_yaw;
     double yaw_rate = 0.0, yaw_acceleration = 0.0;
     bool evaluated = false;
     if (snapshot->time_spline.valid) {
-        evaluated = evaluateTimeBspline(snapshot->time_spline, command_time,
+        evaluated = evaluateTimeBspline(snapshot->time_spline, path_time,
                                         target, velocity, acceleration,
                                         yaw, yaw_rate, yaw_acceleration);
     } else {
         const int idx = std::min(static_cast<int>(snapshot->points.size()) - 1,
             std::max(0, static_cast<int>(std::floor(
-                command_time / std::max(1e-3, snapshot->sample_dt)))));
+                path_time / std::max(1e-3, snapshot->sample_dt)))));
         target = snapshot->points[idx];
         velocity = idx < static_cast<int>(snapshot->velocities.size())
             ? snapshot->velocities[idx] : Eigen::Vector3d::Zero();
@@ -2077,7 +2403,7 @@ void CoverageSearchManager::executeRealtimeTrajectory() {
         return;
     }
 
-    const bool terminal_hold = elapsed >= duration;
+    const bool terminal_hold = path_time >= duration;
     if (terminal_hold) {
         // Do not replace the analytic endpoint with XYZ_POS.  Keep publishing
         // the exact P/V/A=0 terminal sample until measured motion has settled.
@@ -2127,7 +2453,7 @@ void CoverageSearchManager::maintainActiveTrajectory() {
     if (!has_traj_ || traj_points_.empty()) return;
 
     if (active_time_spline_.valid) {
-        const double elapsed = std::max(0.0, (ros::Time::now() - traj_start_time_).toSec());
+        const double elapsed = currentTrajectoryTime();
         const double remaining = active_time_spline_.duration - elapsed;
         std::string replan_reason;
         if (activeTrajectoryUnsafe(replan_reason)) {
@@ -2141,17 +2467,21 @@ void CoverageSearchManager::maintainActiveTrajectory() {
                    !isAtspTargetValid(current_goal_, current_goal_yaw_, current_goal_task_id_)) {
             replan_reason = "active viewpoint/frontier changed";
         } else if (rolling_replan_requested_) {
-            replan_reason = "frontier update";
+            replan_reason = rolling_replan_reason_.empty()
+                ? "frontier update" : rolling_replan_reason_;
         } else if (elapsed >= replan_min_execute_time_ && currentGoalFrontierCovered()) {
             replan_reason = "active frontier covered";
         } else if (elapsed >= replan_periodic_time_) {
             replan_reason = "periodic";
-        } else if (remaining <= replan_remaining_time_) {
+        } else if (remaining <= std::max(
+                       replan_remaining_time_, rollingHandoffLead() + 0.15)) {
             replan_reason = "trajectory ending";
         }
         if (!replan_reason.empty()) {
             // The active spline remains in the realtime executor while this
             // worker re-solves ATSP and a new first-viewpoint trajectory.
+            if (!rolling_worker_running_ && !pending_traj_.ready)
+                rolling_replan_reason_ = replan_reason;
             tryPrepareRollingHandoff(true);
         }
         if (pending_traj_.ready && pending_traj_.handoff_time >= 0.0 &&
@@ -2193,7 +2523,7 @@ void CoverageSearchManager::maintainActiveTrajectory() {
 
 bool CoverageSearchManager::activeTrajectoryUnsafe(std::string &reason) {
     if (!active_time_spline_.valid) return false;
-    const double now = std::max(0.0, (ros::Time::now() - traj_start_time_).toSec());
+    const double now = currentTrajectoryTime();
     const double duration = active_time_spline_.duration;
     if (now >= duration) return false;
 

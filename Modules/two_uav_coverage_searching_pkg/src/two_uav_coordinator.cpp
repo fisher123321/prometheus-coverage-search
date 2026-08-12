@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -169,6 +170,8 @@ class TwoUavCoordinator {
     state_pub_ = nh_.advertise<prometheus_two_uav_coverage_search::SwarmState>(tx_prefix_ + "/state", 10);
     frontier_pub_ = nh_.advertise<prometheus_two_uav_coverage_search::SwarmFrontierArray>(tx_prefix_ + "/frontier", 2);
     task_pub_ = nh_.advertise<prometheus_two_uav_coverage_search::SwarmTaskArray>(tx_prefix_ + "/task", 2);
+    local_task_pub_ = nh_.advertise<prometheus_two_uav_coverage_search::SwarmTaskArray>(
+        uav + "/prometheus/coverage_search/local_tasks", 2);
     trajectory_pub_ = nh_.advertise<prometheus_two_uav_coverage_search::SwarmTrajectory>(tx_prefix_ + "/trajectory", 2);
     auction_manifest_pub_ = nh_.advertise<prometheus_two_uav_coverage_search::SwarmAuctionManifest>(
         tx_prefix_ + "/auction_manifest", 2);
@@ -237,6 +240,14 @@ class TwoUavCoordinator {
 
   void commandTimerCb(const ros::TimerEvent& event) {
     if (!ownReady() || phase_ != ACTIVE || !rawCommandFresh()) return;
+    std::string safety_reason;
+    if (!peerTrajectorySafe(&safety_reason)) {
+      ROS_WARN_THROTTLE(1.0, "[two_uav_coordinator] UAV %d blocks command handoff: %s",
+                        uav_id_, safety_reason.c_str());
+      phase_ = HOLD;
+      publishHold();
+      return;
+    }
     if (!relay_yaw_inited_) {
       relay_yaw_ = state_.attitude[2];
       relay_yaw_rate_ = 0.0;
@@ -352,7 +363,10 @@ class TwoUavCoordinator {
     const double offset = std::max(0.0, (when - trajectory.header.stamp).toSec());
     const double sample = offset / trajectory.dt;
     const int first = static_cast<int>(std::floor(sample));
-    if (first >= static_cast<int>(trajectory.points.size())) return false;
+    if (first >= static_cast<int>(trajectory.points.size())) {
+      *point = trajectory.points.back();
+      return true;
+    }
     const int second = std::min(first + 1, static_cast<int>(trajectory.points.size()) - 1);
     const double alpha = std::min(1.0, std::max(0.0, sample - first));
     const auto& a = trajectory.points[first];
@@ -365,39 +379,47 @@ class TwoUavCoordinator {
 
   bool peerTrajectorySafe(std::string* reason) {
     const ros::Time now = ros::Time::now();
-    const bool trajectories_fresh = !local_trajectory_received_.isZero() &&
-        !peer_trajectory_received_.isZero() &&
-        (now - local_trajectory_received_).toSec() <= trajectory_timeout_ &&
+    if (!peerFresh()) return true;
+    const bool local_fresh = !local_trajectory_received_.isZero() &&
+        (now - local_trajectory_received_).toSec() <= trajectory_timeout_;
+    const bool peer_fresh = !peer_trajectory_received_.isZero() &&
         (now - peer_trajectory_received_).toSec() <= trajectory_timeout_;
-    if (!peerFresh() || !trajectories_fresh) return true;
+    const geometry_msgs::Point static_self = ownPoint();
+    const geometry_msgs::Point static_peer = peer_.pose.position;
 
     geometry_msgs::Point self, peer;
     bool high_id_escaping = false;
     double previous_separation = 0.0;
     for (double t = 0.0; t <= 2.0; t += 0.05) {
       const ros::Time when = now + ros::Duration(t);
-      if (!sampleTrajectory(local_trajectory_, when, &self) ||
-          !sampleTrajectory(peer_trajectory_, when, &peer)) break;
+      self = static_self;
+      peer = static_peer;
+      if (local_fresh) sampleTrajectory(local_trajectory_, when, &self);
+      if (peer_fresh) sampleTrajectory(peer_trajectory_, when, &peer);
       const double separation = std::sqrt(
           (self.x - peer.x) * (self.x - peer.x) +
           (self.y - peer.y) * (self.y - peer.y) +
           (self.z - peer.z) * (self.z - peer.z));
       if (separation >= safe_separation_) {
-        if (high_id_escaping) return true;
+        high_id_escaping = false;
         continue;
       }
 
-      if (uav_id_ > peer_uav_id_ &&
-          (last_collision_replan_request_.isZero() ||
-           (now - last_collision_replan_request_).toSec() >= 0.5)) {
+      // Low ID keeps right of way.  Only the high-ID aircraft is blocked and
+      // asked to replan, so both coordinators cannot turn one predicted
+      // crossing into a mutual hover deadlock.
+      if (uav_id_ < peer_uav_id_) continue;
+
+      if (last_collision_replan_request_.isZero() ||
+          (now - last_collision_replan_request_).toSec() >= 0.5) {
         std_msgs::Bool request;
         request.data = true;
         peer_collision_replan_pub_.publish(request);
         last_collision_replan_request_ = now;
       }
       // 两机已经进入安全间距内时，高 ID 机不能因 t=0 的既有重叠
-      // 永远被拦截；只允许它沿间距单调增加的轨迹退出，低 ID 保持悬停。
-      if (uav_id_ > peer_uav_id_) {
+      // 永远被拦截；只允许它沿间距单调增加的轨迹退出。
+      if (high_id_escaping || t <= 1e-6) {
         if (!high_id_escaping) {
           high_id_escaping = true;
           previous_separation = separation;
@@ -411,11 +433,11 @@ class TwoUavCoordinator {
       if (reason) {
         *reason = "predicted peer collision in " + std::to_string(t) +
             "s at " + std::to_string(separation) + "m; " +
-            (uav_id_ < peer_uav_id_ ? "lower ID holds" : "higher ID replans");
+            "higher ID replans";
       }
       return false;
     }
-    return !high_id_escaping;
+    return true;
   }
 
   void publishHold() {
@@ -451,17 +473,51 @@ class TwoUavCoordinator {
   }
 
   void publishOwnLeases(const ros::Time& now) {
-    prometheus_two_uav_coverage_search::SwarmTaskArray out;
-    out.header.stamp = now;
-    out.source_uav_id = uav_id_;
-    out.map_epoch = map_epoch_;
-    out.revision = ++task_revision_;
+    prometheus_two_uav_coverage_search::SwarmTaskArray local;
+    local.header.stamp = now;
+    local.source_uav_id = uav_id_;
+    local.map_epoch = map_epoch_;
+    local.revision = ++task_revision_;
     for (const auto& entry : own_leases_) {
-      if (entry.second.lease_expire_time > now) out.tasks.push_back(entry.second);
+      if (entry.second.lease_expire_time > now) local.tasks.push_back(entry.second);
     }
-    local_tasks_ = out;
+    local_tasks_ = local;
+    auto manager_view = local;
+    for (const auto& recent : recently_assigned_frontiers_) {
+      const auto owner = last_committed_owners_.find(recent.first);
+      const auto& frontier = recent.second.first;
+      if (recent.second.second <= now || owner == last_committed_owners_.end() ||
+          owner->second == static_cast<uint32_t>(uav_id_) ||
+          frontier.frontier_source_uav_id != static_cast<uint32_t>(uav_id_)) continue;
+      auto transfer = makeLease(frontier, now, 0);
+      transfer.winner_uav_id = owner->second;
+      transfer.lease_expire_time = recent.second.second;
+      manager_view.tasks.push_back(transfer);
+    }
+    local_task_pub_.publish(manager_view);
+    auto shared = local;
+    shared.tasks.erase(std::remove_if(shared.tasks.begin(), shared.tasks.end(),
+        [](const prometheus_two_uav_coverage_search::SwarmTask& task) {
+          return task.allocation_state ==
+              prometheus_two_uav_coverage_search::SwarmTask::ALLOCATION_LOCAL_RESERVATION;
+        }), shared.tasks.end());
     local_task_published_ = now;
-    task_pub_.publish(out);
+    task_pub_.publish(shared);
+  }
+
+  prometheus_two_uav_coverage_search::SwarmFrontierArray peerVisibleFrontiers(
+      const ros::Time& now) const {
+    auto shared = local_frontiers_;
+    shared.frontiers.erase(std::remove_if(shared.frontiers.begin(), shared.frontiers.end(),
+        [&](const prometheus_two_uav_coverage_search::SwarmFrontier& frontier) {
+          if (frontier.reservation_owner_uav_id == static_cast<uint32_t>(uav_id_) &&
+              frontier.reservation_expire_time > now) return true;
+          const auto lease = own_leases_.find(frontier.task_id);
+          return lease != own_leases_.end() && lease->second.lease_expire_time > now &&
+              lease->second.allocation_state ==
+                  prometheus_two_uav_coverage_search::SwarmTask::ALLOCATION_LOCAL_RESERVATION;
+        }), shared.frontiers.end());
+    return shared;
   }
 
   void claimLocalFrontierReservations() {
@@ -624,12 +680,30 @@ class TwoUavCoordinator {
     out->uav1_position = uav_id_ == 1 ? ownPoint() : peer_.pose.position;
     out->uav2_position = uav_id_ == 1 ? peer_.pose.position : ownPoint();
     out->frontiers.clear();
+    for (auto it = recently_assigned_frontiers_.begin();
+         it != recently_assigned_frontiers_.end();) {
+      if (it->second.second <= now) it = recently_assigned_frontiers_.erase(it);
+      else ++it;
+    }
     for (const auto& entry : tasks) {
       const auto& frontier = entry.second;
       if (active_fresh && frontier.task_id == active_task_id) {
         continue;
       }
-      if (own_leases_.count(frontier.task_id) != 0) {
+      const bool equivalent_live_lease = std::any_of(
+          own_leases_.begin(), own_leases_.end(), [&](const auto& lease) {
+            return lease.second.lease_expire_time > now &&
+                two_uav_auction::samePhysicalTask(frontier, lease.second);
+          }) || std::any_of(peer_tasks_.tasks.begin(), peer_tasks_.tasks.end(),
+              [&](const auto& lease) {
+                return lease.lease_expire_time > now &&
+                    two_uav_auction::samePhysicalTask(frontier, lease);
+              }) || std::any_of(recently_assigned_frontiers_.begin(),
+                  recently_assigned_frontiers_.end(), [&](const auto& recent) {
+                    return recent.second.second > now &&
+                        two_uav_auction::samePhysicalTask(frontier, recent.second.first);
+                  });
+      if (equivalent_live_lease) {
         continue;
       }
       if (frontier.reservation_owner_uav_id != 0 &&
@@ -659,6 +733,9 @@ class TwoUavCoordinator {
       auto descriptor = frontier;
       descriptor.frontier_cells.clear();
       descriptor.candidate_viewpoints.resize(1);  // best representative only
+      const auto previous_owner = last_committed_owners_.find(frontier.task_id);
+      descriptor.previous_owner_uav_id = previous_owner == last_committed_owners_.end()
+          ? 0 : previous_owner->second;
       out->frontiers.push_back(descriptor);
     }
     std::sort(out->frontiers.begin(), out->frontiers.end(), two_uav_auction::taskLess);
@@ -823,7 +900,8 @@ class TwoUavCoordinator {
       const uint32_t owner = two_uav_auction::resolveConsensusOwner(
           local_owner, local_auction_proposal_.source_uav_id,
           peer_owner, peer_auction_proposal_.source_uav_id,
-          std::min<uint32_t>(uav_id_, peer_uav_id_));
+          std::min<uint32_t>(uav_id_, peer_uav_id_),
+          current_auction_task_set_.frontiers[i].previous_owner_uav_id);
       final->owner_uav_ids[i] = owner;
       if (owner == 0) {
         final->assignment_modes[i] =
@@ -862,7 +940,9 @@ class TwoUavCoordinator {
       const auto& frontier = current_auction_task_set_.frontiers[i];
       const uint32_t owner = final.owner_uav_ids[i];
       if (owner == 0) {
+        last_committed_owners_.erase(frontier.task_id);
         recently_assigned_.erase(frontier.task_id);
+        recently_assigned_frontiers_.erase(frontier.task_id);
         auto unresolved = frontier;
         const uint32_t view = final.viewpoint_indices[i];
         if (view < unresolved.candidate_viewpoints.size() && view != 0) {
@@ -877,6 +957,7 @@ class TwoUavCoordinator {
                 unreachable_retry_period_, unreachable_retry_max_period_, failures));
         ++unreachable;
       } else {
+        last_committed_owners_[frontier.task_id] = owner;
         unreachable_tasks_.erase(frontier.task_id);
         unreachable_retry_after_.erase(frontier.task_id);
         unreachable_retry_counts_.erase(frontier.task_id);
@@ -886,6 +967,8 @@ class TwoUavCoordinator {
         // otherwise immediately auction the same task again.
         recently_assigned_[frontier.task_id] = std::make_pair(
             frontier.cluster_version, now + ros::Duration(task_lease_duration_));
+        recently_assigned_frontiers_[frontier.task_id] = std::make_pair(
+            frontier, now + ros::Duration(task_lease_duration_));
       }
       ROS_INFO("[AuctionResult] UAV %d round=%llu task=%llu owner=%u view=%u mode=%s.",
                uav_id_, static_cast<unsigned long long>(final.task_set_hash),
@@ -905,7 +988,8 @@ class TwoUavCoordinator {
 
   void runAuction() {
     const ros::Time now = ros::Time::now();
-    if ((now - last_auction_).toSec() < auction_period_) return;
+    const double period = current_auction_task_set_hash_ == 0 ? auction_period_ : 0.05;
+    if ((now - last_auction_).toSec() < period) return;
     last_auction_ = now;
 
     const uint64_t active_task_id = local_trajectory_.active_task_id;
@@ -971,6 +1055,13 @@ class TwoUavCoordinator {
         return;
       }
       task_set = two_uav_auction::confirmedTaskSet(local_auction_offer_, peer_auction_offer_);
+      std::set<uint64_t> offered_uids;
+      for (const auto& task : local_auction_offer_.frontiers) offered_uids.insert(task.task_id);
+      for (const auto& task : peer_auction_offer_.frontiers) offered_uids.insert(task.task_id);
+      if (task_set.frontiers.size() < offered_uids.size()) {
+        ROS_INFO("[AuctionDedup] UAV %d suppressed %zu geometrically equivalent public task(s).",
+                 uav_id_, offered_uids.size() - task_set.frontiers.size());
+      }
       task_set.header.stamp = now;
       task_set.source_uav_id = uav_id_;
       logAuctionOfferDifference(task_set);
@@ -1118,7 +1209,7 @@ class TwoUavCoordinator {
       return;
     }
     phase_ = ACTIVE;
-    frontier_pub_.publish(local_frontiers_);
+    frontier_pub_.publish(peerVisibleFrontiers(ros::Time::now()));
     runAuction();
     if (!rawCommandFresh()) {
       ROS_WARN_THROTTLE(1.0,
@@ -1152,13 +1243,21 @@ class TwoUavCoordinator {
 
     const ros::Time now = ros::Time::now();
 
-    int id = 0;
+    std::set<int> current_ids;
+    const auto markerId = [&](uint64_t task_id) {
+      const auto found = task_label_ids_.find(task_id);
+      if (found != task_label_ids_.end()) return found->second;
+      const int id = next_task_label_id_++;
+      task_label_ids_[task_id] = id;
+      return id;
+    };
     // Each coordinator publishes only the tasks it owns. RViz subscribes to
     // both UAV topics, so every assigned viewpoint appears exactly once.
     for (const auto& task : local_tasks_.tasks) {
       if (task.lease_expire_time <= now ||
           task.winner_uav_id != static_cast<uint32_t>(uav_id_)) continue;
-      label.id = id++;
+      label.id = markerId(task.task_id);
+      current_ids.insert(label.id);
       label.pose = labelPose(task);
       label.pose.position.z = fly_height_ + 0.55;
       label.text = "UAV" + std::to_string(task.winner_uav_id) + "\n" +
@@ -1174,7 +1273,8 @@ class TwoUavCoordinator {
     // from the lower-ID coordinator so it cannot silently disappear or double.
     if (uav_id_ < peer_uav_id_) {
       for (const auto& entry : unreachable_tasks_) {
-        label.id = id++;
+        label.id = markerId(entry.first);
+        current_ids.insert(label.id);
         label.pose = labelPose(entry.second);
         label.pose.position.z = fly_height_ + 0.55;
         label.text = "UNREACHABLE";
@@ -1186,13 +1286,15 @@ class TwoUavCoordinator {
       }
     }
 
-    // clear stale labels
-    for (int i = id; i < last_task_label_count_; ++i) {
-      label.id = i;
+    // Marker IDs follow task UIDs, not vector order. Removing one task can no
+    // longer leave an old UAV1/UAV2 label attached to another viewpoint.
+    for (const int id : published_task_label_ids_) {
+      if (current_ids.count(id) != 0) continue;
+      label.id = id;
       label.action = visualization_msgs::Marker::DELETE;
       task_label_pub_.publish(label);
     }
-    last_task_label_count_ = id;
+    published_task_label_ids_ = std::move(current_ids);
   }
 
   ros::NodeHandle nh_;
@@ -1237,10 +1339,14 @@ class TwoUavCoordinator {
   std::array<double, 7> auction_stage_elapsed_s_{};
   uint32_t task_revision_ = 0, command_id_ = 0;
   std::map<uint64_t, prometheus_two_uav_coverage_search::SwarmTask> own_leases_;
+  std::map<uint64_t, uint32_t> last_committed_owners_;
   std::map<uint64_t, prometheus_two_uav_coverage_search::SwarmFrontier> unreachable_tasks_;
   std::map<uint64_t, ros::Time> unreachable_retry_after_;
   std::map<uint64_t, uint32_t> unreachable_retry_counts_;
   std::map<uint64_t, std::pair<uint32_t, ros::Time>> recently_assigned_;
+  std::map<uint64_t, std::pair<
+      prometheus_two_uav_coverage_search::SwarmFrontier, ros::Time>>
+      recently_assigned_frontiers_;
   ros::Subscriber state_sub_, control_sub_, raw_command_sub_, local_frontier_sub_, local_trajectory_sub_, completion_ready_sub_;
   ros::Subscriber local_auction_assignment_sub_;
   ros::Subscriber peer_state_sub_, peer_frontier_sub_, peer_task_sub_, peer_trajectory_sub_;
@@ -1248,7 +1354,10 @@ class TwoUavCoordinator {
   ros::Publisher state_pub_, frontier_pub_, task_pub_, trajectory_pub_, peer_collision_replan_pub_, command_pub_, task_label_pub_;
   ros::Publisher auction_manifest_pub_, auction_assignment_pub_, auction_task_set_pub_,
       auction_task_set_sync_pub_;
-  int last_task_label_count_ = 0;
+  ros::Publisher local_task_pub_;
+  std::map<uint64_t, int> task_label_ids_;
+  std::set<int> published_task_label_ids_;
+  int next_task_label_id_ = 0;
   ros::Timer timer_, command_timer_;
 };
 

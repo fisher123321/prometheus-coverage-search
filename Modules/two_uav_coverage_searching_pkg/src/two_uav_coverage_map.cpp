@@ -490,7 +490,12 @@ bool CoverageMap::updateOccupancyFromEvidence(const Eigen::Vector3i &idx,
 
 int8_t CoverageMap::getLocalEvidence(int address) const {
     if (address < 0 || address >= static_cast<int>(occupancy_evidence_buffer_.size())) return 0;
-    return occupancy_evidence_buffer_[address];
+    const int8_t evidence = occupancy_evidence_buffer_[address];
+    if (evidence != 0 || !observed_buffer_[address]) return evidence;
+    // Wire value 0 means unknown. A locally observed voxel whose Bayesian
+    // evidence happens to be neutral must still be sent as known, otherwise
+    // the peer recreates frontier cells inside an already explored region.
+    return occupancy_buffer_[address] == 2 ? int8_t(2) : int8_t(-1);
 }
 
 bool CoverageMap::setRemoteEvidence(int address, int8_t evidence) {

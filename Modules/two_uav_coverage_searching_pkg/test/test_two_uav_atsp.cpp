@@ -14,6 +14,12 @@ TEST(OpenAtsp, FindsDirectedMinimumFromCurrentState) {
     EXPECT_EQ((std::vector<int>{0, 1, 2}), order);
 }
 
+TEST(OpenAtsp, SwitchesGoalOnlyForAbsoluteAndRelativeImprovement) {
+    EXPECT_FALSE(shouldSwitchAtspGoal(6.0, 5.2, 1.0, 0.15));
+    EXPECT_FALSE(shouldSwitchAtspGoal(10.0, 8.8, 1.0, 0.15));
+    EXPECT_TRUE(shouldSwitchAtspGoal(10.0, 8.4, 1.0, 0.15));
+}
+
 int main(int argc, char **argv) {
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
