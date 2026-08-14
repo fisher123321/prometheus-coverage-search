@@ -13,6 +13,13 @@ prometheus_two_uav_coverage_search::SwarmFrontier frontier(uint64_t id,
   out.frontier_source_uav_id = source;
   out.cluster_version = version;
   out.frontier_cell_count = 12;
+  out.centroid.x = x;
+  out.centroid.y = 3.4;
+  out.centroid.z = 1.0;
+  out.box_min.x = x - 0.4;
+  out.box_min.y = 3.0;
+  out.box_max.x = x + 0.4;
+  out.box_max.y = 3.8;
   geometry_msgs::Pose view;
   view.position.x = x;
   view.position.y = 2.0;
@@ -66,6 +73,14 @@ TEST(TwoUavAuctionProtocol, TaskSetDigestUsesOnlyRepresentativeViewpoint) {
             two_uav_auction::taskSetHash({second}));
 }
 
+TEST(TwoUavAuctionProtocol, TaskSetDigestIncludesPreviousOwner) {
+  auto first = frontier(11, 1, 7, 1.0);
+  auto second = first;
+  second.previous_owner_uav_id = 2;
+  EXPECT_NE(two_uav_auction::taskSetHash({first}),
+            two_uav_auction::taskSetHash({second}));
+}
+
 TEST(TwoUavAuctionProtocol, RequiresMutualAcknowledgementOfTheSameOfferPair) {
   prometheus_two_uav_coverage_search::SwarmAuctionTaskSet uav1;
   prometheus_two_uav_coverage_search::SwarmAuctionTaskSet uav2;
@@ -103,6 +118,15 @@ TEST(TwoUavAuctionProtocol, ResolvesEveryOwnerConflictToLowerId) {
   EXPECT_EQ(0u, two_uav_auction::resolveOwner(0, 0, 1));
 }
 
+TEST(TwoUavAuctionProtocol, KeepsReachableIncumbentForMarginalImprovement) {
+  EXPECT_EQ(1u, two_uav_auction::applyOwnerHysteresis(
+      2, 1, true, 13.711, true, 12.994, 1.0, 0.15));
+  EXPECT_EQ(2u, two_uav_auction::applyOwnerHysteresis(
+      2, 1, true, 12.0, true, 9.0, 1.0, 0.15));
+  EXPECT_EQ(2u, two_uav_auction::applyOwnerHysteresis(
+      2, 1, false, 12.0, true, 11.5, 1.0, 0.15));
+}
+
 TEST(TwoUavAuctionProtocol, RejectsOwnerNotConfirmedByItsOwnEvaluator) {
   // This is the previous peer-final deadlock: UAV1's map selected UAV2,
   // while UAV2 rejected the endpoint for both vehicles.  The final result
@@ -112,6 +136,13 @@ TEST(TwoUavAuctionProtocol, RejectsOwnerNotConfirmedByItsOwnEvaluator) {
   EXPECT_EQ(1u, two_uav_auction::resolveConsensusOwner(1, 1, 0, 2, 1));
   EXPECT_EQ(2u, two_uav_auction::resolveConsensusOwner(2, 1, 2, 2, 1));
   EXPECT_EQ(1u, two_uav_auction::resolveConsensusOwner(2, 1, 1, 2, 1));
+}
+
+TEST(TwoUavAuctionProtocol, ProposalConflictKeepsPreviousOwner) {
+  EXPECT_EQ(2u, two_uav_auction::resolveConsensusOwner(1, 1, 2, 2, 1, 2));
+  EXPECT_EQ(1u, two_uav_auction::resolveConsensusOwner(1, 1, 2, 2, 1, 1));
+  // Explicit endpoint rejection still takes precedence over owner history.
+  EXPECT_EQ(0u, two_uav_auction::resolveConsensusOwner(2, 1, 0, 2, 1, 2));
 }
 
 TEST(TwoUavAuctionProtocol, ConfirmedTaskSetIncludesOneSidedUidsAndSourceDescriptor) {
@@ -136,6 +167,27 @@ TEST(TwoUavAuctionProtocol, ConfirmedTaskSetIncludesOneSidedUidsAndSourceDescrip
   uav2.offer_sequence = 7;
   EXPECT_NE(first.task_set_hash,
             two_uav_auction::confirmedTaskSet(uav1, uav2).task_set_hash);
+}
+
+TEST(TwoUavAuctionProtocol, ConfirmedTaskSetSuppressesEquivalentGeometryWithoutChangingUid) {
+  prometheus_two_uav_coverage_search::SwarmAuctionTaskSet uav1;
+  uav1.source_uav_id = 1;
+  uav1.offer_sequence = 4;
+  uav1.frontiers = {frontier(11, 1, 1, 2.0)};
+  prometheus_two_uav_coverage_search::SwarmAuctionTaskSet uav2;
+  uav2.source_uav_id = 2;
+  uav2.offer_sequence = 6;
+  uav2.frontiers = {frontier(22, 2, 1, 2.15)};
+
+  const auto first = two_uav_auction::confirmedTaskSet(uav1, uav2);
+  const auto second = two_uav_auction::confirmedTaskSet(uav2, uav1);
+  ASSERT_EQ(1u, first.frontiers.size());
+  EXPECT_EQ(11u, first.frontiers.front().task_id);
+  EXPECT_EQ(first.task_set_hash, second.task_set_hash);
+
+  uav2.frontiers.front().candidate_viewpoints.front().orientation.z = 1.0;
+  uav2.frontiers.front().candidate_viewpoints.front().orientation.w = 0.0;
+  EXPECT_EQ(2u, two_uav_auction::confirmedTaskSet(uav1, uav2).frontiers.size());
 }
 
 TEST(TwoUavAuctionProtocol, ConfirmedTaskSetFreezesMatchingNewestPositions) {

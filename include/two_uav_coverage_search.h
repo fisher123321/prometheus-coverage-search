@@ -7,6 +7,7 @@
 #include <iostream>
 #include <algorithm>
 #include <queue>
+#include <deque>
 #include <unordered_map>
 #include <vector>
 #include <cmath>
@@ -23,6 +24,7 @@
 #include <memory>
 #include <limits>
 #include <map>
+#include <fstream>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
@@ -58,6 +60,30 @@
 
 using namespace std;
 using namespace Eigen;
+
+inline double frontierContinuationConfidence(double cell_gap, double max_gap,
+                                             double forward_progress,
+                                             bool has_old_normal,
+                                             double normal_alignment,
+                                             bool has_both_normals,
+                                             double resolution) {
+    if (!std::isfinite(cell_gap) || cell_gap > max_gap) return 0.0;
+    const double grid = std::max(0.0, std::min(1.0, 1.0 - cell_gap / max_gap));
+    double progress = 0.5;
+    if (has_old_normal) {
+        if (forward_progress < -resolution) return 0.0;
+        progress = std::max(0.0, std::min(1.0,
+            (forward_progress + resolution) / (max_gap + resolution)));
+    }
+    const double normal = has_both_normals
+        ? std::max(0.0, std::min(1.0, 0.5 * (normal_alignment + 1.0)))
+        : 0.5;
+    return 0.50 * grid + 0.30 * progress + 0.20 * normal;
+}
+
+inline double goalDeadlineSeconds(double expected_travel_time) {
+    return std::max(30.0, 1.5 * std::max(0.0, expected_travel_time) + 5.0);
+}
 
 // ============================================================
 // 占据地图类 - 深度相机3D栅格地图，用于覆盖搜索
@@ -249,11 +275,13 @@ public:
 
     int toAddress2D(int x, int y);
     void setSearchTimeout(double timeout_ms) { search_timeout_ms_ = timeout_ms; }
+    void setPlanningClearance(double clearance) { planning_clearance_ = clearance; }
     FailureReason lastFailureReason() const { return last_failure_reason_; }
 
 private:
     CoverageMap *map_;
     double search_timeout_ms_;
+    double planning_clearance_ = 0.45;
     FailureReason last_failure_reason_;
 
     int dx_[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
@@ -266,6 +294,39 @@ private:
                             double &path_len,
                             int &unknown_cells,
                             double &unknown_ratio);
+};
+
+// ============================================================
+// 2D动力学A*：仅为1.5--5m的已选中视点生成状态感知路径初值。
+// ATSP仍使用上面的几何A*，避免对代价矩阵的每条边重复做状态空间搜索。
+// ============================================================
+class KinodynamicAstar2D {
+public:
+    enum FailureReason {
+        KINO_OK = 0,
+        KINO_ENDPOINT_BLOCKED,
+        KINO_TIMEOUT,
+        KINO_NO_PATH
+    };
+
+    void init(CoverageMap *map) { map_ = map; }
+    void setPlanningClearance(double clearance) { planning_clearance_ = clearance; }
+    bool search(const Eigen::Vector3d &start_pos,
+                const Eigen::Vector3d &start_vel,
+                const Eigen::Vector3d &start_acc,
+                const Eigen::Vector3d &goal_pos,
+                const Eigen::Vector3d &goal_vel,
+                double max_vel, double max_acc,
+                double timeout_ms,
+                std::vector<Eigen::Vector3d> &path,
+                const std::vector<Eigen::Vector3d> *guide_path = nullptr,
+                double guide_radius = 1.0);
+    FailureReason lastFailureReason() const { return last_failure_reason_; }
+
+private:
+    CoverageMap *map_ = nullptr;
+    double planning_clearance_ = 0.45;
+    FailureReason last_failure_reason_ = KINO_OK;
 };
 
 // ============================================================
@@ -346,6 +407,7 @@ public:
     bool isViewpointVisible(const FrontierCluster &ftr, const Eigen::Vector3d &pos,
                             double yaw);
     void refreshViewpoints(FrontierCluster &ftr, const Eigen::Vector3d &cur_pos);
+    Eigen::Vector2d unknownDirection(const FrontierCluster &ftr) const;
 
     std::vector<FrontierCluster> frontiers_;
     std::vector<FrontierCluster> sleeping_frontiers_;
@@ -360,7 +422,7 @@ private:
                      const Eigen::Vector3d &min2, const Eigen::Vector3d &max2);
     void resetFrontierFlag(const FrontierCluster &ftr);
     void splitLargeFrontiers();
-    void assignNewTaskIdentities(const std::vector<FrontierCluster> &previous);
+    void assignNewTaskIdentities();
     void computeFrontierInfo(FrontierCluster &ftr);
     bool isValidFrontierCluster(const std::vector<Eigen::Vector3d> &cells,
                                 bool relaxed = false);
@@ -442,6 +504,7 @@ private:
     FrontierFinder frontier_finder_;
     HierarchicalGrid hierarchical_grid_;
     Astar2D astar2d_;
+    KinodynamicAstar2D kino_astar2d_;
     std::unique_ptr<tf2_ros::Buffer> planning_tf_buffer_;
     std::unique_ptr<tf2_ros::TransformListener> planning_tf_listener_;
 
@@ -469,9 +532,15 @@ private:
     ros::CallbackQueue auction_callback_queue_;
     std::unique_ptr<ros::NodeHandle> auction_nh_;
     std::unique_ptr<ros::AsyncSpinner> auction_spinner_;
+    // A completed rolling solve must not wait behind map/frontier callbacks.
+    ros::CallbackQueue rolling_result_callback_queue_;
+    std::unique_ptr<ros::NodeHandle> rolling_result_nh_;
+    std::unique_ptr<ros::AsyncSpinner> rolling_result_spinner_;
+    std::mutex planning_state_mutex_;
     std::mutex coverage_map_update_mutex_;
     ros::Timer mainloop_timer_, trajectory_timer_, frontier_timer_, swarm_data_timer_;
     ros::Timer raw_heartbeat_timer_;
+    ros::Timer rolling_result_timer_;
 
     struct AuctionMapSnapshot {
         int nx = 0, ny = 0;
@@ -520,17 +589,19 @@ private:
     string uav_name_;
 
     double fly_height_, sensing_range_, sensing_fov_h_, sensing_fov_v_;
-    double max_vel_, max_acc_, max_yaw_rate_, max_yaw_acc_, replan_time_, goal_reach_dist_;
-    // FUEL-style execution triggers.  The handoff itself still uses replan_time_.
+    double max_vel_, max_acc_, max_yaw_rate_, max_yaw_acc_, goal_reach_dist_;
+    // FUEL-style execution triggers. The rolling handoff lead is fixed at 0.25 s.
     double replan_min_execute_time_ = 0.5;
     double replan_periodic_time_ = 1.5;
     double replan_remaining_time_ = 0.5;
-    double peer_avoidance_radius_ = 0.75, peer_avoidance_duration_ = 2.0;
+    double trajectory_plan_clearance_ = 0.60;  // B样条引导/修复目标，不是硬碰撞阈值
+    double peer_avoidance_radius_ = 1.30, peer_avoidance_duration_ = 2.0;
     bool sim_mode_, auto_start_, cooperative_mode_, external_goal_only_;
     int global_coverage_source_;
     int map_input_source_;
     int map_epoch_;
     double swarm_chunk_size_, swarm_chunk_delta_period_;
+    int swarm_snapshot_chunks_per_tick_ = 1;
     double peer_state_timeout_ = 0.6;
     string swarm_tx_prefix_, swarm_rx_prefix_;
     int swarm_chunk_cells_x_, swarm_chunk_cells_y_;
@@ -540,12 +611,20 @@ private:
     std::vector<uint32_t> swarm_peer_chunk_revision_;
     std::vector<uint8_t> swarm_chunk_snapshot_stage_;
     std::vector<bool> swarm_chunk_force_snapshot_;
+    size_t swarm_snapshot_cursor_ = 0;
+    uint64_t swarm_map_delta_tx_ = 0, swarm_map_snapshot_tx_ = 0;
+    uint64_t swarm_map_rx_ = 0, swarm_map_gap_requests_ = 0;
     bool atsp_enabled_ = true;
     int atsp_max_clusters_ = 5;
     int atsp_refine_clusters_ = 3;
     int atsp_viewpoints_per_cluster_ = 3;
     double atsp_edge_timeout_ms_ = 100.0;
+    double atsp_goal_switch_min_distance_ = 1.0;
+    double atsp_goal_switch_min_ratio_ = 0.15;
+    double kinodynamic_corridor_radius_ = 1.0;
     double auction_astar_timeout_ms_ = 50.0;
+    double auction_owner_switch_min_distance_ = 1.0;
+    double auction_owner_switch_min_ratio_ = 0.15;
     double atsp_planning_budget_ms_ = 250.0;
     bool atsp_tour_active_ = false;
     prometheus_two_uav_coverage_search::SwarmFrontierArray local_swarm_frontiers_;
@@ -584,6 +663,7 @@ private:
     // ★ 目标硬截止时间：选定目标时刻 + N 秒仍未到达 → 强制放弃，避免卡死在一个不可达目标上
     ros::Time goal_commit_time_;
     double goal_deadline_sec_;
+    double planned_goal_travel_time_ = 0.0;
 
     // ★ A*路径
     std::vector<Eigen::Vector3d> astar_path_;
@@ -637,6 +717,9 @@ private:
     std::atomic<uint64_t> realtime_completed_generation_{0};
     std::atomic<uint32_t> realtime_command_id_{0};
     std::atomic<float> realtime_yaw_rate_ref_{0.0f};
+    std::ofstream tracking_log_;
+    ros::Time last_tracking_log_stamp_;
+    uint64_t last_tracking_log_generation_ = 0;
 
     // 旧轨迹执行期间预先生成，抵达交接点后一次性切换。
     struct PendingTrajectory {
@@ -657,9 +740,13 @@ private:
         std::vector<Eigen::Vector3d> frontier_targets;
         std::vector<double> frontier_target_yaws;
         std::vector<uint64_t> frontier_target_task_ids;
+        std::vector<Eigen::Vector3d> atsp_tour_visualization;
         int frontier_target_idx = 0;
         bool atsp_tour_active = false;
         ros::Time result_ready_time;
+        double planning_duration_ms = 0.0;
+        double expected_goal_travel_time = 0.0;
+        std::string trigger_reason;
     } pending_traj_;
     bool rolling_prepare_in_progress_;
     bool rolling_snapshot_mode_ = false;
@@ -667,6 +754,7 @@ private:
     // Coalesces frontier/map changes while the single rolling worker is busy.
     // The active trajectory remains executable until a successor is accepted.
     bool rolling_replan_requested_ = false;
+    std::string rolling_replan_reason_;
     ros::Time rolling_last_attempt_time_;
     uint64_t rolling_replan_count_ = 0;
     bool planning_start_state_valid_ = false;
@@ -676,6 +764,7 @@ private:
     double traj_esdf_ms_ = 0.0;
     double traj_geometry_ms_ = 0.0;
     double traj_profile_ms_ = 0.0;
+    std::string last_bspline_failure_reason_;
     struct AtspTiming {
         bool valid = false;
         bool solved = false;
@@ -693,10 +782,14 @@ private:
     std::vector<Eigen::Vector3d> frontier_targets_;
     std::vector<double> frontier_target_yaws_;
     std::vector<uint64_t> frontier_target_task_ids_;
+    // Read-only ATSP order for RViz; never consumed as executable goals.
+    std::vector<Eigen::Vector3d> atsp_tour_visualization_;
     int frontier_target_idx_;
-    // The next locally observed frontier must be visited before a stale tail
-    // of the previous ATSP tour.  It is cleared once inserted into a new tour.
-    uint64_t local_discovery_priority_task_id_ = 0;
+    // A new local task is preferred only when it geometrically continues the
+    // active frontier after that frontier becomes invalid. Ordinary local
+    // discoveries enter ATSP without overriding its first task.
+    uint64_t local_continuation_task_id_ = 0;
+    double local_continuation_confidence_ = 0.0;
     uint64_t current_goal_task_id_ = 0;
     struct LocalFrontierReservation {
         prometheus_two_uav_coverage_search::SwarmTask task;
@@ -706,11 +799,14 @@ private:
     std::set<uint64_t> retired_frontier_ids_;
     prometheus_two_uav_coverage_search::SwarmTask active_goal_frontier_;
     std::vector<Eigen::Vector3d> active_goal_frontier_cells_;
+    Eigen::Vector2d active_goal_frontier_normal_ = Eigen::Vector2d::Zero();
     bool active_goal_frontier_valid_ = false;
     bool active_goal_frontier_covered_pending_ = false;
     uint64_t active_goal_frontier_checked_generation_ = 0;
 
     ros::Time start_time_, finish_time_;
+    ros::Time completion_quiet_since_;
+    std::atomic<double> auction_busy_until_sec_{0.0};
     ros::Time coverage_25_time_, coverage_50_time_, coverage_75_time_;
     ros::Time traj_start_time_;  // 轨迹开始时间，用于超时检测
     ros::Time hover_wait_start_; // 悬停等待开始时间
@@ -742,6 +838,7 @@ private:
 
     // 回调
     void uavStateCb(const prometheus_msgs::UAVState::ConstPtr &msg);
+    void recordTrajectoryTracking(const prometheus_msgs::UAVState &state);
     void uavControlStateCb(const prometheus_msgs::UAVControlState::ConstPtr &msg);
     void globalPclCb(const sensor_msgs::PointCloud2ConstPtr &msg);
     void localPclCb(const sensor_msgs::PointCloud2ConstPtr &msg);
@@ -760,6 +857,7 @@ private:
 
     void mainloopCb(const ros::TimerEvent &e);
     void trajectoryCb(const ros::TimerEvent &e);
+    void rollingResultCb(const ros::TimerEvent &e);
     void frontierCb(const ros::TimerEvent &e);
     void publishStartupHold();
     void updateFrontiers();
@@ -773,13 +871,15 @@ private:
     bool selectAtspTour();
     bool hasConfirmedSelfLease(const FrontierFinder::FrontierCluster &frontier);
     bool isAtspTargetValid(const Eigen::Vector3d &target, double yaw, uint64_t task_id);
-    bool planPathToGoal();           // A*规划到目标的路径
+    bool planPathToGoal();           // 几何 A*；仅1.5--5m尝试动力学 A*
+    bool planExecutableTrajectoryToGoal(); // 同簇三视点路径/轨迹逐一回退
     void generateBsplineTraj();      // 从A*路径生成B样条轨迹
     void executeTrajectory();        // 执行B样条轨迹
     void executeRealtimeTrajectory();
     void armRealtimeTrajectory();
     void disarmRealtimeTrajectory();
     bool consumeRealtimeTrajectoryCompletion();
+    double currentTrajectoryTime();
     void maintainActiveTrajectory();
     double terminalBrakingDistance() const;
     bool reachedGoal();
@@ -796,7 +896,8 @@ private:
                              double &yaw_acceleration) const;
     bool buildTimeParameterizedSpline(const Eigen::Vector3d &start_acc,
                                       double start_yaw_rate,
-                                      double start_yaw_acceleration);
+                                      double start_yaw_acceleration,
+                                      bool escape_recovery = false);
     bool optimizeTimeBspline2D(TimeBspline &spline, bool rolling,
                                std::string &reason);
     // 三项统一为时间并取瓶颈最大值：路径、运动方向转向、偏航。
@@ -826,7 +927,10 @@ private:
     // ★ 目标点前沿验证：目标点附近必须有unknown区域
     bool isNearFrontier(const Eigen::Vector3d &pos);
     bool tryPrepareRollingHandoff(bool force_new_goal = false,
-                                  bool handoff_at_terminal = false);
+                                  bool handoff_at_terminal = false,
+                                  double frozen_handoff_time = -1.0);
+    double rollingHandoffLead() const;
+    bool collectCompletedRollingResult();
     bool buildContinuousBridge(const Eigen::Vector3d &start_pos,
                                const Eigen::Vector3d &start_vel,
                                const Eigen::Vector3d &start_acc,

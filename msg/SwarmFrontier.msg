@@ -16,3 +16,6 @@ geometry_msgs/Pose[] candidate_viewpoints
 float32 information_gain
 uint32 reservation_owner_uav_id
 time reservation_expire_time
+# Previous distributed owner. This is history only after lease expiry and is
+# used to avoid transferring a stable task for a marginal path-cost change.
+uint32 previous_owner_uav_id

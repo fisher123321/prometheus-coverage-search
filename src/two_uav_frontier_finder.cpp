@@ -72,7 +72,6 @@ void FrontierFinder::init(ros::NodeHandle &nh, CoverageMap *map) {
 }
 
 void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
-    std::vector<FrontierCluster> previous = frontiers_;
     last_aabb_search_ms_ = 0.0;
     last_viewpoint_ms_ = 0.0;
     last_local_update_box_count_ = 0;
@@ -122,8 +121,6 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
     }
     if (retired_frontier) {
         frontiers_.swap(live_frontiers);
-        // Retired IDs are never inherited by replacement clusters.
-        previous = frontiers_;
         ++update_generation_;
     }
 
@@ -239,7 +236,7 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
         }
     }
     if (new_count > 0) splitLargeFrontiers();
-    assignNewTaskIdentities(previous);
+    assignNewTaskIdentities();
     const auto cluster_end = std::chrono::steady_clock::now();
     computeViewpoints(cur_pos);
     const auto viewpoints_end = std::chrono::steady_clock::now();
@@ -248,49 +245,16 @@ void FrontierFinder::searchFrontiers(const Eigen::Vector3d &cur_pos) {
     // [FrontierTiming] incremental log intentionally disabled during replan profiling.
 }
 
-void FrontierFinder::assignNewTaskIdentities(const std::vector<FrontierCluster> &previous) {
-    std::set<uint64_t> retained;
-    for (const auto &frontier : frontiers_) {
-        if (frontier.task_id != 0) retained.insert(frontier.task_id);
-    }
-
+void FrontierFinder::assignNewTaskIdentities() {
     for (auto &frontier : frontiers_) {
         if (frontier.task_id != 0) continue;
-        int best = -1;
-        double best_overlap = 0.0;
-        for (int i = 0; i < static_cast<int>(previous.size()); ++i) {
-            const auto &old = previous[i];
-            if (old.task_id == 0 || retained.count(old.task_id) != 0) continue;
-            const double overlap_x = std::max(0.0, std::min(frontier.box_max_(0), old.box_max_(0)) -
-                                               std::max(frontier.box_min_(0), old.box_min_(0)));
-            const double overlap_y = std::max(0.0, std::min(frontier.box_max_(1), old.box_max_(1)) -
-                                               std::max(frontier.box_min_(1), old.box_min_(1)));
-            const double smaller_area = std::min(
-                (frontier.box_max_(0) - frontier.box_min_(0)) *
-                    (frontier.box_max_(1) - frontier.box_min_(1)),
-                (old.box_max_(0) - old.box_min_(0)) *
-                    (old.box_max_(1) - old.box_min_(1)));
-            const double overlap = smaller_area > 1e-6 ? overlap_x * overlap_y / smaller_area : 0.0;
-            if (overlap > best_overlap) {
-                best_overlap = overlap;
-                best = i;
-            }
-        }
-        if (best >= 0 && best_overlap >= 0.75) {
-            frontier.task_id = previous[best].task_id;
-            frontier.source_uav_id = previous[best].source_uav_id;
-            frontier.source_revision = previous[best].source_revision + 1;
-            frontier.local_discovery = false;
-        } else {
-            // task_id contains the source identity; the low 48 bits are local
-            // monotonic sequence numbers and are never spatially quantized.
-            frontier.task_id = (static_cast<uint64_t>(source_uav_id_ & 0xffff) << 48) |
-                               (next_task_sequence_++ & 0x0000ffffffffffffULL);
-            frontier.source_uav_id = source_uav_id_;
-            frontier.source_revision = 1;
-            frontier.local_discovery = true;
-        }
-        retained.insert(frontier.task_id);
+        // Every newly extracted cluster is a new entity. Deleted clusters and
+        // PCA split children never inherit an older cluster's UID.
+        frontier.task_id = (static_cast<uint64_t>(source_uav_id_ & 0xffff) << 48) |
+                           (next_task_sequence_++ & 0x0000ffffffffffffULL);
+        frontier.source_uav_id = source_uav_id_;
+        frontier.source_revision = 1;
+        frontier.local_discovery = true;
     }
 }
 
@@ -625,6 +589,24 @@ void FrontierFinder::refreshViewpoints(FrontierCluster &ftr,
     sampleViewpoints(ftr, cur_pos);
 }
 
+Eigen::Vector2d FrontierFinder::unknownDirection(const FrontierCluster &ftr) const {
+    Eigen::Vector2d normal = Eigen::Vector2d::Zero();
+    const auto &cells = ftr.filtered_cells.empty() ? ftr.cells : ftr.filtered_cells;
+    static const int directions[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    for (const auto &cell : cells) {
+        Eigen::Vector3i index;
+        map_->posToIndex(cell, index);
+        for (const auto &direction : directions) {
+            const Eigen::Vector3i neighbor = index +
+                Eigen::Vector3i(direction[0], direction[1], 0);
+            if (map_->isUnknownIndex(neighbor))
+                normal += Eigen::Vector2d(direction[0], direction[1]);
+        }
+    }
+    if (normal.squaredNorm() > 1e-6) normal.normalize();
+    return normal;
+}
+
 void FrontierFinder::downsample(const std::vector<Eigen::Vector3d> &cluster_in,
                                 std::vector<Eigen::Vector3d> &cluster_out) {
     cluster_out.clear();
@@ -663,19 +645,8 @@ void FrontierFinder::sampleViewpoints(FrontierCluster &ftr, const Eigen::Vector3
 
     // The frontier normal points from known free space toward its adjacent
     // unknown voxels.  Unlike a PCA normal, its sign is therefore fixed.
-    Eigen::Vector2d unknown_normal = Eigen::Vector2d::Zero();
-    const auto &normal_cells = ftr.filtered_cells.empty() ? ftr.cells : ftr.filtered_cells;
-    static const int normal_dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-    for (const auto &cell : normal_cells) {
-        Eigen::Vector3i idx;
-        map_->posToIndex(cell, idx);
-        for (const auto &dir : normal_dirs) {
-            const Eigen::Vector3i nbr = idx + Eigen::Vector3i(dir[0], dir[1], 0);
-            if (map_->isUnknownIndex(nbr)) unknown_normal += Eigen::Vector2d(dir[0], dir[1]);
-        }
-    }
+    const Eigen::Vector2d unknown_normal = unknownDirection(ftr);
     const bool has_unknown_normal = unknown_normal.squaredNorm() > 1e-6;
-    if (has_unknown_normal) unknown_normal.normalize();
 
     struct ViewpointCandidate {
         Eigen::Vector3d position;

@@ -5,6 +5,10 @@ namespace {
 constexpr double kRollingPeriodicInterval = 0.30;
 }
 
+double CoverageSearchManager::rollingHandoffLead() const {
+    return 0.25;
+}
+
 bool CoverageSearchManager::isStuck() {
     // ★ 如果已经非常接近目标，不算卡住（正常到达）
     if (has_goal_) {
@@ -48,32 +52,31 @@ bool CoverageSearchManager::isNearFrontier(const Eigen::Vector3d &pos) {
     return false;
 }
 
+bool CoverageSearchManager::collectCompletedRollingResult() {
+    if (!rolling_worker_running_ && rolling_worker_.joinable()) rolling_worker_.join();
+    std::lock_guard<std::mutex> lock(rolling_result_mutex_);
+    if (completed_pending_traj_.result_ready_time.isZero()) return false;
+    if (completed_pending_traj_.ready &&
+        completed_pending_traj_.source_generation == rolling_generation_ &&
+        has_traj_ && has_goal_) {
+        pending_traj_ = std::move(completed_pending_traj_);
+        completed_pending_traj_ = PendingTrajectory();
+        return true;
+    }
+    rolling_replan_requested_ = true;
+    if (!completed_pending_traj_.ready) {
+        ROS_WARN_THROTTLE(2.0, "[CoverageSearch] No safe rolling successor; "
+                          "retain old trajectory and retry from a later handoff state.");
+    }
+    completed_pending_traj_ = PendingTrajectory();
+    return false;
+}
+
 bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
-                                                      bool handoff_at_terminal) {
+                                                      bool handoff_at_terminal,
+                                                      double frozen_handoff_time) {
     if (!rolling_snapshot_mode_) {
-        if (!rolling_worker_running_ && rolling_worker_.joinable()) {
-            rolling_worker_.join();
-        }
-        {
-            std::lock_guard<std::mutex> lock(rolling_result_mutex_);
-            if (completed_pending_traj_.frontier_generation != 0) {
-                if (completed_pending_traj_.ready &&
-                    completed_pending_traj_.source_generation == rolling_generation_ &&
-                    has_traj_ && has_goal_) {
-                    pending_traj_ = std::move(completed_pending_traj_);
-                    completed_pending_traj_ = PendingTrajectory();
-                    return true;
-                }
-                if (completed_pending_traj_.ready) {
-                    rolling_replan_requested_ = true;
-                } else {
-                    ROS_WARN_THROTTLE(2.0, "[CoverageSearch] No safe rolling successor; "
-                                      "retain old trajectory and retry from a later handoff state.");
-                    rolling_replan_requested_ = true;
-                }
-                completed_pending_traj_ = PendingTrajectory();
-            }
-        }
+        if (collectCompletedRollingResult()) return true;
 
         if (!has_traj_ || !has_goal_ || (!force_new_goal && !active_goal_frontier_valid_) ||
             pending_traj_.ready || rolling_worker_running_ ||
@@ -81,16 +84,19 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
             return false;
         }
         const ros::Time now = ros::Time::now();
-        const double elapsed = std::max(0.0, (now - traj_start_time_).toSec());
+        const double elapsed = currentTrajectoryTime();
         const double remaining = active_time_spline_.duration - elapsed;
-        const double handoff_lead = std::max(0.01, replan_time_);
-        if (remaining <= handoff_lead) return false;
+        const double handoff_lead = rollingHandoffLead();
+        if (!handoff_at_terminal && remaining <= handoff_lead) return false;
         const bool periodic_due = elapsed >= kRollingPeriodicInterval &&
             (rolling_last_attempt_time_.isZero() ||
              (now - rolling_last_attempt_time_).toSec() >= kRollingPeriodicInterval);
         const bool terminal_due = remaining <= 0.50;
         if (handoff_at_terminal && !periodic_due) return false;
-        if (!force_new_goal && !periodic_due && !terminal_due) return false;
+        // Frontier callbacks only coalesce a request.  Do not launch another
+        // worker every map tick; the 0.30 s rolling cadence is the minimum
+        // execution window for the current successor.
+        if (!periodic_due && !terminal_due) return false;
         const uint64_t frontier_generation = frontier_finder_.update_generation_;
 
         // 工作线程只接触这一时刻的地图、前沿和活动轨迹副本；主线程继续发布旧轨迹。
@@ -99,6 +105,9 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
         planner->frontier_finder_ = frontier_finder_;
         planner->frontier_finder_.setMap(&planner->coverage_map_);
         planner->astar2d_.init(&planner->coverage_map_);
+        planner->astar2d_.setPlanningClearance(trajectory_plan_clearance_);
+        planner->kino_astar2d_.init(&planner->coverage_map_);
+        planner->kino_astar2d_.setPlanningClearance(trajectory_plan_clearance_);
         planner->uav_id_ = uav_id_;
         planner->uav_pos_ = uav_pos_;
         planner->uav_vel_ = uav_vel_;
@@ -109,7 +118,7 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
         planner->max_acc_ = max_acc_;
         planner->max_yaw_rate_ = max_yaw_rate_;
         planner->max_yaw_acc_ = max_yaw_acc_;
-        planner->replan_time_ = replan_time_;
+        planner->trajectory_plan_clearance_ = trajectory_plan_clearance_;
         planner->goal_reach_dist_ = goal_reach_dist_;
         planner->sim_mode_ = sim_mode_;
         planner->cooperative_mode_ = cooperative_mode_;
@@ -118,6 +127,10 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
         planner->atsp_refine_clusters_ = atsp_refine_clusters_;
         planner->atsp_viewpoints_per_cluster_ = atsp_viewpoints_per_cluster_;
         planner->atsp_edge_timeout_ms_ = atsp_edge_timeout_ms_;
+        planner->atsp_planning_budget_ms_ = atsp_planning_budget_ms_;
+        planner->atsp_goal_switch_min_distance_ = atsp_goal_switch_min_distance_;
+        planner->atsp_goal_switch_min_ratio_ = atsp_goal_switch_min_ratio_;
+        planner->kinodynamic_corridor_radius_ = kinodynamic_corridor_radius_;
         planner->local_swarm_tasks_ = local_swarm_tasks_;
         planner->remote_swarm_tasks_ = remote_swarm_tasks_;
         planner->local_swarm_frontiers_ = local_swarm_frontiers_;
@@ -154,11 +167,16 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
         planner->frontier_targets_ = frontier_targets_;
         planner->frontier_target_yaws_ = frontier_target_yaws_;
         planner->frontier_target_task_ids_ = frontier_target_task_ids_;
+        planner->atsp_tour_visualization_ = atsp_tour_visualization_;
         planner->frontier_target_idx_ = frontier_target_idx_;
-        planner->local_discovery_priority_task_id_ = local_discovery_priority_task_id_;
+        planner->local_continuation_task_id_ = local_continuation_task_id_;
+        planner->local_continuation_confidence_ = local_continuation_confidence_;
+        planner->rolling_replan_reason_ = rolling_replan_reason_;
         planner->atsp_tour_active_ = atsp_tour_active_;
         planner->start_time_ = start_time_;
         planner->goal_commit_time_ = goal_commit_time_;
+        planner->goal_deadline_sec_ = goal_deadline_sec_;
+        planner->planned_goal_travel_time_ = planned_goal_travel_time_;
         planner->same_goal_replan_count_ = same_goal_replan_count_;
         planner->traj_step_size_ = traj_step_size_;
         planner->traj_advance_dist_ = traj_advance_dist_;
@@ -166,15 +184,27 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
         planner->traj_cut_clearance_ = traj_cut_clearance_;
         planner->rolling_prepare_in_progress_ = false;
         planner->rolling_snapshot_mode_ = true;
+        frozen_handoff_time = handoff_at_terminal ? active_time_spline_.duration
+            : elapsed + handoff_lead;
+        if (frozen_handoff_time > active_time_spline_.duration) return false;
+        ROS_INFO("[RollingDispatch][UAV%d] trigger=%s lead=%.2fs old_remaining=%.2fs "
+                 "handoff=%.2fs.", uav_id_,
+                 rolling_replan_reason_.empty() ? "unspecified" :
+                    rolling_replan_reason_.c_str(),
+                 handoff_lead, remaining, frozen_handoff_time);
         rolling_last_attempt_time_ = now;
         ++rolling_replan_count_;
         rolling_worker_running_ = true;
         const uint64_t source_generation = rolling_generation_;
+        // Updates arriving after this point set the flag again and become one
+        // coalesced follow-up solve; they do not cancel this safe successor.
+        rolling_replan_requested_ = false;
         try {
             rolling_worker_ = std::thread([this, planner, source_generation,
                                            frontier_generation, force_new_goal,
-                                           handoff_at_terminal]() {
-                planner->tryPrepareRollingHandoff(force_new_goal, handoff_at_terminal);
+                                           handoff_at_terminal, frozen_handoff_time]() {
+                planner->tryPrepareRollingHandoff(force_new_goal, handoff_at_terminal,
+                                                  frozen_handoff_time);
                 PendingTrajectory result = std::move(planner->pending_traj_);
                 result.result_ready_time = ros::Time::now();
                 result.source_generation = source_generation;
@@ -199,12 +229,10 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
 
     const auto rolling_start = std::chrono::steady_clock::now();
     const int n = (int)traj_points_.size();
-    const double elapsed = std::max(0.0, (ros::Time::now() - traj_start_time_).toSec());
-    // While the final ATSP target is still being executed, prepare the next
-    // tour from its terminal state so that the observation is not cut short.
-    // Ordinary rolling handoffs retain the 0.25 s look-ahead.
-    const double handoff_time = handoff_at_terminal ? active_time_spline_.duration :
-        elapsed + std::max(0.01, replan_time_);
+    // This single frozen time defines the state used by ATSP, path planning,
+    // trajectory generation and activation.  Do not choose a different state later.
+    const double handoff_time = frozen_handoff_time >= 0.0 ? frozen_handoff_time :
+        (handoff_at_terminal ? active_time_spline_.duration : rollingHandoffLead());
     if (handoff_time > active_time_spline_.duration) return false;
     const int handoff_idx = std::min(n - 1, std::max(0, (int)std::lround(
         handoff_time / std::max(1e-3, active_time_spline_.duration) * (n - 1))));
@@ -249,10 +277,14 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
     const std::vector<Eigen::Vector3d> old_frontier_targets = frontier_targets_;
     const std::vector<double> old_frontier_yaws = frontier_target_yaws_;
     const std::vector<uint64_t> old_frontier_task_ids = frontier_target_task_ids_;
+    const std::vector<Eigen::Vector3d> old_atsp_tour_visualization =
+        atsp_tour_visualization_;
     const int old_frontier_idx = frontier_target_idx_;
     const uint64_t old_goal_task_id = current_goal_task_id_;
     const int old_same_goal_replans = same_goal_replan_count_;
     const ros::Time old_goal_commit = goal_commit_time_;
+    const double old_goal_deadline = goal_deadline_sec_;
+    const double old_planned_goal_travel_time = planned_goal_travel_time_;
     const bool old_has_failed_goal = has_failed_goal_;
     const Eigen::Vector3d old_failed_goal = failed_goal_;
     const ros::Time old_failed_goal_time = failed_goal_time_;
@@ -300,11 +332,8 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
     }
     has_goal_ = successor_selected;
     astar2d_.setSearchTimeout(50.0);
-    const auto path_start = std::chrono::steady_clock::now();
-    const bool path_found = successor_selected && planPathToGoal();
-    const auto path_end = std::chrono::steady_clock::now();
+    const bool path_found = successor_selected && planExecutableTrajectoryToGoal();
     if (path_found) {
-        generateBsplineTraj();
         if (has_traj_ && active_time_spline_.valid) {
             prepared.ready = true;
             prepared.handoff_idx = handoff_idx;
@@ -318,11 +347,14 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
             prepared.accs = traj_accs_;
             prepared.yaws = traj_yaws_;
             prepared.time_spline = active_time_spline_;
+            prepared.expected_goal_travel_time = planned_goal_travel_time_;
             prepared.frontier_targets = frontier_targets_;
             prepared.frontier_target_yaws = frontier_target_yaws_;
             prepared.frontier_target_task_ids = frontier_target_task_ids_;
+            prepared.atsp_tour_visualization = atsp_tour_visualization_;
             prepared.frontier_target_idx = frontier_target_idx_;
             prepared.atsp_tour_active = atsp_tour_active_;
+            prepared.trigger_reason = rolling_replan_reason_;
         }
     }
     astar2d_.setSearchTimeout(250.0);
@@ -351,10 +383,13 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
     frontier_targets_ = old_frontier_targets;
     frontier_target_yaws_ = old_frontier_yaws;
     frontier_target_task_ids_ = old_frontier_task_ids;
+    atsp_tour_visualization_ = old_atsp_tour_visualization;
     frontier_target_idx_ = old_frontier_idx;
     current_goal_task_id_ = old_goal_task_id;
     same_goal_replan_count_ = old_same_goal_replans;
     goal_commit_time_ = old_goal_commit;
+    goal_deadline_sec_ = old_goal_deadline;
+    planned_goal_travel_time_ = old_planned_goal_travel_time;
     has_failed_goal_ = old_has_failed_goal;
     failed_goal_ = old_failed_goal;
     failed_goal_time_ = old_failed_goal_time;
@@ -366,13 +401,14 @@ bool CoverageSearchManager::tryPrepareRollingHandoff(bool force_new_goal,
 
     const double planning_ms = std::chrono::duration<double, std::milli>(
         restore_end - rolling_start).count();
-    if (!prepared.ready) {
-        ROS_WARN("[CoverageSearch] Rolling preplan failed after %.1f ms; retain old trajectory.",
-                 planning_ms);
+    prepared.planning_duration_ms = planning_ms;
+    const bool ready = prepared.ready;
+    pending_traj_ = std::move(prepared);
+    if (!ready) {
+        ROS_WARN("[CoverageSearch][UAV%d] Rolling preplan failed after %.1f ms; "
+                 "retain old trajectory.", uav_id_, planning_ms);
         return false;
     }
-
-    pending_traj_ = std::move(prepared);
     return true;
 }
 
@@ -477,13 +513,17 @@ bool CoverageSearchManager::selectAtspTour() {
     frontier_targets_.clear();
     frontier_target_yaws_.clear();
     frontier_target_task_ids_.clear();
+    atsp_tour_visualization_.clear();
     frontier_target_idx_ = 0;
     atsp_tour_active_ = false;
 
     std::vector<Cluster> clusters;
+    int peer_owned = 0, no_lease = 0, no_view = 0;
+    int unsafe_views = 0, occluded_views = 0;
     for (auto &frontier : frontier_finder_.frontiers_) {
-        if (!hasConfirmedSelfLease(frontier) || isFrontierLeasedToPeer(frontier) ||
-            frontier.viewpoints.empty()) continue;
+        if (isFrontierLeasedToPeer(frontier)) { ++peer_owned; continue; }
+        if (!hasConfirmedSelfLease(frontier)) { ++no_lease; continue; }
+        if (frontier.viewpoints.empty()) { ++no_view; continue; }
         std::vector<Viewpoint> viewpoints;
         for (size_t view = 0; view < frontier.viewpoints.size() && view < 3; ++view) {
             const Eigen::Vector3d &point = frontier.viewpoints[view];
@@ -491,15 +531,22 @@ bool CoverageSearchManager::selectAtspTour() {
             coverage_map_.posToIndex(point, index);
             const double yaw = view < frontier.viewpoint_yaws.size()
                 ? frontier.viewpoint_yaws[view] : uav_yaw_;
-            if (coverage_map_.isInMap2D(index(0), index(1)) &&
-                coverage_map_.isFree2D(index(0), index(1)) &&
-                coverage_map_.getDistance2D(index(0), index(1)) + 1e-3 >=
-                    requiredTrajectoryClearance(point, traj_cut_clearance_) &&
-                frontier_finder_.isViewpointVisible(frontier, point, yaw)) {
-                viewpoints.push_back({point, yaw});
+            const double hard_clearance = requiredTrajectoryClearance(
+                point, traj_cut_clearance_);
+            if (!coverage_map_.isInMap2D(index(0), index(1)) ||
+                !coverage_map_.isFree2D(index(0), index(1)) ||
+                coverage_map_.getDistance2D(index(0), index(1)) + 1e-3 <
+                    hard_clearance) {
+                ++unsafe_views;
+                continue;
             }
+            if (!frontier_finder_.isViewpointVisible(frontier, point, yaw)) {
+                ++occluded_views;
+                continue;
+            }
+            viewpoints.push_back({point, yaw});
         }
-        if (viewpoints.empty()) continue;
+        if (viewpoints.empty()) { ++no_view; continue; }
         clusters.push_back({viewpoints, frontierTaskId(frontier),
                             (viewpoints.front().point.head<2>() - uav_pos_.head<2>()).norm()});
     }
@@ -511,18 +558,22 @@ bool CoverageSearchManager::selectAtspTour() {
                   [&](const Cluster &cluster) {
                       return !selected_task_ids.insert(cluster.task_id).second;
                   }), clusters.end());
-    const auto priority = std::find_if(clusters.begin(), clusters.end(),
-        [&](const Cluster &cluster) {
-            return cluster.task_id == local_discovery_priority_task_id_;
-        });
-    if (priority != clusters.end()) {
-        const Cluster local_priority = *priority;
-        clusters.erase(priority);
-        clusters.insert(clusters.begin(), local_priority);
-    }
+    const bool incumbent_valid = current_goal_task_id_ != 0 &&
+        isAtspTargetValid(current_goal_, current_goal_yaw_, current_goal_task_id_);
+    const uint64_t required_task_id = incumbent_valid ? current_goal_task_id_ : 0;
+    // Keep only the valid incumbent in the bounded five-cluster snapshot.
+    // Continuations must first qualify as one of the nearest five, then their
+    // finite initial-edge reward may change the ATSP order.
+    const auto required = std::find_if(clusters.begin(), clusters.end(),
+        [&](const Cluster &cluster) { return cluster.task_id == required_task_id; });
+    if (required != clusters.end()) std::rotate(clusters.begin(), required, required + 1);
     if (static_cast<int>(clusters.size()) > atsp_max_clusters_)
         clusters.resize(atsp_max_clusters_);
     if (clusters.empty()) {
+        ROS_WARN_THROTTLE(2.0,
+            "[CoverageSearch][UAV%d] No ATSP candidate: peer_owned=%d no_self_lease=%d "
+            "no_view=%d unsafe_views=%d occluded_views=%d.",
+            uav_id_, peer_owned, no_lease, no_view, unsafe_views, occluded_views);
         log_atsp(false, "no leased viewpoints", 0);
         return false;
     }
@@ -547,14 +598,43 @@ bool CoverageSearchManager::selectAtspTour() {
         return computeTransitionCost(from_pos, from_vel, from_yaw, to_pos, to_yaw,
                                      length, direction);
     };
+    const auto initial_edge_cost = [&](const Cluster &cluster,
+                                       const Viewpoint &viewpoint) {
+        double cost = edge_cost(uav_pos_, uav_vel_, uav_yaw_,
+                                viewpoint.point, viewpoint.yaw);
+        if (!incumbent_valid && cluster.task_id == local_continuation_task_id_ &&
+            std::isfinite(cost)) {
+            cost = std::max(0.0, cost - 0.50 * local_continuation_confidence_);
+        }
+        return cost;
+    };
 
     astar2d_.setSearchTimeout(atsp_edge_timeout_ms_);
     std::vector<Cluster> reachable;
-    for (const auto &cluster : clusters) {
-        if (std::isfinite(edge_cost(uav_pos_, uav_vel_, uav_yaw_,
-                                    cluster.viewpoints.front().point,
-                                    cluster.viewpoints.front().yaw)))
-            reachable.push_back(cluster);
+    for (Cluster cluster : clusters) {
+        size_t reachable_view = cluster.viewpoints.size();
+        for (size_t view = 0; view < cluster.viewpoints.size(); ++view) {
+            if (std::isfinite(edge_cost(uav_pos_, uav_vel_, uav_yaw_,
+                                        cluster.viewpoints[view].point,
+                                        cluster.viewpoints[view].yaw))) {
+                reachable_view = view;
+                break;
+            }
+        }
+        if (reachable_view == cluster.viewpoints.size()) {
+            ROS_WARN("[CoverageSearch][UAV%d] Task=%llu: all three viewpoints failed geometric A*.",
+                     uav_id_, static_cast<unsigned long long>(cluster.task_id));
+            continue;
+        }
+        if (reachable_view > 0) {
+            std::rotate(cluster.viewpoints.begin(),
+                        cluster.viewpoints.begin() + reachable_view,
+                        cluster.viewpoints.begin() + reachable_view + 1);
+            ROS_INFO("[CoverageSearch][UAV%d] Task=%llu: first viewpoint A* failed; "
+                     "ATSP uses viewpoint %zu.", uav_id_,
+                     static_cast<unsigned long long>(cluster.task_id), reachable_view + 1);
+        }
+        reachable.push_back(std::move(cluster));
     }
     clusters.swap(reachable);
     const int count = static_cast<int>(clusters.size());
@@ -567,9 +647,7 @@ bool CoverageSearchManager::selectAtspTour() {
     std::vector<std::vector<double>> matrix(
         count + 1, std::vector<double>(count + 1, 0.0));
     for (int i = 0; i < count; ++i) {
-        matrix[0][i + 1] = edge_cost(uav_pos_, uav_vel_, uav_yaw_,
-                                     clusters[i].viewpoints.front().point,
-                                     clusters[i].viewpoints.front().yaw);
+        matrix[0][i + 1] = initial_edge_cost(clusters[i], clusters[i].viewpoints.front());
         for (int j = 0; j < count; ++j) {
             if (i == j) continue;
             matrix[i + 1][j + 1] = edge_cost(
@@ -589,14 +667,6 @@ bool CoverageSearchManager::selectAtspTour() {
         ROS_WARN_THROTTLE(2.0, "[CoverageSearch] No safe open ATSP route for current leased tasks.");
         log_atsp(false, "open tour unavailable", clusters.size());
         return false;
-    }
-    if (local_discovery_priority_task_id_ != 0) {
-        const auto priority_order = std::find_if(order.begin(), order.end(),
-            [&](int index) { return clusters[index].task_id == local_discovery_priority_task_id_; });
-        if (priority_order != order.end()) {
-            std::rotate(order.begin(), priority_order, priority_order + 1);
-            local_discovery_priority_task_id_ = 0;
-        }
     }
     std::vector<Cluster> tour;
     tour.reserve(order.size());
@@ -619,8 +689,7 @@ bool CoverageSearchManager::selectAtspTour() {
         costs[0].assign(layers[0].size(), inf);
         parents[0].assign(layers[0].size(), -1);
         for (size_t view = 0; view < layers[0].size(); ++view) {
-            costs[0][view] = edge_cost(uav_pos_, uav_vel_, uav_yaw_,
-                                       layers[0][view].point, layers[0][view].yaw);
+            costs[0][view] = initial_edge_cost(tour[0], layers[0][view]);
         }
         for (int layer = 1; layer < refine_count; ++layer) {
             costs[layer].assign(layers[layer].size(), inf);
@@ -653,14 +722,59 @@ bool CoverageSearchManager::selectAtspTour() {
     }
 
     ROS_ASSERT(!tour.empty());
-    // FUEL semantics: ATSP only ranks the present frontier snapshot.  The
-    // executable plan contains its first refined target; every replan solves
-    // a new tour instead of consuming an old B/C/D suffix.
-    const auto &next_target = tour.front();
-    frontier_targets_.push_back(next_target.viewpoints.front().point);
-    frontier_target_yaws_.push_back(next_target.viewpoints.front().yaw);
-    frontier_target_task_ids_.push_back(next_target.task_id);
+    // FUEL semantics: ATSP ranks the current snapshot and only its first task
+    // is executable.  Add hysteresis after the fresh solve so two similarly
+    // priced frontiers cannot pull the aircraft back and forth.
+    const Cluster *next_target = &tour.front();
+    Eigen::Vector3d selected_point = next_target->viewpoints.front().point;
+    double selected_yaw = next_target->viewpoints.front().yaw;
+    uint64_t selected_task_id = next_target->task_id;
+    std::string decision = "atsp_first";
+
+    if (incumbent_valid) {
+        bool keep_incumbent = selected_task_id == current_goal_task_id_;
+        if (!keep_incumbent) {
+            const auto pathLength = [&](const Eigen::Vector3d &goal, double &length) {
+                if (astar2d_.isPathTraversable(uav_pos_, goal, &length)) return true;
+                astar2d_.setSearchTimeout(40.0);
+                std::vector<Eigen::Vector3d> path;
+                return astar2d_.search(uav_pos_, goal, path, &length) && !path.empty();
+            };
+            double incumbent_length = 0.0, proposed_length = 0.0;
+            const bool lengths_valid = pathLength(current_goal_, incumbent_length) &&
+                pathLength(selected_point, proposed_length);
+            keep_incumbent = !lengths_valid || !shouldSwitchAtspGoal(
+                incumbent_length, proposed_length,
+                atsp_goal_switch_min_distance_, atsp_goal_switch_min_ratio_);
+            decision = keep_incumbent ? "incumbent_hysteresis" : "shorter_path";
+        } else {
+            decision = "incumbent_atsp_first";
+        }
+        astar2d_.setSearchTimeout(250.0);
+        if (keep_incumbent) {
+            selected_point = current_goal_;
+            selected_yaw = current_goal_yaw_;
+            selected_task_id = current_goal_task_id_;
+        }
+    } else if (selected_task_id == local_continuation_task_id_ &&
+               local_continuation_confidence_ >= 0.55) {
+        decision = "continuation_reward";
+    }
+
+    atsp_tour_visualization_.push_back(selected_point);
+    for (const auto &cluster : tour) {
+        if (cluster.task_id != selected_task_id)
+            atsp_tour_visualization_.push_back(cluster.viewpoints.front().point);
+    }
+    frontier_targets_.push_back(selected_point);
+    frontier_target_yaws_.push_back(selected_yaw);
+    frontier_target_task_ids_.push_back(selected_task_id);
     atsp_tour_active_ = true;
+    ROS_INFO("[ATSPDecision][UAV%d] previous_task=%llu selected_task=%llu "
+             "reason=%s clusters=%zu.", uav_id_,
+             static_cast<unsigned long long>(current_goal_task_id_),
+             static_cast<unsigned long long>(selected_task_id),
+             decision.c_str(), tour.size());
     log_atsp(true, "first task selected", tour.size());
     return true;
 }
@@ -1010,14 +1124,245 @@ bool CoverageSearchManager::selectNextFrontier() {
 bool CoverageSearchManager::planPathToGoal() {
     if (!has_goal_) return false;
 
-    // 所有正常任务都经过带低净空代价的 A*，不能因一条仅满足硬阈值的
-    // 直线而贴墙飞行。直线段检查仍只用于执行期安全验证。
-    bool found = astar2d_.search(uav_pos_, current_goal_, astar_path_);
-    if (found && !astar_path_.empty()) {
-        astar_path_idx_ = 0;
-        return true;
+    std::vector<Eigen::Vector3d> global_path;
+    if (!astar2d_.search(uav_pos_, current_goal_, global_path) ||
+        global_path.size() < 2) {
+        const char *reason = "no path";
+        if (astar2d_.lastFailureReason() == Astar2D::ASTAR_ENDPOINT_BLOCKED)
+            reason = "viewpoint blocked or below hard clearance";
+        else if (astar2d_.lastFailureReason() == Astar2D::ASTAR_TIMEOUT)
+            reason = "geometric A* timeout";
+        else if (astar2d_.lastFailureReason() == Astar2D::ASTAR_UNKNOWN_REJECTED)
+            reason = "geometric A* unknown-space rejection";
+        ROS_WARN("[CoverageSearch][UAV%d] Viewpoint geometric A* failed: %s, task=%llu.",
+                 uav_id_, reason, static_cast<unsigned long long>(current_goal_task_id_));
+        return false;
     }
 
+    // Keep one bounded planning horizon.  As in FUEL, very short and far paths
+    // use the geometric corridor; only 1.5--5m paths try state-space search.
+    std::vector<double> arc(global_path.size(), 0.0);
+    for (size_t i = 1; i < global_path.size(); ++i)
+        arc[i] = arc[i - 1] + (global_path[i] - global_path[i - 1]).head<2>().norm();
+    const double global_length = arc.back();
+    Eigen::Vector3d initial_path_direction = global_path[1] - global_path[0];
+    initial_path_direction(2) = 0.0;
+    planned_goal_travel_time_ = computeTransitionCost(
+        uav_pos_, uav_vel_, uav_yaw_, current_goal_, current_goal_yaw_,
+        global_length, initial_path_direction);
+    const double local_length = std::min(5.0, global_length);
+    size_t tail_index = 1;
+    while (tail_index < arc.size() && arc[tail_index] < local_length) ++tail_index;
+    tail_index = std::min(tail_index, arc.size() - 1);
+    const double segment = std::max(1e-6, arc[tail_index] - arc[tail_index - 1]);
+    Eigen::Vector3d local_goal = global_path[tail_index - 1] +
+        (local_length - arc[tail_index - 1]) / segment *
+        (global_path[tail_index] - global_path[tail_index - 1]);
+    local_goal(2) = fly_height_;
+
+    std::vector<Eigen::Vector3d> geometric_horizon(
+        global_path.begin(), global_path.begin() + tail_index);
+    if (geometric_horizon.empty() ||
+        (geometric_horizon.back() - local_goal).head<2>().norm() > 1e-3) {
+        geometric_horizon.push_back(local_goal);
+    } else {
+        geometric_horizon.back() = local_goal;
+    }
+
+    if (global_length < 1.5 || global_length > 5.0) {
+        astar_path_ = std::move(geometric_horizon);
+        astar_path_idx_ = 0;
+        return astar_path_.size() >= 2;
+    }
+
+    std::vector<Eigen::Vector3d> local_path;
+    const Eigen::Vector3d start_acc = planning_start_state_valid_
+        ? planning_start_acc_ : Eigen::Vector3d::Zero();
+    const double kino_timeout_ms = rolling_prepare_in_progress_ ? 80.0 : 100.0;
+    if (!kino_astar2d_.search(uav_pos_, uav_vel_, start_acc,
+                              local_goal, Eigen::Vector3d::Zero(),
+                              max_vel_, max_acc_, kino_timeout_ms, local_path,
+                              &geometric_horizon, kinodynamic_corridor_radius_)) {
+        const char *reason = "no path";
+        if (kino_astar2d_.lastFailureReason() == KinodynamicAstar2D::KINO_ENDPOINT_BLOCKED)
+            reason = "endpoint blocked or below hard clearance";
+        else if (kino_astar2d_.lastFailureReason() == KinodynamicAstar2D::KINO_TIMEOUT)
+            reason = "timeout";
+        if (kino_astar2d_.lastFailureReason() != KinodynamicAstar2D::KINO_TIMEOUT) {
+            ROS_WARN("[CoverageSearch][UAV%d] Viewpoint kinodynamic A* failed: %s, "
+                     "task=%llu; try another representative view.", uav_id_, reason,
+                     static_cast<unsigned long long>(current_goal_task_id_));
+            return false;
+        }
+        ROS_WARN("[CoverageSearch][UAV%d] Kinodynamic A* timed out after %.0fms for "
+                 "task=%llu; use the hard-safe geometric A* horizon as B-spline guide.",
+                 uav_id_, kino_timeout_ms,
+                 static_cast<unsigned long long>(current_goal_task_id_));
+        local_path = std::move(geometric_horizon);
+    }
+
+    astar_path_ = std::move(local_path);
+    astar_path_idx_ = 0;
+    return astar_path_.size() >= 2;
+}
+
+bool CoverageSearchManager::planExecutableTrajectoryToGoal() {
+    if (!has_goal_) return false;
+    struct Candidate { Eigen::Vector3d point; double yaw; };
+    std::vector<Candidate> candidates{{current_goal_, current_goal_yaw_}};
+    if (current_goal_task_id_ != 0) {
+        for (const auto &frontier : frontier_finder_.frontiers_) {
+            if (frontierTaskId(frontier) != current_goal_task_id_) continue;
+            for (size_t i = 0; i < frontier.viewpoints.size() && i < 3; ++i) {
+                const Eigen::Vector3d &point = frontier.viewpoints[i];
+                const double yaw = i < frontier.viewpoint_yaws.size()
+                    ? frontier.viewpoint_yaws[i] : current_goal_yaw_;
+                if (!frontier_finder_.isViewpointVisible(frontier, point, yaw)) {
+                    ROS_WARN("[CoverageSearch][UAV%d] Reject task=%llu view=%zu: line of sight blocked.",
+                             uav_id_, static_cast<unsigned long long>(current_goal_task_id_), i + 1);
+                    continue;
+                }
+                Eigen::Vector3i index;
+                coverage_map_.posToIndex(point, index);
+                const double hard_clearance = requiredTrajectoryClearance(
+                    point, traj_cut_clearance_);
+                if (!coverage_map_.isInMap2D(index(0), index(1)) ||
+                    !coverage_map_.isFree2D(index(0), index(1)) ||
+                    coverage_map_.getDistance2D(index(0), index(1)) + 1e-3 <
+                        hard_clearance) {
+                    ROS_WARN("[CoverageSearch][UAV%d] Reject task=%llu view=%zu: clearance below %.2fm.",
+                             uav_id_, static_cast<unsigned long long>(current_goal_task_id_),
+                             i + 1, hard_clearance);
+                    continue;
+                }
+                const bool duplicate = std::any_of(candidates.begin(), candidates.end(),
+                    [&](const Candidate &candidate) {
+                        return (candidate.point - point).head<2>().norm() < 0.05;
+                    });
+                if (!duplicate) candidates.push_back({point, yaw});
+            }
+            break;
+        }
+    }
+
+    const bool saved_start_valid = planning_start_state_valid_;
+    const Eigen::Vector3d saved_start_acc = planning_start_acc_;
+    const double saved_yaw_rate = planning_start_yaw_rate_;
+    const double saved_yaw_acc = planning_start_yaw_acc_;
+    const Eigen::Vector3d original_goal = current_goal_;
+    const double original_goal_yaw = current_goal_yaw_;
+    for (size_t view = 0; view < candidates.size() && view < 3; ++view) {
+        current_goal_ = candidates[view].point;
+        current_goal_(2) = fly_height_;
+        current_goal_yaw_ = candidates[view].yaw;
+        planning_start_state_valid_ = saved_start_valid;
+        planning_start_acc_ = saved_start_acc;
+        planning_start_yaw_rate_ = saved_yaw_rate;
+        planning_start_yaw_acc_ = saved_yaw_acc;
+        has_traj_ = false;
+        if (!planPathToGoal()) continue;
+        const double semantic_goal_yaw = current_goal_yaw_;
+        if ((astar_path_.back() - current_goal_).head<2>().norm() > 0.30 &&
+            astar_path_.size() >= 2) {
+            Eigen::Vector3d terminal_direction = astar_path_.back() -
+                astar_path_[astar_path_.size() - 2];
+            terminal_direction(2) = 0.0;
+            if (terminal_direction.norm() > 1e-3)
+                current_goal_yaw_ = std::atan2(terminal_direction(1), terminal_direction(0));
+        }
+        generateBsplineTraj();
+        current_goal_yaw_ = semantic_goal_yaw;
+        if ((!has_traj_ || !active_time_spline_.valid) &&
+            last_bspline_failure_reason_.find("free_support_budget_exhausted") !=
+                std::string::npos) {
+            const double retry_clearance = trajectory_plan_clearance_ + 0.10;
+            astar2d_.setPlanningClearance(retry_clearance);
+            kino_astar2d_.setPlanningClearance(retry_clearance);
+            planning_start_state_valid_ = saved_start_valid;
+            planning_start_acc_ = saved_start_acc;
+            planning_start_yaw_rate_ = saved_yaw_rate;
+            planning_start_yaw_acc_ = saved_yaw_acc;
+            if (planPathToGoal()) {
+                if ((astar_path_.back() - current_goal_).head<2>().norm() > 0.30 &&
+                    astar_path_.size() >= 2) {
+                    Eigen::Vector3d direction = astar_path_.back() -
+                        astar_path_[astar_path_.size() - 2];
+                    if (direction.head<2>().norm() > 1e-3)
+                        current_goal_yaw_ = std::atan2(direction(1), direction(0));
+                }
+                generateBsplineTraj();
+                current_goal_yaw_ = semantic_goal_yaw;
+            }
+            astar2d_.setPlanningClearance(trajectory_plan_clearance_);
+            kino_astar2d_.setPlanningClearance(trajectory_plan_clearance_);
+            if (has_traj_ && active_time_spline_.valid) {
+                ROS_INFO("[CoverageSearch][UAV%d] Task=%llu view=%zu accepted after "
+                         "raising A* guide clearance to %.2fm.", uav_id_,
+                         static_cast<unsigned long long>(current_goal_task_id_),
+                         view + 1, retry_clearance);
+            }
+        }
+        if (has_traj_ && active_time_spline_.valid) {
+            if (view > 0) {
+                ROS_INFO("[CoverageSearch][UAV%d] Task=%llu uses reachable backup view=%zu.",
+                         uav_id_, static_cast<unsigned long long>(current_goal_task_id_), view + 1);
+            }
+            return true;
+        }
+        ROS_WARN("[CoverageSearch][UAV%d] Reject task=%llu view=%zu: B-spline optimization failed.",
+                 uav_id_, static_cast<unsigned long long>(current_goal_task_id_), view + 1);
+    }
+    // With no old spline to retain, brake along the measured velocity instead
+    // of truncating and retrying the same rejected viewpoint spline.
+    if (!rolling_prepare_in_progress_ && uav_vel_.head<2>().norm() > 0.15) {
+        const double braking_distance = terminalBrakingDistance();
+        Eigen::Vector3d stop = uav_pos_;
+        stop.head<2>() += braking_distance * uav_vel_.head<2>().normalized();
+        stop(2) = fly_height_;
+        if (!pathToTargetBlocked(stop, uav_pos_, traj_cut_clearance_)) {
+            astar_path_ = {uav_pos_, stop};
+            astar_path_.front()(2) = fly_height_;
+            current_goal_yaw_ = uav_yaw_;
+            planning_start_state_valid_ = true;
+            planning_start_acc_.setZero();
+            planning_start_yaw_rate_ = realtime_yaw_rate_ref_.load();
+            planning_start_yaw_acc_ = 0.0;
+            generateBsplineTraj();
+            current_goal_ = original_goal;
+            current_goal_yaw_ = original_goal_yaw;
+            if (has_traj_ && active_time_spline_.valid) {
+                rolling_replan_requested_ = true;
+                ROS_WARN("[CoverageSearch][UAV%d] No viewpoint spline is executable; "
+                         "execute %.2fm measured-state braking spline and replan.",
+                         uav_id_, braking_distance);
+                return true;
+            }
+        } else {
+            ROS_WARN("[CoverageSearch][UAV%d] Measured-state braking corridor is blocked; "
+                     "do not create an unsafe recovery spline.", uav_id_);
+        }
+    }
+    current_goal_ = original_goal;
+    current_goal_yaw_ = original_goal_yaw;
+    planning_start_state_valid_ = saved_start_valid;
+    planning_start_acc_ = saved_start_acc;
+    planning_start_yaw_rate_ = saved_yaw_rate;
+    planning_start_yaw_acc_ = saved_yaw_acc;
+    has_traj_ = false;
+    bool refreshed = false;
+    if (!rolling_snapshot_mode_) {
+        for (auto &frontier : frontier_finder_.frontiers_) {
+            if (frontierTaskId(frontier) != current_goal_task_id_) continue;
+            frontier_finder_.refreshViewpoints(frontier, uav_pos_);
+            refreshed = true;
+            break;
+        }
+    }
+    ROS_WARN("[CoverageSearch][UAV%d] Task=%llu has no executable trajectory in its three "
+             "views; viewpoint refresh=%s, retry on next planning snapshot.", uav_id_,
+             static_cast<unsigned long long>(current_goal_task_id_),
+             refreshed ? "completed" :
+                 (rolling_snapshot_mode_ ? "deferred to next map snapshot" : "task entity missing"));
     return false;
 }
 // 三项均为时间、权重均为1，最终取瓶颈最大值。
@@ -1038,9 +1383,11 @@ double CoverageSearchManager::computeFrontierCost(const Eigen::Vector3d &vp,
     if (path_dir.norm() < 1e-3) path_dir = vp - uav_pos_;
     path_dir(2) = 0.0;
     if (vel.norm() > 0.1 && path_dir.norm() > 1e-3) {
-        double dot = vel.normalized().dot(path_dir.normalized());
-        double direction_diff = acos(std::min(1.0, std::max(-1.0, dot)));
-        direction_time = direction_diff / std::max(0.1, max_yaw_rate_);
+        path_dir.normalize();
+        const double parallel = vel.dot(path_dir);
+        const Eigen::Vector3d velocity_to_remove =
+            vel - std::max(0.0, parallel) * path_dir;
+        direction_time = velocity_to_remove.norm() / std::max(0.1, max_acc_);
     }
 
     double yaw_diff = fabs(atan2(sin(vp_yaw - uav_yaw_), cos(vp_yaw - uav_yaw_)));
@@ -1064,9 +1411,11 @@ double CoverageSearchManager::computeTransitionCost(
     if (path_dir.norm() < 1e-3) path_dir = to_pos - from_pos;
     path_dir(2) = 0.0;
     if (velocity.norm() > 0.1 && path_dir.norm() > 1e-3) {
-        const double dot = velocity.normalized().dot(path_dir.normalized());
-        direction_time = std::acos(std::min(1.0, std::max(-1.0, dot))) /
-                         std::max(0.1, max_yaw_rate_);
+        path_dir.normalize();
+        const double parallel = velocity.dot(path_dir);
+        const Eigen::Vector3d velocity_to_remove =
+            velocity - std::max(0.0, parallel) * path_dir;
+        direction_time = velocity_to_remove.norm() / std::max(0.1, max_acc_);
     }
     const double yaw_time = std::fabs(std::atan2(std::sin(to_yaw - from_yaw),
                                                   std::cos(to_yaw - from_yaw))) /
@@ -1108,7 +1457,6 @@ bool CoverageSearchManager::pathToTargetBlocked(const Eigen::Vector3d &to,
         }
         return false;
     }
-    Eigen::Vector3d dir = seg / dist;
     double step = std::max(0.05, 0.5 * coverage_map_.resolution_);
     Eigen::Vector3i start_idx;
     coverage_map_.posToIndex(start, start_idx);

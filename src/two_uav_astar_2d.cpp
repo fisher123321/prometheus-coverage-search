@@ -22,7 +22,7 @@ bool Astar2D::isWalkable(int x, int y) {
     if (x < 0 || x >= map_->grid_size_(0) || y < 0 || y >= map_->grid_size_(1))
         return false;
     if (!map_->isFree2D(x, y) || map_->isOccupied2D(x, y)) return false;
-    const double hard_clearance = std::max(0.45, map_->esdf_safe_distance_);
+    const double hard_clearance = std::max(planning_clearance_, map_->esdf_safe_distance_);
     return map_->getDistance2D(x, y) >= hard_clearance;
 }
 
@@ -55,13 +55,13 @@ bool Astar2D::search(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
             walkable_cache[key] =
                 map_->isFree2D(x, y) &&
                 !map_->isOccupied2D(x, y) &&
-                distance_cache[key] >= std::max(0.45, map_->esdf_safe_distance_);
+                distance_cache[key] >= std::max(planning_clearance_, map_->esdf_safe_distance_);
         }
         return walkable_cache[key] != 0;
     };
 
     const Eigen::Vector2i requested_si = si;
-    const double hard_clearance = std::max(0.45, map_->esdf_safe_distance_);
+    const double hard_clearance = std::max(planning_clearance_, map_->esdf_safe_distance_);
     const double bridge_step = std::max(0.05, 0.5 * map_->resolution_);
     auto hardBridgeClear = [&](const Eigen::Vector3d &from,
                                const Eigen::Vector3d &to) {
@@ -179,7 +179,7 @@ bool Astar2D::search(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
     const int MAX_EXPAND = 90000;
     auto clearancePenalty = [&](int x, int y) -> double {
         int key = toAddress2D(x, y);
-        const double hard_clearance = std::max(0.45, map_->esdf_safe_distance_);
+        const double hard_clearance = std::max(planning_clearance_, map_->esdf_safe_distance_);
         const double desired_clearance = std::max(0.80, hard_clearance);
         const double dist = distance_cache[key] >= 0.0
                                 ? distance_cache[key]
@@ -358,7 +358,7 @@ bool Astar2D::isPathClear(const Eigen::Vector3d &start, const Eigen::Vector3d &g
     if (dist < 0.01) return true;
     dir.normalize();
 
-    const double hard_clearance = std::max(0.45, map_->esdf_safe_distance_);
+    const double hard_clearance = std::max(planning_clearance_, map_->esdf_safe_distance_);
     double step = std::max(0.05, 0.5 * map_->resolution_);
     for (double d = step; d <= dist; d += step) {
         Eigen::Vector3d check_pos = start + d * dir;
@@ -388,7 +388,7 @@ bool Astar2D::isPathTraversable(const Eigen::Vector3d &start,
 
     int unknown = 0;
     int checked = 0;
-    const double hard_clearance = std::max(0.45, map_->esdf_safe_distance_);
+    const double hard_clearance = std::max(planning_clearance_, map_->esdf_safe_distance_);
     double step = std::max(0.05, 0.5 * map_->resolution_);
     for (double d = step; d <= dist; d += step) {
         Eigen::Vector3d check_pos = start + d * dir;
@@ -422,7 +422,7 @@ bool Astar2D::findReachableApproach(const Eigen::Vector3d &start,
     map_->posToIndex(target, target_idx);
     const int nx = map_->grid_size_(0), ny = map_->grid_size_(1);
     const int total = nx * ny;
-    const double hard_clearance = std::max(0.45, map_->esdf_safe_distance_);
+    const double hard_clearance = std::max(planning_clearance_, map_->esdf_safe_distance_);
     auto walkable = [&](int x, int y) {
         return x >= 0 && x < nx && y >= 0 && y < ny &&
                map_->isFree2D(x, y) && !map_->isOccupied2D(x, y) &&
@@ -484,4 +484,286 @@ bool Astar2D::findReachableApproach(const Eigen::Vector3d &start,
     map_->indexToPos(Eigen::Vector3i(bx, by, map_->fly_z_idx_), approach);
     approach(2) = map_->fly_height_;
     return search(start, approach, path);
+}
+
+// ============================================================
+// 2D Kinodynamic A* implementation
+// ============================================================
+bool KinodynamicAstar2D::search(
+    const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel,
+    const Eigen::Vector3d &start_acc, const Eigen::Vector3d &goal_pos,
+    const Eigen::Vector3d &goal_vel, double max_vel, double max_acc,
+    double timeout_ms, std::vector<Eigen::Vector3d> &path,
+    const std::vector<Eigen::Vector3d> *guide_path, double guide_radius) {
+    path.clear();
+    last_failure_reason_ = KINO_OK;
+    if (!map_ || max_vel <= 1e-3 || max_acc <= 1e-3) {
+        last_failure_reason_ = KINO_NO_PATH;
+        return false;
+    }
+
+    map_->updateDistanceFields();
+    const double plan_clearance = std::max(planning_clearance_, map_->esdf_safe_distance_);
+    Eigen::Vector3i goal_idx;
+    map_->posToIndex(goal_pos, goal_idx);
+    if (!map_->isInMap2D(goal_idx(0), goal_idx(1)) ||
+        !map_->isFree2D(goal_idx(0), goal_idx(1)) ||
+        map_->getDistance2D(goal_idx(0), goal_idx(1)) + 1e-3 < plan_clearance) {
+        last_failure_reason_ = KINO_ENDPOINT_BLOCKED;
+        return false;
+    }
+
+    const int ny = map_->grid_size_(1);
+    std::vector<uint8_t> guide_mask;
+    if (guide_path && guide_path->size() >= 2) {
+        guide_radius = std::max(0.4, guide_radius);
+        guide_mask.assign(map_->grid_size_(0) * ny, 0);
+        const int radius_cells = static_cast<int>(
+            std::ceil(guide_radius / map_->resolution_)) + 1;
+        for (size_t segment = 1; segment < guide_path->size(); ++segment) {
+            const Eigen::Vector2d a = (*guide_path)[segment - 1].head<2>();
+            const Eigen::Vector2d b = (*guide_path)[segment].head<2>();
+            Eigen::Vector3i ai, bi;
+            map_->posToIndex((*guide_path)[segment - 1], ai);
+            map_->posToIndex((*guide_path)[segment], bi);
+            const int min_x = std::max(0, std::min(ai(0), bi(0)) - radius_cells);
+            const int max_x = std::min(map_->grid_size_(0) - 1,
+                std::max(ai(0), bi(0)) + radius_cells);
+            const int min_y = std::max(0, std::min(ai(1), bi(1)) - radius_cells);
+            const int max_y = std::min(map_->grid_size_(1) - 1,
+                std::max(ai(1), bi(1)) + radius_cells);
+            const Eigen::Vector2d ab = b - a;
+            const double denominator = ab.squaredNorm();
+            for (int x = min_x; x <= max_x; ++x) {
+                for (int y = min_y; y <= max_y; ++y) {
+                    Eigen::Vector3d center;
+                    map_->indexToPos(Eigen::Vector3i(x, y, map_->fly_z_idx_), center);
+                    const double t = denominator > 1e-9
+                        ? std::max(0.0, std::min(1.0,
+                            (center.head<2>() - a).dot(ab) / denominator)) : 0.0;
+                    if ((center.head<2>() - (a + t * ab)).norm() <=
+                        guide_radius + 0.5 * map_->resolution_) {
+                        guide_mask[x * ny + y] = 1;
+                    }
+                }
+            }
+        }
+    }
+    const auto insideGuideCorridor = [&](const Eigen::Vector2d &position) {
+        if (guide_mask.empty()) return true;
+        Eigen::Vector3i idx;
+        map_->posToIndex(Eigen::Vector3d(position(0), position(1), map_->fly_height_), idx);
+        return map_->isInMap2D(idx(0), idx(1)) && guide_mask[idx(0) * ny + idx(1)] != 0;
+    };
+
+    struct Node {
+        Eigen::Vector2d pos = Eigen::Vector2d::Zero();
+        Eigen::Vector2d vel = Eigen::Vector2d::Zero();
+        Eigen::Vector2d input = Eigen::Vector2d::Zero();
+        double duration = 0.0;
+        double g = 0.0;
+        int parent = -1;
+        int64_t key = 0;
+    };
+
+    const double velocity_resolution = std::max(0.35, 0.35 * max_vel);
+    const int velocity_bins = std::max(3,
+        static_cast<int>(std::ceil(2.0 * max_vel / velocity_resolution)) + 1);
+    const auto velocityBin = [&](double velocity) {
+        const double clipped = std::max(-max_vel, std::min(max_vel, velocity));
+        return std::max(0, std::min(velocity_bins - 1,
+            static_cast<int>(std::lround((clipped + max_vel) / velocity_resolution))));
+    };
+    const auto stateKey = [&](const Eigen::Vector2d &position,
+                              const Eigen::Vector2d &velocity) {
+        Eigen::Vector3d p(position(0), position(1), map_->fly_height_);
+        Eigen::Vector3i idx;
+        map_->posToIndex(p, idx);
+        if (!map_->isInMap2D(idx(0), idx(1))) return int64_t(-1);
+        int64_t key = static_cast<int64_t>(idx(0) * ny + idx(1));
+        key = key * velocity_bins + velocityBin(velocity(0));
+        key = key * velocity_bins + velocityBin(velocity(1));
+        return key;
+    };
+    const auto safePrimitive = [&](const Eigen::Vector2d &position,
+                                   const Eigen::Vector2d &velocity,
+                                   const Eigen::Vector2d &acceleration,
+                                   double duration) {
+        Eigen::Vector3d start3(position(0), position(1), map_->fly_height_);
+        Eigen::Vector3i start_index;
+        map_->posToIndex(start3, start_index);
+        double previous_clearance = map_->isInMap2D(start_index(0), start_index(1))
+            ? map_->getDistance2D(start_index(0), start_index(1)) : 0.0;
+        bool escaping = previous_clearance + 1e-3 < plan_clearance;
+        const int samples = std::max(5, static_cast<int>(std::ceil(duration / 0.08)));
+        for (int sample = 1; sample <= samples; ++sample) {
+            const double t = duration * sample / samples;
+            const Eigen::Vector2d p = position + t * velocity +
+                                      0.5 * t * t * acceleration;
+            const Eigen::Vector2d v = velocity + t * acceleration;
+            if (v.norm() > 1.001 * max_vel || !insideGuideCorridor(p)) return false;
+            Eigen::Vector3d p3(p(0), p(1), map_->fly_height_);
+            Eigen::Vector3i idx;
+            map_->posToIndex(p3, idx);
+            if (!map_->isInMap2D(idx(0), idx(1)) ||
+                !map_->isFree2D(idx(0), idx(1))) return false;
+            const double clearance = map_->getDistance2D(idx(0), idx(1));
+            if (escaping) {
+                if (clearance + 1e-3 < previous_clearance) return false;
+                if (clearance + 1e-3 >= plan_clearance) escaping = false;
+            } else if (clearance + 1e-3 < plan_clearance) {
+                return false;
+            }
+            previous_clearance = clearance;
+        }
+        return true;
+    };
+    const auto connectorSafe = [&](const Eigen::Vector2d &from,
+                                   const Eigen::Vector2d &to) {
+        const Eigen::Vector2d segment = to - from;
+        const int samples = std::max(1, static_cast<int>(std::ceil(
+            segment.norm() / std::max(0.05, 0.5 * map_->resolution_))));
+        for (int i = 1; i <= samples; ++i) {
+            const Eigen::Vector2d p = from + static_cast<double>(i) / samples * segment;
+            if (!insideGuideCorridor(p)) return false;
+            Eigen::Vector3d p3(p(0), p(1), map_->fly_height_);
+            Eigen::Vector3i idx;
+            map_->posToIndex(p3, idx);
+            if (!map_->isInMap2D(idx(0), idx(1)) ||
+                !map_->isFree2D(idx(0), idx(1)) ||
+                map_->getDistance2D(idx(0), idx(1)) + 1e-3 < plan_clearance) return false;
+        }
+        return true;
+    };
+
+    std::vector<Eigen::Vector2d> accelerations{Eigen::Vector2d::Zero()};
+    for (int direction = 0; direction < 8; ++direction) {
+        const double angle = direction * M_PI / 4.0;
+        accelerations.emplace_back(max_acc * std::cos(angle), max_acc * std::sin(angle));
+    }
+    Eigen::Vector2d inherited_acc = start_acc.head<2>();
+    if (inherited_acc.norm() > max_acc) inherited_acc *= max_acc / inherited_acc.norm();
+    if (std::none_of(accelerations.begin(), accelerations.end(),
+        [&](const Eigen::Vector2d &candidate) {
+            return (candidate - inherited_acc).norm() < 1e-3;
+        })) accelerations.push_back(inherited_acc);
+
+    const Eigen::Vector2d goal2 = goal_pos.head<2>();
+    Eigen::Vector2d bounded_start_vel = start_vel.head<2>();
+    if (bounded_start_vel.norm() > max_vel)
+        bounded_start_vel *= max_vel / bounded_start_vel.norm();
+    Eigen::Vector2d bounded_goal_vel = goal_vel.head<2>();
+    if (bounded_goal_vel.norm() > max_vel)
+        bounded_goal_vel *= max_vel / bounded_goal_vel.norm();
+
+    std::vector<Node> nodes;
+    nodes.reserve(24000);
+    Node start;
+    start.pos = start_pos.head<2>();
+    start.vel = bounded_start_vel;
+    start.key = stateKey(start.pos, start.vel);
+    if (start.key < 0) {
+        last_failure_reason_ = KINO_ENDPOINT_BLOCKED;
+        return false;
+    }
+    nodes.push_back(start);
+    std::unordered_map<int64_t, int> best_node;
+    best_node[start.key] = 0;
+    using QueueEntry = std::pair<double, int>;
+    std::priority_queue<QueueEntry, std::vector<QueueEntry>, std::greater<QueueEntry>> open;
+    const auto heuristic = [&](const Eigen::Vector2d &position,
+                               const Eigen::Vector2d &velocity) {
+        return (goal2 - position).norm() / std::max(0.1, max_vel) +
+               0.20 * (bounded_goal_vel - velocity).norm() / std::max(0.1, max_acc);
+    };
+    open.push({heuristic(start.pos, start.vel), 0});
+
+    const auto search_start = std::chrono::steady_clock::now();
+    int goal_node = -1;
+    // The geometric corridor already supplies the route; this state search
+    // only needs a moving-start-compatible guide. One medium duration halves
+    // branching versus the former two-duration lattice.
+    const double durations[] = {0.55};
+    while (!open.empty() && nodes.size() < 24000) {
+        if (std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - search_start).count() > timeout_ms) {
+            last_failure_reason_ = KINO_TIMEOUT;
+            return false;
+        }
+        const int current_index = open.top().second;
+        open.pop();
+        const Node current = nodes[current_index];
+        const auto best = best_node.find(current.key);
+        if (best == best_node.end() || best->second != current_index) continue;
+
+        const double goal_distance = (current.pos - goal2).norm();
+        const double goal_velocity_error = (current.vel - bounded_goal_vel).norm();
+        if (goal_distance <= std::max(0.30, 1.5 * map_->resolution_) &&
+            goal_velocity_error <= std::max(0.50, 0.55 * max_vel) &&
+            connectorSafe(current.pos, goal2)) {
+            goal_node = current_index;
+            break;
+        }
+
+        for (const Eigen::Vector2d &acceleration : accelerations) {
+            for (double duration : durations) {
+                if (!safePrimitive(current.pos, current.vel, acceleration, duration)) continue;
+                Node next;
+                next.pos = current.pos + duration * current.vel +
+                           0.5 * duration * duration * acceleration;
+                next.vel = current.vel + duration * acceleration;
+                next.input = acceleration;
+                next.duration = duration;
+                next.parent = current_index;
+                next.key = stateKey(next.pos, next.vel);
+                if (next.key < 0) continue;
+                Eigen::Vector3d next3(next.pos(0), next.pos(1), map_->fly_height_);
+                Eigen::Vector3i next_idx;
+                map_->posToIndex(next3, next_idx);
+                const double clearance = map_->getDistance2D(next_idx(0), next_idx(1));
+                const double clearance_lack = std::max(0.0, 0.80 - clearance);
+                next.g = current.g + duration + 0.03 * acceleration.squaredNorm() * duration +
+                         0.5 * clearance_lack * clearance_lack;
+                const auto previous = best_node.find(next.key);
+                if (previous != best_node.end() &&
+                    nodes[previous->second].g <= next.g + 1e-6) continue;
+                const int next_index = static_cast<int>(nodes.size());
+                nodes.push_back(next);
+                best_node[next.key] = next_index;
+                open.push({next.g + 1.5 * heuristic(next.pos, next.vel), next_index});
+            }
+        }
+    }
+
+    if (goal_node < 0) {
+        last_failure_reason_ = KINO_NO_PATH;
+        return false;
+    }
+
+    std::vector<int> chain;
+    for (int index = goal_node; index >= 0; index = nodes[index].parent)
+        chain.push_back(index);
+    std::reverse(chain.begin(), chain.end());
+    path.emplace_back(start_pos(0), start_pos(1), map_->fly_height_);
+    for (size_t i = 1; i < chain.size(); ++i) {
+        const Node &parent = nodes[chain[i - 1]];
+        const Node &child = nodes[chain[i]];
+        const int samples = std::max(2, static_cast<int>(std::ceil(child.duration / 0.12)));
+        for (int sample = 1; sample <= samples; ++sample) {
+            const double t = child.duration * sample / samples;
+            const Eigen::Vector2d p = parent.pos + t * parent.vel +
+                                      0.5 * t * t * child.input;
+            path.emplace_back(p(0), p(1), map_->fly_height_);
+        }
+    }
+    const Eigen::Vector2d last = path.back().head<2>();
+    const int connector_samples = std::max(1, static_cast<int>(std::ceil(
+        (goal2 - last).norm() / std::max(0.05, map_->resolution_))));
+    for (int sample = 1; sample <= connector_samples; ++sample) {
+        const Eigen::Vector2d p = last + static_cast<double>(sample) /
+            connector_samples * (goal2 - last);
+        path.emplace_back(p(0), p(1), map_->fly_height_);
+    }
+    last_failure_reason_ = KINO_OK;
+    return path.size() >= 2;
 }

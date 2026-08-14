@@ -116,6 +116,10 @@ if(CATKIN_ENABLE_TESTING)
   if(TARGET two_uav_auction_protocol_test)
     target_link_libraries(two_uav_auction_protocol_test ${catkin_LIBRARIES})
   endif()
+  catkin_add_gtest(two_uav_kinodynamic_astar_test test/test_two_uav_kinodynamic_astar.cpp)
+  if(TARGET two_uav_kinodynamic_astar_test)
+    target_link_libraries(two_uav_kinodynamic_astar_test two_uav_coverage_lib ${catkin_LIBRARIES})
+  endif()
 endif()
 
 install(TARGETS two_uav_coverage_lib

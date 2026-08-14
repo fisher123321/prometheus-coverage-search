@@ -40,11 +40,11 @@
         <!-- 最大偏航角加速度，保证转向从起点到视点全程平滑完成 -->
         <param name="coverage_search/max_yaw_acc" value="$(arg max_yaw_acc)"/>
         <!-- 滚动重规划交接前瞻时间(秒) -->
-        <param name="coverage_search/replan_time" value="0.25"/>
         <!-- FUEL-style replan triggers: covered frontier, periodic refresh, and terminal handoff. -->
         <param name="coverage_search/replan_min_execute_time" value="0.5"/>
         <param name="coverage_search/replan_periodic_time" value="1.5"/>
         <param name="coverage_search/replan_remaining_time" value="0.5"/>
+        <param name="coverage_search/trajectory_plan_clearance" value="0.60"/>
         <!-- 目标到达判定距离(米) -->
         <param name="coverage_search/goal_reach_dist" value="0.25"/>
         <!-- 前方障碍物检测距离(米) -->
@@ -78,8 +78,9 @@
         <param name="coverage_search/map_epoch" value="1"/>
         <param name="coverage_search/swarm_chunk_size" value="2.0"/>
         <param name="coverage_search/swarm_chunk_delta_period" value="0.25"/>
+        <param name="coverage_search/swarm_snapshot_chunks_per_tick" value="1"/>
         <param name="coverage_search/peer_state_timeout" value="0.6"/>
-        <param name="coverage_search/peer_avoidance_radius" value="0.75"/>
+        <param name="coverage_search/peer_avoidance_radius" value="1.30"/>
         <param name="coverage_search/peer_avoidance_duration" value="2.0"/>
         <param name="coverage_search/swarm_tx_prefix" value="$(arg swarm_tx_prefix)"/>
         <param name="coverage_search/swarm_rx_prefix" value="$(arg swarm_rx_prefix)"/>

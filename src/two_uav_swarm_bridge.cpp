@@ -33,7 +33,8 @@ class BridgeChannel {
   BridgeChannel(ros::NodeHandle& nh, zmqpp::context_t& context,
                 const std::string& tx_topic, const std::string& rx_topic,
                 const std::string& local_ip, const std::string& peer_ip,
-                int local_port, int peer_port, int max_hz, uint32_t max_bytes)
+                int local_port, int peer_port, int max_hz, uint32_t max_bytes,
+                int queue_size = 10)
       : max_hz_(std::max(0, max_hz)), max_bytes_(max_bytes),
         sender_(new zmqpp::socket(context, zmqpp::socket_type::pub)),
         receiver_(new zmqpp::socket(context, zmqpp::socket_type::sub)) {
@@ -42,8 +43,9 @@ class BridgeChannel {
     sender_->bind(self_endpoint);
     receiver_->subscribe("");
     receiver_->connect(peer_endpoint);
-    publisher_ = nh.advertise<Message>(rx_topic, 10);
-    subscriber_ = nh.subscribe<Message>(tx_topic, 10, &BridgeChannel::send, this,
+    queue_size = std::max(1, queue_size);
+    publisher_ = nh.advertise<Message>(rx_topic, queue_size);
+    subscriber_ = nh.subscribe<Message>(tx_topic, queue_size, &BridgeChannel::send, this,
                                         ros::TransportHints().tcpNoDelay());
     receive_thread_ = std::thread(&BridgeChannel::receiveLoop, this);
     ROS_INFO("[two_uav_bridge] %s -> %s on port %d", tx_topic.c_str(),
@@ -180,12 +182,12 @@ int main(int argc, char** argv) {
       port_base + 3, peer_port_base + 3, data_hz, max_bytes);
   BridgeChannel<prometheus_two_uav_coverage_search::SwarmMapChunk> map_chunk(
       nh, context, tx_prefix + "/map_chunk", rx_prefix + "/map_chunk", local_ip, peer_ip,
-      // Delta batches every 0.5 s can contain many independent chunks.  Rate-limiting this
-      // channel drops all but the first and makes the sender believe the dropped chunks arrived.
-      port_base + 4, peer_port_base + 4, 0, max_bytes);
+      // A 4 Hz update is a burst of independent chunks, not one message.
+      // Buffer the full burst and never rate-limit individual chunks.
+      port_base + 4, peer_port_base + 4, 0, max_bytes, 512);
   BridgeChannel<prometheus_two_uav_coverage_search::SwarmMapRequest> map_request(
       nh, context, tx_prefix + "/map_request", rx_prefix + "/map_request", local_ip, peer_ip,
-      port_base + 5, peer_port_base + 5, data_hz, max_bytes);
+      port_base + 5, peer_port_base + 5, 0, max_bytes, 128);
   ros::spin();
   return 0;
 }
